@@ -51,6 +51,15 @@ const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const TMP = mkdtempSync(join(tmpdir(), 'dsh-restart-win-integration-'));
 const cases = [];
 
+/**
+ * The platform whose *semantics* this suite exercises.
+ *
+ * `process.platform` by default; `DSH_RESTART_TEST_PLATFORM=linux` lets a
+ * Windows machine (and CI) verify the Linux branch. Tests that need Windows
+ * semantics are registered as visible skips with a reason.
+ */
+const PLATFORM = process.env.DSH_RESTART_TEST_PLATFORM || process.platform;
+
 /** @param {string} name @param {() => void | Promise<void>} fn */
 function test(name, fn) {
     cases.push({ name, fn });
@@ -59,6 +68,18 @@ function test(name, fn) {
 /** @param {string} name @param {string} reason */
 function skip(name, reason) {
     cases.push({ name, fn: () => 'skip', reason });
+}
+
+/**
+ * Register a test only when the platform semantics it exercises apply; else
+ * register an explicit skip so the case count stays honest.
+ *
+ * @param {boolean} condition true to run the test
+ * @param {string} name @param {string} reason @param {() => void | Promise<void>} fn
+ */
+function testUnless(condition, name, reason, fn) {
+    if (condition) test(name, fn);
+    else skip(name, reason);
 }
 
 /** @param {string} name @returns {string} */
@@ -179,7 +200,7 @@ function stubArgs(action, invocation, extra = {}) {
         invocation,
         resultFile: extra.resultFile ?? '',
         noWait: extra.noWait ?? false,
-        platform: process.platform,
+        platform: PLATFORM,
     })];
 }
 
@@ -208,7 +229,7 @@ test('argv: the OS delivers exactly the array the plugin built (restart)', async
     assert.equal(run.ok, true, `engine failed: ${run.stderr}`);
     const recorded = JSON.parse(readFileSync(join(env.STUB_OUT, 'argv.json'), 'utf8'));
 
-    const prefix = process.platform === 'win32'
+    const prefix = PLATFORM === 'win32'
         ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass']
         : ['-NoLogo', '-NoProfile', '-NonInteractive'];
     const expected = [
@@ -454,7 +475,7 @@ test('config: a rejected tool call returns a failure object and spawns nothing',
         config,
         paths: PATHS(),
         env: { ...process.env, STUB_OUT: out },
-        platform: process.platform,
+        platform: PLATFORM,
     });
     const byName = new Map(definitions.map((definition) => [definition.name, definition]));
     for (const [tool, args] of [
@@ -508,7 +529,7 @@ test('schema: every tool result satisfies the declared output shape (shape rules
         config,
         paths: PATHS(),
         env: { ...process.env, STUB_OUT: out },
-        platform: process.platform,
+        platform: PLATFORM,
     });
     const byName = new Map(definitions.map((definition) => [definition.name, definition]));
     const values = [
@@ -544,7 +565,7 @@ test('schema: the host validator accepts the same values (when the host is insta
         config,
         paths: PATHS(),
         env: { ...process.env, STUB_OUT: out },
-        platform: process.platform,
+        platform: PLATFORM,
     });
     const byName = new Map(definitions.map((definition) => [definition.name, definition]));
     for (const [tool, args] of [
@@ -564,26 +585,31 @@ test('schema: the host validator accepts the same values (when the host is insta
 // 6. opt-in: the real engine through the same code path
 // --------------------------------------------------------------------------
 
-if (process.argv.includes('--with-engine')) {
-    test('real engine: -Status -Json through runForeground, isolated state dir', async () => {
-        const pwsh = resolvePwsh({ pwshPath: '' }, { env: process.env, platform: process.platform });
-        const stateDir = tempDir('real-engine-state');
-        const dshHome = tempDir('real-engine-home');
-        const invocation = resolveInvocation(normalizeConfig({ stateDir, dshHome }), { port: 59999 });
-        const args = buildScriptArgs({ scriptPath: engineScriptPath(), action: 'status', invocation, platform: process.platform });
-        const run = await runForeground({ execPath: pwsh.path, args, timeoutMs: 60000, env: process.env });
-        assert.equal(run.ok, true, `engine exit ${run.exitCode}: ${run.stderr}`);
-        const envelope = extractJsonObject(run.stdout);
-        assert.ok(envelope, 'the engine must print one JSON envelope');
-        assert.equal(envelope.ok, true);
-        assert.equal(envelope.result, 'status');
-        assert.equal(envelope.exitCode, 0);
-        for (const key of ['ok', 'result', 'exitCode', 'version', 'steps', 'warnings', 'targetPid', 'newPid', 'hostUrl', 'error', 'durationMs', 'stateDir', 'logPath', 'status']) {
-            assert.ok(Object.hasOwn(envelope, key), `envelope is missing ${key}`);
-        }
-    });
-} else {
+if (!process.argv.includes('--with-engine')) {
     skip('real engine: -Status -Json through runForeground, isolated state dir', 'pass --with-engine to run the real engine');
+} else {
+    testUnless(
+        PLATFORM === 'win32',
+        'real engine: -Status -Json through runForeground, isolated state dir',
+        'windows-only: runs scripts/dsh-restart.ps1 through a real PowerShell host',
+        async () => {
+            const pwsh = resolvePwsh({ pwshPath: '' }, { env: process.env, platform: PLATFORM });
+            const stateDir = tempDir('real-engine-state');
+            const dshHome = tempDir('real-engine-home');
+            const invocation = resolveInvocation(normalizeConfig({ stateDir, dshHome }), { port: 59999 });
+            const args = buildScriptArgs({ scriptPath: engineScriptPath(), action: 'status', invocation, platform: PLATFORM });
+            const run = await runForeground({ execPath: pwsh.path, args, timeoutMs: 60000, env: process.env });
+            assert.equal(run.ok, true, `engine exit ${run.exitCode}: ${run.stderr}`);
+            const envelope = extractJsonObject(run.stdout);
+            assert.ok(envelope, 'the engine must print one JSON envelope');
+            assert.equal(envelope.ok, true);
+            assert.equal(envelope.result, 'status');
+            assert.equal(envelope.exitCode, 0);
+            for (const key of ['ok', 'result', 'exitCode', 'version', 'steps', 'warnings', 'targetPid', 'newPid', 'hostUrl', 'error', 'durationMs', 'stateDir', 'logPath', 'status']) {
+                assert.ok(Object.hasOwn(envelope, key), `envelope is missing ${key}`);
+            }
+        },
+    );
 }
 
 // --------------------------------------------------------------------------

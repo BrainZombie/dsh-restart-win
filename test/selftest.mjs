@@ -69,6 +69,16 @@ import * as pluginEntry from '../lib/index.js';
 const ROOT = mkdtempSync(join(tmpdir(), 'dsh-restart-win-selftest-'));
 const cases = [];
 
+/**
+ * The platform whose *semantics* the suite is exercising.
+ *
+ * `process.platform` by default; `DSH_RESTART_TEST_PLATFORM=linux` lets a
+ * Windows machine (and CI) verify the Linux branch of the suite. Tests that
+ * depend on Windows semantics skip themselves with an explicit reason instead
+ * of being dropped: a skipped test is visible, a missing one is not.
+ */
+const PLATFORM = process.env.DSH_RESTART_TEST_PLATFORM || process.platform;
+
 /** @param {string} name @param {() => void | Promise<void>} fn */
 function test(name, fn) {
     cases.push({ name, fn });
@@ -77,6 +87,20 @@ function test(name, fn) {
 /** @param {string} name @param {string} reason */
 function skip(name, reason) {
     cases.push({ name, fn: () => 'skip', reason });
+}
+
+/**
+ * Register a test only when the platform semantics it exercises apply.
+ *
+ * The skip is decided at registration time, so the case count stays honest: a
+ * platform-gated test is exactly one case, either run or visibly skipped.
+ *
+ * @param {boolean} condition true to run the test
+ * @param {string} name @param {string} reason @param {() => void | Promise<void>} fn
+ */
+function testUnless(condition, name, reason, fn) {
+    if (condition) test(name, fn);
+    else skip(name, reason);
 }
 
 /** @param {string} name @returns {string} */
@@ -227,10 +251,15 @@ test('normalizeConfig rejects a task name that could break schtasks', () => {
     }
 });
 
-test('normalizeConfig rejects non-executable pwshPath values', () => {
-    assert.throws(() => normalizeConfig({ pwshPath: 'C:\\apps\\pwsh' }), (error) => error.field === 'pwshPath');
-    assert.throws(() => normalizeConfig({ pwshPath: 'pwsh.exe' }), (error) => error.field === 'pwshPath');
-});
+testUnless(
+    PLATFORM === 'win32',
+    'normalizeConfig rejects non-executable pwshPath values',
+    'windows-only: pwshPath must be an absolute .exe path (Windows executable policy)',
+    () => {
+        assert.throws(() => normalizeConfig({ pwshPath: 'C:\\apps\\pwsh' }), (error) => error.field === 'pwshPath');
+        assert.throws(() => normalizeConfig({ pwshPath: 'pwsh.exe' }), (error) => error.field === 'pwshPath');
+    },
+);
 
 test('injectHostEnv defaults to true and is validated as a boolean', () => {
     assert.equal(normalizeConfig({}).injectHostEnv, true);
@@ -349,18 +378,28 @@ test('every accepted action is covered by a legacy switch or is the default rest
 // Paths
 // --------------------------------------------------------------------------
 
-test('dshHome resolves from config, then $DSH_HOME, then the user profile', () => {
-    const env = { USERPROFILE: 'C:\\Users\\example', DSH_HOME: 'D:\\dsh' };
-    assert.equal(resolveDshHome({ dshHome: '' }, env), 'D:\\dsh');
-    assert.equal(resolveDshHome({ dshHome: 'E:\\custom' }, env), 'E:\\custom');
-    assert.equal(resolveDshHome({ dshHome: '' }, { USERPROFILE: 'C:\\Users\\example' }), 'C:\\Users\\example\\.dsh');
-});
+testUnless(
+    PLATFORM === 'win32',
+    'dshHome resolves from config, then $DSH_HOME, then the user profile',
+    'windows-only: joins a Windows profile path with backslash separators',
+    () => {
+        const env = { USERPROFILE: 'C:\\Users\\example', DSH_HOME: 'D:\\dsh' };
+        assert.equal(resolveDshHome({ dshHome: '' }, env), 'D:\\dsh');
+        assert.equal(resolveDshHome({ dshHome: 'E:\\custom' }, env), 'E:\\custom');
+        assert.equal(resolveDshHome({ dshHome: '' }, { USERPROFILE: 'C:\\Users\\example' }), 'C:\\Users\\example\\.dsh');
+    },
+);
 
-test('stateDir defaults to %LOCALAPPDATA%\\dsh-restart', () => {
-    const env = { LOCALAPPDATA: 'C:\\Users\\example\\AppData\\Local' };
-    assert.equal(resolveStateDir({ stateDir: '' }, env), 'C:\\Users\\example\\AppData\\Local\\dsh-restart');
-    assert.equal(resolveStateDir({ stateDir: 'E:\\state' }, env), 'E:\\state');
-});
+testUnless(
+    PLATFORM === 'win32',
+    'stateDir defaults to %LOCALAPPDATA%\\dsh-restart',
+    'windows-only: %LOCALAPPDATA% fallback with backslash separators',
+    () => {
+        const env = { LOCALAPPDATA: 'C:\\Users\\example\\AppData\\Local' };
+        assert.equal(resolveStateDir({ stateDir: '' }, env), 'C:\\Users\\example\\AppData\\Local\\dsh-restart');
+        assert.equal(resolveStateDir({ stateDir: 'E:\\state' }, env), 'E:\\state');
+    },
+);
 
 test('engine and launcher paths are derived from the package, not hardcoded', () => {
     assert.ok(engineScriptPath().endsWith(join('scripts', 'dsh-restart.ps1')));
@@ -1196,9 +1235,26 @@ const pwshForTests = (() => {
     }
 })();
 
-if (!pwshForTests) {
-    skip('integration: the argv binds in a real PowerShell host', 'no PowerShell on PATH');
-    skip('integration: detached launcher runs the engine and writes -ResultFile', 'no PowerShell on PATH');
+/** Every test in the block below needs a real Windows PowerShell host. */
+const PWSH_INTEGRATION_TESTS = Object.freeze([
+    'integration: the argv binds in a real PowerShell host',
+    'integration: injectHostEnv is applied on the foreground path',
+    'integration: injectHostEnv is applied on the detached supervisor path',
+    'integration: the calling session id reaches the engine argv explicitly',
+    'integration: win_restart returns immediately, then the detached run settles',
+    'integration: an engine-written notice survives the supervisor cleanup',
+    'integration: a detached run never writes engine stdout into the host stdio',
+    'integration: detached launcher runs the engine and writes -ResultFile',
+]);
+
+if (PLATFORM !== 'win32') {
+    // Running a .ps1 engine through a real PowerShell host is Windows-specific:
+    // the argv, the exit codes and the fake engine's own cmdlets all assume it.
+    for (const name of PWSH_INTEGRATION_TESTS) {
+        skip(name, 'windows-only: runs the fake .ps1 engine through a real PowerShell host');
+    }
+} else if (!pwshForTests) {
+    for (const name of PWSH_INTEGRATION_TESTS) skip(name, 'no PowerShell on PATH');
 } else {
     const fakeEnginePath = join(ROOT, 'fake-engine.ps1');
     writeFileSync(fakeEnginePath, FAKE_ENGINE, 'utf8');
