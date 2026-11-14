@@ -659,7 +659,7 @@ PROBES['F-15'] = [
     eng(/Wait-PortFree \$Port \$PortFreeSec/, { count: 2 }),
 ];
 PROBES['F-16'] = [eng(/\$dumpOk = \$null/), eng(/\$dumpOk = \$false/), eng(/\$dumpOk = \$true/), eng(/if \(\$dumpOk -eq \$false\)/)];
-PROBES['F-17'] = [eng(/Test-StopPermission \$script:TargetPid/), eng(/Test-StopPermission \$script:TargetPid[\s\S]*Invoke-DeepVerifyWithRetry/, { note: 'elevation gate before the 60s deep verification' })];
+PROBES['F-17'] = [eng(/Test-StopPermission \$permPid/), eng(/Test-StopPermission \$permPid[\s\S]*Invoke-DeepVerifyWithRetry/, { note: 'elevation gate before the 60s deep verification (desktop: main pid)' })];
 PROBES['F-18'] = [eng(/if \(-not \$dv\) \{ Add-Step 'deep-verify' '验证被跳过（找不到 dsh 本体）' 'warn' \}/)];
 PROBES['F-19'] = [eng(/Write-Terminal 'verify-required' 10/)];
 PROBES['F-20'] = [eng(/\$envPlan = Get-RegistryEnvironmentBlock/), eng(/-DryRun 不做副作用/)];
@@ -776,7 +776,7 @@ PROBES['S-05'] = [{
         assert.ok(/host\.out\.log（-Status 校验后补写）/.test(text), 'source value for the -Status refresh');
     },
 }];
-PROBES['S-06'] = [eng(/'host\.out\.log'/), eng(/'host\.err\.log'/)];
+PROBES['S-06'] = [eng(/host\.\$\(\$script:HostKind\)\.out\.log/), eng(/host\.\$\(\$script:HostKind\)\.err\.log/)];
 PROBES['S-07'] = [eng(/UnicodeEncoding\(\$false, \$true\)/), eng(/function Get-TaskXmlPath/), eng(/'dsh-restart\.task\.xml'/)];
 PROBES['S-08'] = [eng(/Join-Path \(Get-StatePath 'fallback'\) 'dsh-restart\.log'/), eng(/Join-Path \(Get-StatePath 'fallback'\) 'restart-history\.jsonl'/), eng(/break/g, { min: 2 })];
 PROBES['S-09'] = [eng(/"dsh-verify\." \+ \[guid\]::NewGuid/), eng(/KeepDir/)];
@@ -856,7 +856,7 @@ PROBES['V-14'] = [eng(/if \(\$VerifyOnly -or \$Preflight\) \{[\s\S]{0,500}Test-S
 PROBES['V-15'] = [eng(/if \(\$VerifyOnly -or \$Preflight\) \{/, { count: 1 })];
 
 // ------------------------------------------------------------------ §7 port discovery
-PROBES['D-01'] = [eng(/netstat -ano -p TCP/, { count: 2 })];
+PROBES['D-01'] = [eng(/netstat -ano -p TCP/, { count: 3 })];
 PROBES['D-02'] = [eng(/@\(\$pids \| Sort-Object -Unique\)/)];
 PROBES['D-03'] = [{ file: ENGINE, inFunction: 'Get-HostCandidate', fn: (ctx) => {
     const body = ctx.functionBody(ENGINE, 'Get-HostCandidate');
@@ -865,7 +865,10 @@ PROBES['D-03'] = [{ file: ENGINE, inFunction: 'Get-HostCandidate', fn: (ctx) => 
     }
 } }];
 PROBES['D-04'] = [eng(/\$proc\.ProcessName -match '\^\(node\|dsh\|bun\)\$'/)];
-PROBES['D-05'] = [{ file: ENGINE, inFunction: 'Get-HostCandidate', lacks: /CommandLine/, note: 'never fuzzy-matches a command line (R4)' }];
+PROBES['D-05'] = [
+    { file: ENGINE, inFunction: 'Get-HostCandidate', has: /Get-PortOwner \$Port/, note: 'the port listener stays the authority (R4)' },
+    { file: ENGINE, inFunction: 'Get-HostCandidate', has: /\$cmd -match/, note: 'the command line only refines isNode when the dsh web host is the Electron CLI shim' },
+];
 PROBES['D-06'] = [{ file: ENGINE, inFunction: 'Test-HostAlive', has: /Get-PortOwner/ }];
 PROBES['D-07'] = [{ file: ENGINE, inFunction: 'Get-CimAvailable', has: /CimInstance|Win32_Process/ }, eng(/CIM 不可用（沙箱\/权限）→ 以端口监听者为权威/)];
 PROBES['D-08'] = [eng(/\$hop -lt 6/), eng(/port-owner-mismatch/)];
@@ -1018,7 +1021,7 @@ PROBES['U-08'] = [{ file: ENGINE, inFunction: 'Get-ResidualChildren', fn: (ctx) 
 } }];
 PROBES['U-09'] = [
     eng(/\$instances = @\(Get-DshInstances\)/, { note: 'empty array must not unwrap to $null' }),
-    eng(/\$children = @\(if \(\$instances\.Count\)/),
+    eng(/\$children = @\(if \(\$script:HostKind -eq 'desktop'\)/),
     eng(/if \(\$tailProp -and \$tailProp\.Value\)/),
     eng(/@\(\$pids \| Sort-Object -Unique\)/),
 ];

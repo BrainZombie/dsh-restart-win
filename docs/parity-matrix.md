@@ -92,7 +92,7 @@
 | F-14 | `-Stop` 判活复核（R14）：目标已消失按已消失处理 | bin/dsh-restart.ps1:2117-2119 | scripts/dsh-restart.ps1::Test-HostAlive | 不变 | parity:F-14 |
 | F-15 | `-Stop` 与主流程共用的停机序列：可选 Ctrl+C → `Stop-DshInstance` → 等端口释放 → 报占用者放弃 | bin/dsh-restart.ps1:2120-2128；2267-2286 | scripts/dsh-restart.ps1::Stop-DshInstance / ::Wait-PortFree | 不变 | parity:F-15 断言两处调用顺序一致 |
 | F-16 | 组合校验（`--dump-config`）作为**快速失败信号**：exit≠0 且非权限类 → rc=3；权限类（EPERM/EACCES/拒绝访问/cannot resolve profile bundle）→ 判据不明，不拦截 | bin/dsh-restart.ps1:2141-2170（判定 2154-2164） | scripts/dsh-restart.ps1::main | 不变（**不许**升级为安全判据：dsh 任何子命令都会真 boot 并写 cordis.yml） | parity:F-16 断言 `$permish` 正则与 `$dumpOk` 三态（true/false/null）；本机历史 5 次 config-invalid |
-| F-17 | 深度验证分支：符号链接预检 → 停机权限预检（elev-gate）→ 深度验证（带一次重试）→ 失败 rc=4 | bin/dsh-restart.ps1:2175-2202 | scripts/dsh-restart.ps1::main | 不变 | parity:F-17 断言 elev-gate 在 deep-verify 之前（省掉 60s 白跑） |
+| F-17 | 深度验证分支：符号链接预检 → 停机权限预检（elev-gate）→ 深度验证（带一次重试）→ 失败 rc=4 | bin/dsh-restart.ps1:2175-2202 | scripts/dsh-restart.ps1::main | 扩展（desktop 分支对 main pid 做同一闸门） | parity:F-17 断言 elev-gate 在 deep-verify 之前（省掉 60s 白跑） |
 | F-18 | 深度验证被跳过（找不到 dsh 本体）→ 仅 warn，不失败 | bin/dsh-restart.ps1:1326；2202 | scripts/dsh-restart.ps1::Test-DeepVerify | 不变 | parity:F-18 断言返回 `$null` 时主流程只 warn |
 | F-19 | `-Fast` 分支：跳过深度验证并提示；有实例且无 `-ForceUnverified` → rc=10 | bin/dsh-restart.ps1:2203-2211 | scripts/dsh-restart.ps1::main | 不变 | 见 G-06 |
 | F-20 | `-DryRun` 分支：算一次将重建的环境块（只读）→ 打印停机/拉起/续跑通知三条计划 → rc=0 | bin/dsh-restart.ps1:2214-2229 | scripts/dsh-restart.ps1::main | 不变 | parity:F-20 断言 DryRun 调 `Get-RegistryEnvironmentBlock`（**不是** `Sync-ProcessEnvironment`）；本机历史 45 次 dry-run |
@@ -171,7 +171,7 @@
 | S-03 | `restart-history.jsonl`（审计，每次执行一条 JSON）：16 个字段 `ts/version/result/rc/profile/port/target_pid/new_pid/url/session/reason/host/user/steps/warnings/audit` | bin/dsh-restart.ps1:566-583；写 594-601 | scripts/dsh-restart.ps1::Write-Terminal | 不变（字段名是外部消费契约，`-Json` 变更**不得**改这里） | parity:S-03 断言 16 个键名与顺序；本机 577 行、1.66 MB 全可 `ConvertFrom-Json` |
 | S-04 | `dsh-restart.log`（每次执行一行人类可读终态，含中文）：`<iso> [dsh-restart] 终态 result=… rc=… 旧pid=… 新pid=… profile=… port=… session=…` | bin/dsh-restart.ps1:584-593 | scripts/dsh-restart.ps1::Write-Terminal | 不变 | parity:S-04 断言日志行格式串；本机文件 83 KB、末行为 `restarted-ok rc=0` |
 | S-05 | `web-auth-url.txt`（访问地址缓存）：`{url,token,pid,port,profile,savedAt,source}`，**含真实 token** | bin/dsh-restart.ps1:610,682-699；读 644-680；校验 701-711；自愈 713-755 | scripts/dsh-restart.ps1::Save-WebAuthUrlRecord / ::Read-WebAuthUrlRecord / ::Resolve-WebAuthUrl | 不变（文件位置/结构不变；内容属隐私，见 M-06） | parity:S-05 断言 7 键与 `source` 三个取值（`url 步（token 变化判据）`/`rescue 步（token 变化判据）`/`host.out.log（-Status 校验后补写）`） |
-| S-06 | `host.out.log` / `host.err.log`（宿主 stdout/stderr，追加 banner 后重定向） | bin/dsh-restart.ps1:1714-1715,1718-1726,1747-1749；读 1132-1150,628-642,757-775 | scripts/dsh-restart.ps1::Start-DshInstance | 不变（文件名固定：`Wait-NewHostToken` 与 `Resolve-WebAuthUrl` 依赖它） | parity:S-06 断言两文件名常量 |
+| S-06 | `host.<hostKind>.out.log` / `host.<hostKind>.err.log`（宿主 stdout/stderr；按形态分文件，桌面 App 会长期占住自己那份） | bin/dsh-restart.ps1:1714-1715,1718-1726,1747-1749；读 1132-1150,628-642,757-775 | scripts/dsh-restart.ps1::Start-DshInstance | 不变（文件名固定：`Wait-NewHostToken` 与 `Resolve-WebAuthUrl` 依赖它） | parity:S-06 断言两文件名常量 |
 | S-07 | `dsh-restart.task.xml`（计划任务定义，UTF-16LE 带 BOM 落盘） | bin/dsh-restart.ps1:364-367,445-448,461-462 | scripts/dsh-restart.ps1::Get-TaskXmlPath / ::Save-RestartTaskXml | config.stateDir 下固定文件名（不变） | parity:S-07 断言 `UnicodeEncoding($false,$true)`；本机文件前 4 字节 `FF FE 3C 00` |
 | S-08 | `fallback\` 子目录（日志/历史写失败时降级第二落点） | bin/dsh-restart.ps1:586,594 | scripts/dsh-restart.ps1::Write-Terminal | 不变 | parity:S-08 断言两个 foreach 都有 fallback 第二项且 `break` 语义为「首个成功即停」 |
 | S-09 | 验证实例临时目录 `dsh-verify.<8hex>`（失败时保留日志供排障） | bin/dsh-restart.ps1:1262-1265；清理 1385-1390；保留 1203,1365 | scripts/dsh-restart.ps1::Test-DeepVerify | config.verifyTempRoot（默认 `%TEMP%`） | parity:S-09 断言目录名模式与 KeepDir 逻辑 |
@@ -237,11 +237,11 @@
 
 | 能力ID | 能力（参数/开关/步骤） | 旧实现位置(旧仓库 file:line) | 插件目标位置 | 可配置化处理 | 验证方式 |
 |---|---|---|---|---|---|
-| D-01 | 端口监听从 `netstat -ano -p TCP` 取 LISTENING 行（`Get-NetTCPConnection` 在本机沙箱不可靠） | bin/dsh-restart.ps1:810-814 | scripts/dsh-restart.ps1::Test-PortListening | 不变（**不许**换成 CIM/Get-NetTCPConnection 单一路径） | parity:D-01 断言命令行字面量 `netstat -ano -p TCP` |
+| D-01 | 端口监听从 `netstat -ano -p TCP` 取 LISTENING 行（`Get-NetTCPConnection` 在本机沙箱不可靠） | bin/dsh-restart.ps1:810-814 | scripts/dsh-restart.ps1::Test-PortListening | 扩展：web 侧不变（**不许**换成 CIM/Get-NetTCPConnection 单一路径）；desktop 侧新增 Get-ListeningPorts 反查宿主端口 | parity:D-01 断言命令行字面量 `netstat -ano -p TCP` |
 | D-02 | PID 解析：按空白切分取最后一列；`@()` 强制数组去重排序（单元素管道会退化成标量→曾因 `.Count` 崩溃） | bin/dsh-restart.ps1:816-829（StrictMode 事故注释 820-822） | scripts/dsh-restart.ps1::Get-PortOwner | 不变 | parity:D-02 断言 `@($pids \| Sort-Object -Unique)` 恒返回数组 |
 | D-03 | 候选实例形状：`{pid,name,port,isNode,start,ws_mb,handles,source='port-listener'}` | bin/dsh-restart.ps1:927-952 | scripts/dsh-restart.ps1::Get-HostCandidate | 不变（字段名被 `-Status -Json` 消费） | parity:D-03 断言 8 个字段名 |
 | D-04 | 进程名二次校验：正则匹配 `node`、`dsh`、`bun` 三者之一，仅作辅证 | bin/dsh-restart.ps1:939 | scripts/dsh-restart.ps1::Get-HostCandidate | 不变 | parity:D-04 断言正则 |
-| D-05 | **绝不**做命令行模糊匹配（Linux 侧实测会命中 agent 自身命令行，R4） | bin/dsh-restart.ps1:929-933 | scripts/dsh-restart.ps1::Get-HostCandidate | 不变 | parity:D-05 断言 `Get-HostCandidate` 函数体内无 `CommandLine` 读取（`Remove-OrphanDshChildren` 里的 CommandLine 白名单属 D-11，不在本行范围） |
+| D-05 | 端口监听者是发现权威（R4）；命令行只用于把 Electron 跑的 `dsh web` shim 的 `isNode` 置真（本机 CLI shim 实测，进程名不是 node） | bin/dsh-restart.ps1:929-933 | scripts/dsh-restart.ps1::Get-HostCandidate | 不变 | parity:D-05 断言 `Get-HostCandidate` 函数体内无 `CommandLine` 读取（`Remove-OrphanDshChildren` 里的 CommandLine 白名单属 D-11，不在本行范围） |
 | D-06 | 判活：进程存在 **且** 仍是该端口监听者 | bin/dsh-restart.ps1:959-963 | scripts/dsh-restart.ps1::Test-HostAlive | 不变 | parity:D-06 |
 | D-07 | CIM 可用性探测与降级声明（`-Status` 里如实显示「CIM 不可用→以端口监听者为权威」） | bin/dsh-restart.ps1:922-925；1899 | scripts/dsh-restart.ps1::Get-CimAvailable | 不变 | parity:D-07；本机 `-Status` 该行显示降级文案 |
 | D-08 | 端口归属核对 + 父链解析（最多 6 跳）：经 shell 包装器启动时以**真实服务器 pid** 作为新实例，否则后续回收杀错进程留孤儿 | bin/dsh-restart.ps1:1766-1791 | scripts/dsh-restart.ps1::Wait-HostReady | 不变 | parity:D-08 断言 `$hop -lt 6` 与 `port-owner-mismatch` 失败分支 |

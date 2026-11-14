@@ -237,6 +237,7 @@ test('argv: the OS delivers exactly the array the plugin built (restart)', async
         '-File', engineScriptPath(),
         '-Status', '-Json',
         '-Profile', 'web',
+        '-HostKind', 'auto',
         '-Port', '4123',
         '-BindHost', '127.0.0.1',
         '-StateDir', invocation.stateDir,

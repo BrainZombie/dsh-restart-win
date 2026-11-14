@@ -47,6 +47,10 @@
 [CmdletBinding()]
 param(
   [string]$Profile = 'web',
+  # 宿主形态：auto = 检测到 DSH Desktop（Electron + dsh-desktop-host 子进程）就按桌面版驱动，
+  # 否则保持 dsh web 语义；web / desktop 可显式钉死（desktop 下 -Port 只是期望值，端口实测）。
+  [ValidateSet('auto', 'web', 'desktop')]
+  [string]$HostKind = 'auto',
   [int]$Port = 3080,
   [string]$BindHost = '127.0.0.1',
   [string]$DshHome = $(if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }),
@@ -100,7 +104,8 @@ param(
 
   # 分离执行支撑（插件/自动化用；人工使用时不必传）
   [string]$ResultFile = '',   # 最终结果 JSON 落盘路径（任何终态都写）
-  [switch]$NoWait             # 收尾不停留：跳过等新 boot token 的 20s，只做一次非阻塞扫描
+  [switch]$NoWait,            # 收尾不停留：跳过等新 boot token 的 20s，只做一次非阻塞扫描
+  [string]$LaunchRecord = ''  # 内部：交接模式下引擎自报 pid（见 lib/delayed-spawn.mjs 的 handoff）
 )
 
 $ErrorActionPreference = 'Stop'
@@ -121,6 +126,39 @@ if ($Json) {
 # 本次拉起实例的访问地址（含 token）；由 Wait-NewHostToken（url/rescue 步）或
 # Resolve-WebAuthUrl（-Status）填充，供步骤输出与 restart-history.jsonl 复用。
 $script:HostUrl = $null
+
+# 拉起子进程前先关掉「标准句柄可继承」标记。
+# 为什么必须（2026-11-14 实测）：Start-Process 走 CreateProcess(bInheritHandles=TRUE)，
+# 即使显式把子进程的 stdout/stderr 重定向到文件，调用方（本脚本）原来的 stdout 句柄
+# 仍然会被**复制**进子进程的句柄表。当本脚本被管道调用（`dsh-restart | tail`）时，
+# 子进程（GUI 宿主或 notepad 都一样）会一直攥着管道写端 → 调用方永远等不到 EOF，
+# 一次成功的重启表现为「命令挂住」。把三个标准句柄的 HANDLE_FLAG_INHERIT 清掉即可，
+# 重定向仍然有效（那是显式传句柄）。失败不致命：退回旧行为。
+function Hide-StdHandleInheritance {
+  try {
+    if (-not ('DshHandleFlags' -as [type])) {
+      Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class DshHandleFlags {
+  [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr GetStdHandle(int n);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetHandleInformation(IntPtr h, uint mask, uint flags);
+  public static bool Clear(int n) {
+    IntPtr h = GetStdHandle(n);
+    if (h == IntPtr.Zero || h == new IntPtr(-1)) return false;
+    return SetHandleInformation(h, 1u, 0u);
+  }
+}
+'@ -ErrorAction Stop
+    }
+    [void][DshHandleFlags]::Clear(-11)   # STD_OUTPUT_HANDLE
+    [void][DshHandleFlags]::Clear(-12)   # STD_ERROR_HANDLE
+    [void][DshHandleFlags]::Clear(-10)   # STD_INPUT_HANDLE
+  } catch {
+    [Console]::Error.WriteLine('[dsh-restart] 提示：无法关闭标准句柄继承（管道调用仍可能挂住）：' + $_.Exception.Message)
+  }
+}
+Hide-StdHandleInheritance
 # boot token 判据：记下「拉起前」的旧 token 与日志长度，url 步只认变化后的新 token ——
 # 上一实例留在日志里的旧 token 绝不能被当成本次新实例的地址。
 $script:PrevBootToken = ''
@@ -161,6 +199,18 @@ $script:StartedAt     = Get-Date
 $script:ResultWritten = $false
 $script:Extra         = [ordered]@{}
 $script:LogPath       = Join-Path $StateDir 'dsh-restart.log'
+
+# 宿主形态（desktop 分支的全部状态都在这里；web 分支不读这些变量）
+$script:HostKindRequested = $HostKind
+$script:HostKind          = $HostKind
+$script:ConfiguredPort    = $Port
+$script:ResolvedPort      = $Port
+$script:Desktop           = $null
+$script:MainPid           = $null
+$script:NewMainPid        = $null
+$script:DesktopAppPath    = $null
+# -Profile 是否由用户显式指定：桌面版下若没指定，profile 从运行中的宿主推导
+$script:ProfileExplicit   = $PSBoundParameters.ContainsKey('Profile')
 
 # 启动形状兜底。
 # 【实测踩坑记录（2026-09-12，真实事故）】这里曾经写成 `pnpm dsh web ...` + cwd=<仓库根>，
@@ -725,6 +775,20 @@ function Get-Ps7RuntimeStatus {
 
 function Get-StatePath([string]$Name) { Join-Path $StateDir $Name }
 
+function Get-EmptyStdinPath {
+  <#
+    拉起 GUI/宿主时把 stdin 接到一个空文件。
+    为什么必须：Start-Process 默认让子进程继承调用方的 stdin —— 当本脚本被管道调用
+    （`dsh-restart | head`、插件 detached 之前的前台探测等）时，子进程会一直攥着管道写端，
+    调用方于是永远等不到 EOF，一次成功的重启表现为「命令挂住」。2026-11-14 实测一次。
+  #>
+  $p = Get-StatePath 'host.stdin'
+  if (-not (Test-Path -LiteralPath $p)) {
+    try { [System.IO.File]::WriteAllText($p, '') } catch { return $null }
+  }
+  return $p
+}
+
 function Write-Terminal([string]$result, [int]$rc) {
   $script:Result   = $result
   $script:ExitCode = $rc
@@ -741,6 +805,11 @@ function Write-Terminal([string]$result, [int]$rc) {
     session    = $Session
     reason     = $Reason
     host       = $env:COMPUTERNAME
+    host_kind  = [string]$script:HostKind
+    main_pid   = $script:MainPid
+    new_main_pid = $script:NewMainPid
+    configured_port = [int]$script:ConfiguredPort
+    resolved_port   = [int]$Port
     user       = (([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -split '\\')[-1]
     steps      = @($script:Steps)
     warnings   = @($script:Warn)
@@ -1106,6 +1175,16 @@ function Get-HostCandidate {
     $proc = Get-Process -Id $p -ErrorAction SilentlyContinue
     if (-not $proc) { continue }
     $isNode = ($proc.ProcessName -match '^(node|dsh|bun)$')
+    $cmd = ''
+    if (-not $isNode) {
+      # 这台机器的 `dsh` 是桌面版自带的 CLI shim：`dsh web` 实际是 Electron 进程跑
+      # dsh-desktop-host\lib\cli.js web，进程名不是 node —— 只按进程名判会误拒 -Stop。
+      try {
+        $ci = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue
+        if ($ci) { $cmd = [string]$ci.CommandLine }
+      } catch { $cmd = '' }
+      if ($cmd -match '(?i)(lib[\\/](bin|cli)\.js["'']?\s+web|dsh(\.cmd|\.exe)?["'']?\s+web)') { $isNode = $true }
+    }
     [void]$cands.Add([pscustomobject]@{
       pid     = $p
       name    = $proc.ProcessName
@@ -1122,12 +1201,18 @@ function Get-HostCandidate {
 
 function Get-DshInstances {
   # 全量实例视图（恒为数组）
+  if ($script:HostKind -eq 'desktop') { return @(Get-DesktopInstances) }
   return @(Get-HostCandidate)
 }
 
 function Test-HostAlive([int]$Pid_, [int]$P) {
   $proc = Get-Process -Id $Pid_ -ErrorAction SilentlyContinue
   if (-not $proc) { return $false }
+  if ($script:HostKind -eq 'desktop') {
+    # 桌面版的「活着」= 宿主子进程在 + Electron 主进程在（主进程没了，壳已经死了）
+    if (-not $script:MainPid) { return $false }
+    return [bool](Get-Process -Id $script:MainPid -ErrorAction SilentlyContinue)
+  }
   return [bool](Get-PortOwner $P | Where-Object { $_ -eq $Pid_ })
 }
 
@@ -1145,6 +1230,7 @@ function Save-BootRecord([string]$CommandLine, [string]$WorkingDirectory) {
     command    = $CommandLine
     cwd        = $WorkingDirectory
     profile    = $Profile
+    hostKind   = $script:HostKind
     port       = $Port
     host       = $BindHost
     dshHome    = $DshHome
@@ -1156,9 +1242,23 @@ function Save-BootRecord([string]$CommandLine, [string]$WorkingDirectory) {
 
 function Resolve-Launch {
   # 返回 @{ file; args[]; cwd; source; raw }
+  if ($script:HostKind -eq 'desktop') {
+    $dl = Get-DesktopLaunch
+    if ($dl) { return $dl }
+    return [pscustomobject]@{ file = ''; args = @(); cwd = ''; source = 'desktop-app-missing'; raw = '' }
+  }
   # 统一用 cmd.exe /c 重放命令文本：启动档案里记的就是用户在 shell 里敲的那一行，
   # 重放它比把命令拆成 argv 更贴近真实（也避免 pnpm/node 路径解析差异）。
   $rec = Get-BootRecord
+  # 启动档案是**共享**的：桌面版记的是 App 的 exe，web 模式绝不能重放它
+  # （否则 `-Profile web` 会把 web 宿主停掉、却把桌面 App 拉起来）。
+  if ($rec -and $rec.command) {
+    $desktopRecord = ([string](Get-JsonField $rec 'hostKind') -eq 'desktop') -or ([string]$rec.command -match '(?i)DeepSeek Harness\.exe')
+    if ($desktopRecord) {
+      Add-Step 'launch' "启动档案是 DSH Desktop 的记录（$($rec.command)）→ web 模式忽略它，改用 DEFAULT_LAUNCH" 'warn'
+      $rec = $null
+    }
+  }
   if ($rec -and $rec.command) {
     $cwd = if ($rec.cwd) { $rec.cwd } else { (Get-Location).Path }
     $resolved = Resolve-DirectLaunch ($rec.command) "$Port"
@@ -1248,6 +1348,15 @@ function Test-LaunchPrereq([string]$RawCommand, [string]$RawCwd) {
          `dsh = node --import tsx/esm apps/cli/src/bin.ts`，跑的是仓库版 CLI 而非全局包）。
     注意：必须传"命令文本"，不能直接看 DEFAULT_LAUNCH['args']（第一个元素是 cmd 的 /c）。
   #>
+  if ($script:HostKind -eq 'desktop') {
+    $exe = Resolve-DesktopAppPath
+    if (-not $exe) {
+      Add-Step 'launch-prereq' '找不到 DSH Desktop 可执行文件：用 -Record -RecordCommand "\"<path>\DeepSeek Harness.exe\"" 记录一次，或把 hostKind 设成 web' 'fail'
+      return $false
+    }
+    Add-Step 'launch-prereq' "DSH Desktop 可执行文件存在：$exe" 'ok'
+    return $true
+  }
   $raw = $RawCommand
   $cwd = $RawCwd
   if (-not $raw -or -not $cwd) {
@@ -1428,6 +1537,7 @@ function Test-SymlinkPrivilege {
 }
 
 function Test-DeepVerify {
+  if ($script:HostKind -eq 'desktop') { return (Test-DesktopVerify) }
   $root = if ($VerifyTempRoot) { $VerifyTempRoot } else { $env:TEMP }
   if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Force -Path $root | Out-Null }
   $v = Join-Path $root ("dsh-verify." + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -1759,7 +1869,8 @@ function Test-StopPermission([int]$Pid_) {
   return [pscustomobject]@{ ok = $true; denied = $false; elevated = $false; reason = '探测无结论' }
 }
 
-function Stop-DshInstance([int]$Pid_, [int]$WaitSeconds) {
+function Stop-DshInstance([int]$Pid_, [int]$WaitSeconds, [int]$MainPid_ = 0) {
+  if ($MainPid_ -gt 0) { return (Stop-DesktopApp $MainPid_ $Pid_ $WaitSeconds) }
   # 先温和 /T（不带 /F），再宽限，再强杀 /T /F —— /T 连子孙（R8）。
   # 必须记录 taskkill 的真实 exit code 与输出：被拒绝（权限/沙箱）与「没生效」是两回事。
   Add-Step 'stop' "taskkill /PID $Pid_ /T（温和，连子树）" 'ok'
@@ -1849,6 +1960,7 @@ function Get-ResidualChildren([int]$RootPid) {
 # ---------------------------------------------------------------- 拉起
 
 function Start-DshInstance {
+  if ($script:HostKind -eq 'desktop') { return (Start-DesktopApp) }
   # 环境块先按注册表重建（见 Sync-ProcessEnvironment 注释）：被旧终端或计划任务拉起的
   # dsh-restart 继承的是过期环境快照，只有在这里重读注册表，setx 改过的变量才能到达新宿主。
   # 放在函数最前，保证「解析」与「拉起」用的是同一份最新环境（PATH 也在其中）。
@@ -1886,8 +1998,10 @@ function Start-DshInstance {
   }
 
   $launch = Resolve-Launch
-  $webOut = Get-StatePath 'host.out.log'
-  $webErr = Get-StatePath 'host.err.log'
+  # 日志按宿主形态分文件：桌面 App 会用 stdout 句柄长期占住自己的日志，
+  # 与 web 宿主共用同一个 host.out.log 时，后拉起的一方连 banner 都写不进去。
+  $webOut = Get-StatePath ("host.$($script:HostKind).out.log")
+  $webErr = Get-StatePath ("host.$($script:HostKind).err.log")
   if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Force -Path $StateDir | Out-Null }
 
   foreach ($f in @($webOut, $webErr)) {
@@ -1897,7 +2011,7 @@ function Start-DshInstance {
     # 的 UTF8 明确写死 —— Add-Content -Encoding UTF8 在两个引擎上并不等价：实测新建文件时
     # 5.1 会先写 EF BB BF、pwsh 7 不写（追加到已有文件时两者才一致）。显式编码后 banner
     # 的字节在 5.1 与 pwsh 下完全相同，不会出现 GBK/混编码。
-    [System.IO.File]::AppendAllText($f, $banner, (New-Object System.Text.UTF8Encoding($false)))
+    try { [System.IO.File]::AppendAllText($f, $banner, (New-Object System.Text.UTF8Encoding($false))) } catch { }
   }
 
   # boot token 判据的基线：拉起前记下旧 token 与日志长度。
@@ -1919,9 +2033,16 @@ function Start-DshInstance {
     $cwd = $env:USERPROFILE
   }
 
-  $p = Start-Process -FilePath $launch.file -ArgumentList $launch.args `
-       -WorkingDirectory $cwd -WindowStyle Hidden -PassThru `
-       -RedirectStandardOutput $webOut -RedirectStandardError $webErr
+  $stdinPath = Get-EmptyStdinPath
+  if ($stdinPath) {
+    $p = Start-Process -FilePath $launch.file -ArgumentList $launch.args `
+         -WorkingDirectory $cwd -WindowStyle Hidden -PassThru `
+         -RedirectStandardOutput $webOut -RedirectStandardError $webErr -RedirectStandardInput $stdinPath
+  } else {
+    $p = Start-Process -FilePath $launch.file -ArgumentList $launch.args `
+         -WorkingDirectory $cwd -WindowStyle Hidden -PassThru `
+         -RedirectStandardOutput $webOut -RedirectStandardError $webErr
+  }
 
   $script:HostOutPath = $webOut
   $script:HostErrPath = $webErr
@@ -1931,6 +2052,7 @@ function Start-DshInstance {
 }
 
 function Wait-HostReady([int]$Pid_, [int]$P, [int]$MaxSec) {
+  if ($script:HostKind -eq 'desktop') { return (Wait-DesktopHostReady $Pid_ $MaxSec) }
   $url = "http://${BindHost}:$P/"
   $deadline = (Get-Date).AddSeconds($MaxSec)
   $last = [pscustomobject]@{ status = 0; serving = $false; authed = $false }
@@ -1985,7 +2107,11 @@ function Wait-HostReady([int]$Pid_, [int]$P, [int]$MaxSec) {
 
 # ---------------------------------------------------------------- 锁（R11/R20：句柄不可被继承）
 
-function Get-MutexName { return ('Local\dsh-restart-p' + $Port) }
+function Get-MutexName {
+  # 桌面版端口随机且发现前未知：按形态命名互斥体，避免不同端口的两套宿主互相放行
+  if ($script:HostKind -eq 'desktop') { return 'Local\dsh-restart-desktop' }
+  return ('Local\dsh-restart-p' + $Port)
+}
 
 function Enter-RestartLock {
   $name = Get-MutexName
@@ -2016,7 +2142,17 @@ function Exit-RestartLock {
 # ---------------------------------------------------------------- Status
 
 function Show-Status {
+  Resolve-HostKind
   $instances = @(Get-DshInstances)   # @() 强制成数组：函数返回空数组会被解包成 $null
+  if ($script:HostKind -eq 'desktop' -and $instances.Count -ge 1 -and -not $script:ProfileExplicit -and $instances[0].profile) {
+    $Profile = [string]$instances[0].profile
+  }
+  if ($script:HostKind -eq 'desktop' -and $instances.Count -ge 1 -and $instances[0].port -gt 0) {
+    $Port = $instances[0].port
+    $script:ResolvedPort = $Port
+    $script:Desktop = $instances[0]
+    $script:MainPid = $instances[0].mainPid
+  }
   $cim = Get-CimAvailable
   $rec = Get-BootRecord
   $last = $null
@@ -2036,7 +2172,7 @@ function Show-Status {
   # 注意：`$x = if (...) { @() } else { @() }` 里的**空数组会被解包成 $null**，
   # 于是后面的 $x.Count 抛 PropertyNotFoundException（只在「无实例」这条路上触发，
   # 实测过一次：dsh 没启动时 `-Status` 走到这里崩掉）。所以整个 if 表达式要再套一层 @()。
-  $children = @(if ($instances.Count) { Get-ResidualChildren $instances[0].pid } else { @() })
+  $children = @(if ($script:HostKind -eq 'desktop') { @() } elseif ($instances.Count) { Get-ResidualChildren $instances[0].pid } else { @() })
 
   if ($Json -or $ResultFile) {
     # 契约 §3.3：-Json 发一个固定信封（ok/result/exitCode/version/steps/warnings/
@@ -2050,6 +2186,12 @@ function Show-Status {
       stateDir   = $StateDir
       profile    = $Profile
       port       = $Port
+      hostKind   = [string]$script:HostKind
+      configuredPort = [int]$script:ConfiguredPort
+      resolvedPort   = [int]$Port
+      portSource     = $(if ($script:HostKind -eq 'desktop') { 'netstat' } else { 'config' })
+      instanceShape  = $(if ($script:HostKind -eq 'desktop') { 'desktop-host' } else { 'web-node' })
+      mainPid        = $(if ($script:HostKind -eq 'desktop' -and $instances.Count -ge 1) { [int]$instances[0].mainPid } else { $null })
       url        = "http://${BindHost}:$Port/"
       launchUrl  = $stUrl
       launchUrlState = $auth.State
@@ -2072,6 +2214,7 @@ function Show-Status {
   Write-Diag "dsh-restart $($script:VERSION) — 只读状态" -ForegroundColor Cyan
   Write-Diag ("  DSH_HOME    : {0}" -f $DshHome)
   Write-Diag ("  状态目录    : {0}" -f $StateDir)
+  Write-Diag ("  宿主形态    : {0}" -f $(if ($script:HostKind -eq 'desktop') { "DSH Desktop（Electron 主进程 pid=$($script:MainPid)，端口实测 $Port / 配置 $($script:ConfiguredPort)）" } else { "web（dsh web，端口 $Port）" }))
   Write-Diag ("  目标        : profile={0}  http://{1}:{2}/" -f $Profile, $BindHost, $Port)
   Write-Diag ("  HTTP        : {0} {1}" -f $probe.status, $(if ($probe.serving) { '(服务中)' } else { '(无响应)' }))
   if ($stUrl) { Write-Diag ("  访问地址    : {0}  （持久文件 {1}）" -f $stUrl, (Get-WebAuthUrlPath)) -ForegroundColor Green }
@@ -2080,7 +2223,9 @@ function Show-Status {
   try { $mk = Get-Content (Join-Path $DshHome '.smart-restart\marker.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
   if ($mk) { Write-Diag ("  marker.json : pid={0} lastBootAt={1} ver={2}" -f $mk.pid, $mk.lastBootAt, $mk.dshVersion) }
   Write-Diag ("  进程发现    : {0}" -f $(if ($cim) { 'CIM 可用' } else { 'CIM 不可用（沙箱/权限）→ 以端口监听者为权威' }))
-  if ($instances.Count -eq 0) { Write-Diag "  实例        : 无（端口 $Port 无监听者）" -ForegroundColor Yellow }
+  if ($instances.Count -eq 0) {
+    Write-Diag ("  实例        : 无（{0}）" -f $(if ($script:HostKind -eq 'desktop') { '未发现 DSH Desktop 宿主子进程' } else { "端口 $Port 无监听者" })) -ForegroundColor Yellow
+  }
   else {
     Write-Diag "  实例        :"
     foreach ($i in $instances) {
@@ -2125,7 +2270,13 @@ function Invoke-RescueLaunch([string]$Cause) {
     返回 $true = 服务已恢复（或本来就有服务）。
   #>
   try {
-    if (Test-PortListening $Port) {
+    if ($script:HostKind -eq 'desktop') {
+      $live = @(Get-DesktopInstances)
+      if ($live.Count -gt 0) {
+        Add-Step 'rescue' "中止发生在停机之后，但机器上已有 DSH Desktop 宿主（main pid=$($live[0].mainPid) 端口=$($live[0].port)）→ 不再重复拉起" 'warn'
+        return $true
+      }
+    } elseif (Test-PortListening $Port) {
       Add-Step 'rescue' "中止发生在停机之后，但端口 $Port 已有监听者（pid=$(@(Get-PortOwner $Port) -join ',')）→ 不再重复拉起" 'warn'
       return $true
     }
@@ -2160,10 +2311,456 @@ function Invoke-RescueLaunch([string]$Cause) {
   }
 }
 
+# ---------------------------------------------------------------- DSH Desktop（Electron 宿主）
+#
+# 与 `dsh web` 的四处硬差异（本机实测 2026-11-14，DSH 0.2.2-rc.3）：
+#   ① 宿主不是 node.exe，而是 Electron 主进程 spawn 的 Node 模式子进程：进程名
+#      `DeepSeek Harness.exe`，命令行含 `...\app.asar\dsh\node_modules\@deepseek-ai\
+#      dsh-desktop-host\lib\index.js`（`--expose-internals` 打头），父进程是 Electron 主进程；
+#   ② 它用 `--port 0` 启动，端口每次随机 → 端口不是配置，必须用 netstat 反查；
+#   ③ 真正的「关闭」是杀 Electron 主进程整棵树；只杀宿主子进程会把壳留在 host crash 状态；
+#   ④ 单实例锁：再启动 exe 只会聚焦旧窗口 → 深度验证必须直接起宿主入口，不能靠「再开一个 App」。
+# 这四条就是 desktop 分支的全部依据；web 分支的语义一字未改。
+
+function Get-ListeningPorts([int]$Pid_) {
+  # 反查某个 pid 的 LISTENING 端口（netstat 是权威；Get-NetTCPConnection 在沙箱下不可靠）
+  $out = New-Object System.Collections.ArrayList
+  foreach ($r in @(netstat -ano -p TCP 2>$null | Select-String 'LISTENING')) {
+    if (-not $r -or -not $r.Line) { continue }
+    $t = @((([string]$r.Line) -split '\s+') | Where-Object { $_ -ne '' })
+    if ($t.Count -lt 5) { continue }
+    if ([int]$t[-1] -ne $Pid_) { continue }
+    $local = [string]$t[1]
+    $idx = $local.LastIndexOf(':')
+    if ($idx -lt 1) { continue }
+    $p = 0
+    if ([int]::TryParse($local.Substring($idx + 1), [ref]$p)) { [void]$out.Add($p) }
+  }
+  return @($out | Sort-Object -Unique)
+}
+
+function Get-DesktopHostProcesses {
+  # 命令行含 dsh-desktop-host\lib\index.js 的进程 = 桌面版宿主子进程。
+  # 恒返回数组；CIM 不可用时返回空数组（由调用方按 web 处理 / 明确报错）。
+  $out = New-Object System.Collections.ArrayList
+  if (-not (Get-CimAvailable)) { return @() }
+  foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='DeepSeek Harness.exe'" -ErrorAction SilentlyContinue)) {
+    $cmd = [string]$p.CommandLine
+    if (-not $cmd) { continue }
+    if ($cmd -notmatch 'dsh-desktop-host[\\/]lib[\\/]index\.js') { continue }
+    [void]$out.Add([pscustomobject]@{
+      pid         = [int]$p.ProcessId
+      mainPid     = [int]$p.ParentProcessId
+      commandLine = $cmd
+    })
+  }
+  return @($out.ToArray())
+}
+
+function Get-DesktopPaths([string]$MainPath) {
+  # 桌面版的固定目录形状（全部从可执行文件位置推导，不猜安装路径）
+  $appRoot    = Split-Path -Path $MainPath -Parent
+  $runtimeDir = Join-Path $appRoot 'resources\app.asar\dsh'
+  return [pscustomobject]@{
+    exe            = $MainPath
+    appRoot        = $appRoot
+    runtimeDir     = $runtimeDir
+    entry          = (Join-Path $runtimeDir 'node_modules\@deepseek-ai\dsh-desktop-host\lib\index.js')
+    asar           = (Join-Path $appRoot 'resources\app.asar')
+    primaryRuntime = (Join-Path $appRoot 'resources\runtime\primary-runtime')
+    pnpm           = (Join-Path $appRoot 'resources\runtime\primary-runtime\dependencies\pnpm\bin\pnpm.mjs')
+    nodeBin        = (Join-Path $appRoot 'resources\runtime\bin')
+  }
+}
+
+function Get-DesktopInstances {
+  <#
+    桌面版实例 = 宿主子进程 + 它的 Electron 主进程 + 实测监听端口。
+    身份四要素（缺一不可，防误杀）：
+      a) 进程名 DeepSeek Harness.exe 且命令行含 dsh-desktop-host\lib\index.js；
+      b) 父进程是同目录下的 DeepSeek Harness.exe，且命令行里没有 --type=（不是渲染/GPU 子进程）；
+      c) <appRoot>\resources\app.asar 是真实文件；
+      d) 宿主命令行里包含由 (b) 推导出的 runtimeDir。
+    端口：netstat 反查宿主 pid 的 LISTENING 端口，逐个 GET /，取 401/200 的那个。
+  #>
+  $list = New-Object System.Collections.ArrayList
+  foreach ($h in @(Get-DesktopHostProcesses)) {
+    $main = Get-CimInstance Win32_Process -Filter "ProcessId=$($h.mainPid)" -ErrorAction SilentlyContinue
+    if (-not $main) { continue }
+    $mainPath = [string]$main.ExecutablePath
+    if (-not $mainPath) { continue }
+    if ([string]$main.CommandLine -match '--type=') { continue }
+    $paths = Get-DesktopPaths $mainPath
+    if (-not (Test-Path -LiteralPath $paths.asar -PathType Leaf)) { continue }
+    if ($h.commandLine -notlike ('*' + $paths.runtimeDir + '*')) { continue }
+    $profileName = ''
+    if ($h.commandLine -match '[\\/]profiles[\\/]([A-Za-z0-9][A-Za-z0-9._-]{0,63})') { $profileName = $Matches[1] }
+    $ports = @(Get-ListeningPorts $h.pid)
+    $chosen = 0
+    $httpStatus = 0
+    foreach ($p in $ports) {
+      $s = Test-HttpServing ("http://${BindHost}:$p/")
+      if ($s.ready) { $chosen = $p; $httpStatus = $s.status; break }
+    }
+    $proc = Get-Process -Id $h.pid -ErrorAction SilentlyContinue
+    [void]$list.Add([pscustomobject]@{
+      pid            = $h.pid
+      name           = 'DeepSeek Harness'
+      port           = $chosen
+      ports          = @($ports)
+      isNode         = $true
+      kind           = 'desktop-host'
+      mainPid        = $h.mainPid
+      profile        = $profileName
+      mainPath       = $mainPath
+      exe            = $paths.exe
+      appRoot        = $paths.appRoot
+      runtimeDir     = $paths.runtimeDir
+      entry          = $paths.entry
+      asar           = $paths.asar
+      primaryRuntime = $paths.primaryRuntime
+      pnpm           = $paths.pnpm
+      nodeBin        = $paths.nodeBin
+      http           = $httpStatus
+      start          = $(try { $proc.StartTime.ToString('o') } catch { '' })
+      ws_mb          = $(if ($proc) { [math]::Round($proc.WorkingSet64 / 1MB, 1) } else { 0 })
+      handles        = $(try { $proc.HandleCount } catch { -1 })
+      source         = 'desktop-host'
+    })
+  }
+  return @($list.ToArray())
+}
+
+function Resolve-HostKind {
+  # auto：先看有没有桌面版宿主进程；其次看启动档案是不是记录着 Desktop 的 exe。
+  # 两者都没有 → web（保持老行为，连“找不到 dsh web”的失败文案都不变）。
+  if ($script:HostKindRequested -ne 'auto') { $script:HostKind = $script:HostKindRequested; return }
+  if (@(Get-DesktopHostProcesses).Count -gt 0) { $script:HostKind = 'desktop'; return }
+  $rec = Get-BootRecord
+  if ($rec -and $rec.command -and ([string]$rec.command -match '(?i)DeepSeek Harness\.exe')) {
+    $script:HostKind = 'desktop'; return
+  }
+  $script:HostKind = 'web'
+}
+
+function Resolve-DesktopProfileName {
+  <#
+    桌面版下 -Profile 的默认值（web）是错的：宿主只跑 desktop。若用户没显式给 -Profile，
+    从运行中宿主的命令行（...\profiles\<name>）推导，其次用启动档案里的 profile。
+    必须在 -Preflight / -VerifyOnly 分支之前调用 —— 那条路不经过实例发现。
+  #>
+  if ($script:ProfileExplicit) { return }
+  if ($script:HostKind -ne 'desktop') { return }
+  foreach ($h in @(Get-DesktopHostProcesses)) {
+    if ($h.commandLine -match '[\\/]profiles[\\/]([A-Za-z0-9][A-Za-z0-9._-]{0,63})') {
+      $name = [string]$Matches[1]
+      if ($name -and $name -ne $Profile) {
+        Add-Step 'profile' "profile 自动取自运行中的宿主：$name（默认值 $Profile 是 dsh web 的）" 'ok'
+        $script:Profile = $name
+      }
+      return
+    }
+  }
+  $rec = Get-BootRecord
+  if ($rec -and $rec.profile -and [string]$rec.profile -ne $Profile) {
+    Add-Step 'profile' "profile 自动取自启动档案：$($rec.profile)" 'ok'
+    $script:Profile = [string]$rec.profile
+  }
+}
+
+function Resolve-DesktopAppPath {
+  # 依次：本次已解析 → 运行中的实例 → 启动档案里的 exe → 常见安装位置。
+  $cands = New-Object System.Collections.ArrayList
+  if ($script:DesktopAppPath) { [void]$cands.Add([string]$script:DesktopAppPath) }
+  foreach ($i in @(Get-DesktopInstances)) { if ($i.exe) { [void]$cands.Add([string]$i.exe) } }
+  $rec = Get-BootRecord
+  if ($rec -and $rec.command) {
+    $m = [regex]::Match([string]$rec.command, '"([^"]+\.exe)"|^\s*([^\s]+\.exe)')
+    if ($m.Success) {
+      if ($m.Groups[1].Success) { [void]$cands.Add($m.Groups[1].Value) }
+      elseif ($m.Groups[2].Success) { [void]$cands.Add($m.Groups[2].Value) }
+    }
+  }
+  [void]$cands.Add((Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'))
+  [void]$cands.Add((Join-Path $env:ProgramFiles 'DeepSeek Harness\DeepSeek Harness.exe'))
+  foreach ($c in $cands) {
+    if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { $script:DesktopAppPath = $c; return $c }
+  }
+  return $null
+}
+
+function Get-DesktopLaunch {
+  $exe = Resolve-DesktopAppPath
+  if (-not $exe) { return $null }
+  $cwd = Split-Path -Path $exe -Parent
+  $rec = Get-BootRecord
+  if ($rec -and $rec.cwd -and (Test-Path -LiteralPath $rec.cwd)) { $cwd = [string]$rec.cwd }
+  return [pscustomobject]@{ file = $exe; args = @(); cwd = $cwd; source = 'desktop-app'; raw = $exe }
+}
+
+function Stop-DesktopApp([int]$MainPid_, [int]$HostPid_, [int]$WaitSeconds) {
+  <#
+    桌面版的停机 = 杀 Electron 主进程整棵树（taskkill /T /F）。
+    为什么不走温和 /T：GUI 的 WM_CLOSE 会触发 App 自己的「有任务在跑，确认退出？」对话框，
+    graceSec 内必然等不到退出，随后还是强杀 —— 只是多闪一个框。续跑通知在停机前已写好。
+    身份复核：mainPid 必须仍对应一个通过四要素校验的桌面实例，且宿主子进程没换过。
+  #>
+  $inst = $null
+  foreach ($i in @(Get-DesktopInstances)) { if ($i.mainPid -eq $MainPid_) { $inst = $i; break } }
+  if (-not $inst) {
+    Add-Step 'stop' "main pid=$MainPid_ 不是可识别的 DSH Desktop 主进程 → 拒绝停机（fail-closed）" 'fail'
+    return $false
+  }
+  if ($HostPid_ -gt 0 -and $inst.pid -ne $HostPid_) {
+    Add-Step 'stop' "宿主子进程已变化（发现 $($inst.pid)，期望 $HostPid_）→ 拒绝停机" 'fail'
+    return $false
+  }
+  Add-Step 'stop' "taskkill /PID $MainPid_ /T /F（DSH Desktop 主进程整棵树；续跑通知已写）" 'ok'
+  $o = & taskkill.exe /PID $MainPid_ /T /F 2>&1
+  $rc = $LASTEXITCODE
+  $deadline = (Get-Date).AddSeconds([Math]::Max($WaitSeconds, 15))
+  while ((Get-Date) -lt $deadline) {
+    if (-not (Get-Process -Id $MainPid_ -ErrorAction SilentlyContinue)) {
+      Add-Step 'stop' "DSH Desktop 已退出（taskkill rc=$rc）" 'ok'
+      return $true
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  Add-Step 'stop' "DSH Desktop 主进程 $MainPid_ 未退出（taskkill rc=$rc：$(Format-KillOutput $o)）" 'fail'
+  return $false
+}
+
+function Start-DesktopApp {
+  # 拉起 GUI：绝不能 -WindowStyle Hidden（会把整个 App 藏掉）；重定向只为收 boot token。
+  $envPlan = Sync-ProcessEnvironment
+  Add-Step 'launch' ('环境块已按注册表重建：' + $envPlan.TotalCount + ' 项；PATH ' + $envPlan.PathItems + ' 项') 'ok'
+  $plan = Get-DesktopLaunch
+  if (-not $plan) {
+    throw '找不到 DSH Desktop 可执行文件：先用 -Record -RecordCommand "\"<path>\DeepSeek Harness.exe\"" 记录一次'
+  }
+  $env:DSH_HOME = $DshHome
+  if ($env:DSH_RESTART_INJECT_HOST_ENV -ne '0') {
+    $env:DSH_UC_PROFILE_NODE_MODULES = Join-Path $DshHome 'profiles\node_modules'
+    $env:NPM_CONFIG_LEGACY_PEER_DEPS = 'true'
+    Add-Step 'launch' "已注入宿主环境 DSH_HOME=$env:DSH_HOME、DSH_UC_PROFILE_NODE_MODULES=$env:DSH_UC_PROFILE_NODE_MODULES" 'ok'
+  } else {
+    Add-Step 'env' '按 DSH_RESTART_INJECT_HOST_ENV=0 跳过宿主环境注入' 'skip'
+  }
+  $webOut = Get-StatePath ("host.$($script:HostKind).out.log")
+  $webErr = Get-StatePath ("host.$($script:HostKind).err.log")
+  if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Force -Path $StateDir | Out-Null }
+  foreach ($f in @($webOut, $webErr)) {
+    $banner = ("`n===== dsh-restart {0} 拉起 DSH Desktop cmd={1} =====`r`n" -f (Get-Date -Format o), $plan.raw)
+    try { [System.IO.File]::AppendAllText($f, $banner, (New-Object System.Text.UTF8Encoding($false))) } catch { }
+  }
+  $script:HostOutPath = $webOut
+  $script:HostErrPath = $webErr
+  $stdinPath = Get-EmptyStdinPath
+  $spArgs = @{
+    FilePath = $plan.file; WorkingDirectory = $plan.cwd; PassThru = $true
+    RedirectStandardOutput = $webOut; RedirectStandardError = $webErr
+  }
+  if ($stdinPath) { $spArgs['RedirectStandardInput'] = $stdinPath }
+  $p = Start-Process @spArgs
+  $script:NewPid = $p.Id
+  $script:NewMainPid = $p.Id
+  Add-Step 'launch' "已拉起 DSH Desktop pid=$($p.Id)（$($plan.file)），stdout→$webOut" 'ok'
+  return $p
+}
+
+function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec) {
+  # 就绪判据：出现「新的」宿主子进程（pid ≠ 旧宿主）+ 它监听的端口 401/200。
+  # 端口每次随机，所以不能沿用「同一端口换 pid」。
+  $oldHostPid = 0
+  if ($script:Desktop) { $oldHostPid = [int]$script:Desktop.pid }
+  $deadline = (Get-Date).AddSeconds($MaxSec)
+  $lastPorts = @()
+  while ((Get-Date) -lt $deadline) {
+    if (-not (Get-Process -Id $MainPid_ -ErrorAction SilentlyContinue)) {
+      $live = @(Get-DesktopInstances)
+      if ($live.Count -gt 0) {
+        Add-Step 'ready' "新进程已退出，但机器上已有 DSH Desktop 宿主（main pid=$($live[0].mainPid)）→ 单实例锁把启动转成了聚焦旧窗口" 'fail'
+        return [pscustomobject]@{ ok = $false; reason = 'desktop-single-instance' }
+      }
+      Add-Step 'ready' "DSH Desktop 主进程 $MainPid_ 已退出（未就绪）" 'fail'
+      Show-LaunchFailure $script:HostOutPath $script:HostErrPath
+      return [pscustomobject]@{ ok = $false; reason = 'exited' }
+    }
+    foreach ($h in @(Get-DesktopHostProcesses)) {
+      if ($h.mainPid -ne $MainPid_) { continue }
+      if ($oldHostPid -gt 0 -and $h.pid -eq $oldHostPid) { continue }
+      $ports = @(Get-ListeningPorts $h.pid)
+      if ($ports.Count -gt 0) { $lastPorts = $ports }
+      foreach ($p in $ports) {
+        $s = Test-HttpServing ("http://${BindHost}:$p/")
+        if ($s.ready) {
+          $script:NewPid = $h.pid
+          $script:NewMainPid = $MainPid_
+          $script:Port = $p
+          Add-Step 'ready' "新宿主 pid=$($h.pid)（父 pid=$MainPid_）端口 $p HTTP=$($s.status)" 'ok'
+          return [pscustomobject]@{ ok = $true; http = $s.status; authed = $s.authed; pid = $h.pid; mainPid = $MainPid_; port = $p }
+        }
+      }
+    }
+    Start-Sleep -Milliseconds 700
+  }
+  $diag = if (@($lastPorts).Count -gt 0) { "端口 $($lastPorts -join ',') 已绑定但未就绪" } else { '未发现宿主子进程的监听端口' }
+  Add-Step 'ready' "等待 DSH Desktop 就绪超时 ${MaxSec}s：$diag" 'fail'
+  return [pscustomobject]@{ ok = $false; reason = 'timeout' }
+}
+
+function Remove-TreeSafe([string]$Dir) {
+  # 含 junction 的目录：cmd rmdir 只删链接本身；PS5.1 的 Remove-Item -Recurse 可能跟进目标。
+  if (-not (Test-Path -LiteralPath $Dir)) { return }
+  & cmd.exe /c "rmdir /s /q `"$Dir`"" *> $null
+}
+
+function Test-DesktopVerify {
+  <#
+    桌面版深度验证：用 App 自带的 Electron（Node 模式）直接起宿主入口，隔离 DSH_HOME +
+    复制出来的 profile（node_modules 逐项 junction）。与主进程 spawn 的形状一致，
+    端口是 --port 0 分配的，起来后用 netstat 反查。
+  #>
+  $root = if ($VerifyTempRoot) { $VerifyTempRoot } else { $env:TEMP }
+  if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Force -Path $root | Out-Null }
+  $v = Join-Path $root ("dsh-desktop-verify." + [guid]::NewGuid().ToString('N').Substring(0, 8))
+  $p = $null
+  $keepLog = $false
+  $vPort = 0
+  try {
+    New-Item -ItemType Directory -Path $v -Force | Out-Null
+    $vProfile = Join-Path $v ('profiles\' + $Profile)
+    New-Item -ItemType Directory -Path $vProfile -Force | Out-Null
+    $srcProfile = Join-Path $DshHome ('profiles\' + $Profile)
+    if (-not (Test-Path -LiteralPath $srcProfile)) {
+      $existing = @(Get-ChildItem -LiteralPath (Join-Path $DshHome 'profiles') -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+      $why = "真实 profile 不存在：$srcProfile（-Profile '$Profile' 是否正确？现有 profile：$($existing -join ', ')）"
+      Add-Step 'deep-verify' $why 'fail'
+      return [pscustomobject]@{ ok = $false; reason = 'profile-missing' }
+    }
+    foreach ($f in (Get-ChildItem -LiteralPath $srcProfile -File -Force -ErrorAction SilentlyContinue)) {
+      Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $vProfile $f.Name) -Force -ErrorAction SilentlyContinue
+    }
+    $srcFallback = Join-Path $srcProfile '.dsh-module-fallback'
+    if (Test-Path -LiteralPath $srcFallback) {
+      Copy-TreeWithLinks $srcFallback (Join-Path $vProfile '.dsh-module-fallback')
+    }
+    $srcNm = Join-Path $srcProfile 'node_modules'
+    if (-not (Test-Path -LiteralPath $srcNm)) {
+      $why = "真实 profile 缺少 node_modules（$srcNm）→ 隔离验证实例组装不出依赖"
+      Add-Step 'deep-verify' $why 'fail'
+      return [pscustomobject]@{ ok = $false; reason = 'profile-missing-node-modules' }
+    }
+    $vNm = Join-Path $vProfile 'node_modules'
+    New-Item -ItemType Directory -Force -Path $vNm | Out-Null
+    foreach ($it in (Get-ChildItem -LiteralPath $srcNm -Force -ErrorAction SilentlyContinue)) {
+      $linkPath = Join-Path $vNm $it.Name
+      if ($it.Name -like '@*' -and $it.PSIsContainer) {
+        # 作用域目录里可能是 pnpm 的**相对**符号链接（link: 依赖）：整个目录做 junction
+        # 会让相对目标按临时路径解析而失效（实测：bundle 被跳过且只在 stderr 留一行）。
+        # 这里复刻一层真目录，子项各自用绝对路径 junction，链接目标维持真实位置。
+        New-Item -ItemType Directory -Force -Path $linkPath | Out-Null
+        foreach ($sub in (Get-ChildItem -LiteralPath $it.FullName -Force -ErrorAction SilentlyContinue)) {
+          try { New-Item -ItemType Junction -Path (Join-Path $linkPath $sub.Name) -Target $sub.FullName -ErrorAction Stop | Out-Null } catch { }
+        }
+      } else {
+        try { New-Item -ItemType Junction -Path $linkPath -Target $it.FullName -ErrorAction Stop | Out-Null } catch { }
+      }
+    }
+    $vnFb = Join-Path $vProfile '.dsh-module-fallback\node_modules'
+    foreach ($entry in (Get-ChildItem -LiteralPath $vnFb -Force -ErrorAction SilentlyContinue)) {
+      if ($entry.Name -like '@*' -and $entry.PSIsContainer) {
+        foreach ($sub in (Get-ChildItem -LiteralPath $entry.FullName -Force -ErrorAction SilentlyContinue)) {
+          $link = Join-Path (Join-Path $vNm $entry.Name) $sub.Name
+          if (-not (Test-Path -LiteralPath $link)) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $link -Parent) | Out-Null
+            try { New-Item -ItemType Junction -Path $link -Target $sub.FullName -ErrorAction Stop | Out-Null } catch { }
+          }
+        }
+      } elseif (-not (Test-Path -LiteralPath (Join-Path $vNm $entry.Name))) {
+        try { New-Item -ItemType Junction -Path (Join-Path $vNm $entry.Name) -Target $entry.FullName -ErrorAction Stop | Out-Null } catch { }
+      }
+    }
+
+    $paths = $null
+    $exe = Resolve-DesktopAppPath
+    if ($exe) { $paths = Get-DesktopPaths $exe }
+    if (-not $paths) {
+      Add-Step 'deep-verify' '找不到 DSH Desktop 可执行文件 → 无法做桌面版深度验证；用 -Record 记录启动命令后重试' 'fail'
+      return [pscustomobject]@{ ok = $false; reason = 'desktop-app-missing' }
+    }
+    if (-not (Test-Path -LiteralPath $paths.asar -PathType Leaf)) {
+      Add-Step 'deep-verify' "app.asar 不存在：$($paths.asar)" 'fail'
+      return [pscustomobject]@{ ok = $false; reason = 'desktop-entry-missing' }
+    }
+
+    $out = Join-Path $v 'boot.out'
+    $err = Join-Path $v 'boot.err'
+    $env2 = @{
+      ELECTRON_RUN_AS_NODE = '1'
+      DSH_HOME = $v
+      DSH_UC_PROFILE_NODE_MODULES = $vNm
+    }
+    $vArgs = @('--expose-internals', $paths.entry, $paths.runtimeDir, $vProfile, $paths.primaryRuntime, $paths.pnpm, $paths.nodeBin)
+    $p = Start-Process -FilePath $paths.exe -ArgumentList $vArgs `
+         -WorkingDirectory $vProfile -WindowStyle Hidden -Environment $env2 `
+         -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
+
+    $deadline = (Get-Date).AddSeconds($VerifyReadySec)
+    $lastHttp = 0
+    while ((Get-Date) -lt $deadline) {
+      if ($p.HasExited) { break }
+      $ports = @(Get-ListeningPorts $p.Id)
+      foreach ($port in $ports) {
+        $s = Test-HttpServing ("http://${BindHost}:$port/")
+        $lastHttp = $s.status
+        if ($s.ready) {
+          $vPort = $port
+          Add-Step 'deep-verify' ("桌面宿主隔离实例 $port 就绪 HTTP=$($s.status)（Electron Node 模式 + 临时 home）") 'ok'
+          return [pscustomobject]@{ ok = $true; port = $port; http = $s.status; logdir = $v }
+        }
+      }
+      Start-Sleep -Milliseconds 800
+    }
+    $keepLog = $true
+    $tail = @()
+    foreach ($f in @($out, $err)) {
+      if (Test-Path -LiteralPath $f) {
+        $l = @(Get-Content -LiteralPath $f -Encoding UTF8 -ErrorAction SilentlyContinue)
+        $tail += ($l | Select-Object -Last 15)
+        $tail += ($l | Select-String -Pattern 'error|throw|failed|EPERM|EADDRINUSE|unknown option' | Select-Object -First 10 | ForEach-Object { $_.Line })
+      }
+    }
+    $script:VerifyTail = $tail
+    $why = if ($p.HasExited) { "进程已退出（exit=$($p.ExitCode)）" }
+           elseif ($lastHttp -eq 404) { "端口已绑但 $VerifyReadySec s 内路由未就绪（404）" }
+           elseif ($lastHttp -eq 0) { "$VerifyReadySec s 内端口未响应" }
+           else { "最后状态码 $lastHttp" }
+    Add-Step 'deep-verify' ("桌面宿主隔离实例未就绪：$why；日志保留在 $v") 'fail'
+    return [pscustomobject]@{ ok = $false; reason = 'not-ready'; logdir = $v; tail = $tail }
+  } catch {
+    Add-Step 'deep-verify' "桌面验证实例启动异常: $($_.Exception.Message)" 'fail'
+    return [pscustomobject]@{ ok = $false; error = $_.Exception.Message }
+  } finally {
+    if ($p) { & taskkill.exe /PID $p.Id /T /F *> $null; Start-Sleep -Milliseconds 800 }
+    if ($keepLog) { Add-Step 'deep-verify-cleanup' "失败日志保留：$v" 'warn' }
+    else { Remove-TreeSafe $v }
+  }
+}
+
 # ================================================================ 主流程
 
 $exit = 1
 try {
+  # ---- -0. 交接模式（desktop host）：先把自己的 pid 写进 launch 记录。
+  #      独立执行的 supervisor 可能已经被宿主进程树带走，宿主侧靠这条记录跟踪引擎。
+  if ($LaunchRecord) {
+    try {
+      $rec = [ordered]@{ phase = 'engine-running'; enginePid = $PID; at = (Get-NowIso); via = 'handoff' }
+      New-Utf8NoBom $LaunchRecord ($rec | ConvertTo-Json -Compress)
+    } catch { }
+  }
+
   # ---- 0. 分离执行支撑的入参（新增参数：只影响入参校验，不改任何既有退出码语义）
   #   -ResultFile 必须先证明写得进去再动手：否则一次重启成功后却拿不到结果文件，消费方
   #   只能靠超时判失败。写不进去属于「入参不可用」，按既有 invalid-args 语义退出 2。
@@ -2198,6 +2795,11 @@ try {
     # 不是错误：-NoWait 单独用只是「收尾不等待」，但分离执行方因此读不到结果文件 —— 明确提示
     Add-Step 'no-wait' '-NoWait 已开启但没有 -ResultFile：结果只写日志与 restart-history.jsonl，分离执行方读不到' 'warn'
   }
+
+  # ---- 0-host. 宿主形态（auto → web/desktop）：必须在取锁之前，互斥体名字依赖它
+  Resolve-HostKind
+  Add-Step 'host-kind' $(if ($script:HostKind -eq 'desktop') { 'desktop：DSH Desktop（Electron 主进程 + dsh-desktop-host 子进程，端口实测）' } else { 'web：dsh web 进程（按端口发现）' }) 'ok'
+  Resolve-DesktopProfileName
 
   if ($UnregisterTask) {
     $o = & schtasks.exe /Delete /TN $TaskName /F 2>&1
@@ -2236,13 +2838,17 @@ try {
     exit 0
   }
 
-  # ---- 0. 锁
-  if (-not (Enter-RestartLock)) {
-    Add-Step 'lock' "已有另一个 dsh-restart 在跑（Local\dsh-restart-$Port），立刻退出" 'fail'
-    Write-Terminal 'locked' 2
-    exit 2
+  # ---- 0. 锁（只读的 -Status 不取锁：面板每 8s 刷一次状态，取锁会把真正的动作挤成 locked）
+  if (-not $Status) {
+    if (-not (Enter-RestartLock)) {
+      Add-Step 'lock' "已有另一个 dsh-restart 在跑（$(Get-MutexName)），立刻退出" 'fail'
+      Write-Terminal 'locked' 2
+      exit 2
+    }
+    Add-Step 'lock' ("已取得互斥体 " + (Get-MutexName) + "（句柄不继承）") 'ok'
+  } else {
+    Add-Step 'lock' '只读状态：不取重启锁（不阻塞也不会被阻塞）' 'skip'
   }
-  Add-Step 'lock' "已取得互斥体 Local\dsh-restart-$Port（句柄不继承）" 'ok'
 
   # ---- 0a. 引擎能力闸门：验证型重启需要 pwsh 7（5.1 缺 Start-Process -Environment 与
   #      New-Item -ItemType SymbolicLink）。必须在**停机之前**明确报错 —— 否则异常会落在
@@ -2295,6 +2901,28 @@ try {
     Add-Step 'discover' "端口 $Port 无监听者（冷启动或已停）" $(if ($Start) { 'ok' } else { 'warn' })
   }
 
+  # ---- 1a. desktop：端口是实测值，停机目标是 Electron 主进程（不是宿主子进程）
+  if ($script:HostKind -eq 'desktop') {
+    if ($instances.Count -ge 1) {
+      $script:Desktop = $instances[0]
+      $script:MainPid = $instances[0].mainPid
+      $script:DesktopAppPath = $instances[0].exe
+      if (-not $script:ProfileExplicit -and $instances[0].profile -and $Profile -ne $instances[0].profile) {
+        Add-Step 'profile' "profile 自动取自运行中的宿主：$($instances[0].profile)（默认值 $Profile 是 dsh web 的）" 'ok'
+        $Profile = [string]$instances[0].profile
+      }
+      if ($instances[0].port -gt 0) { $Port = $instances[0].port; $script:ResolvedPort = $Port }
+      Add-Step 'discover' "桌面版：主进程 pid=$($script:MainPid)，宿主 pid=$($instances[0].pid)，实测端口 $(if ($instances[0].port -gt 0) { $instances[0].port } else { '未就绪' })（配置端口 $($script:ConfiguredPort) 仅作期望值）" 'ok'
+    } else {
+      Add-Step 'discover' "桌面版：没有运行中的 DSH Desktop 宿主（冷启动；启动档案 exe=$(if (Resolve-DesktopAppPath) { Resolve-DesktopAppPath } else { '未找到' })）" $(if ($Start) { 'ok' } else { 'warn' })
+      $bootRec = Get-BootRecord
+      if (-not $script:ProfileExplicit -and $bootRec -and $bootRec.profile) {
+        Add-Step 'profile' "profile 自动取自启动档案：$($bootRec.profile)" 'ok'
+        $Profile = [string]$bootRec.profile
+      }
+    }
+  }
+
   # ---- 1b. 只停机（-Stop）：不深度验证、不写续跑通知、不拉起 —— 跨端口迁移/彻底关停用
   #      为什么必须有：实例发现是**按端口**做的，重启路径只会停 $Port 上的实例；旧实例在
   #      另一个端口时（例如从 <旧端口> 迁到 <新端口>）就没有任何原语能停掉它，只能手工 taskkill。
@@ -2341,7 +2969,8 @@ try {
       Add-Step 'stop' "目标 pid=$($script:TargetPid) 未通过判活复核（R14），按已消失处理" 'warn'
     } else {
       if ($TryCtrlC) { [void](Invoke-TryCtrlC $script:TargetPid); Start-Sleep -Seconds 2 }
-      if (-not (Stop-DshInstance $script:TargetPid $GraceSec)) { Write-Terminal 'stop-failed' 6; exit 6 }
+      $stopMain = $(if ($script:HostKind -eq 'desktop' -and $script:MainPid) { [int]$script:MainPid } else { 0 })
+      if (-not (Stop-DshInstance $script:TargetPid $GraceSec $stopMain)) { Write-Terminal 'stop-failed' 6; exit 6 }
     }
     if (-not (Wait-PortFree $Port $PortFreeSec)) {
       $owner = @(Get-PortOwner $Port)
@@ -2361,7 +2990,9 @@ try {
   # ---- 2. 组合校验（R2 的便宜前置闸门）
   #      Windows 注意：任何 dsh profile 命令都会「真 boot 并写 cordis.yml」。
   #      因此这一步等价于一次浅启动，不能当作安全判据，只作为快速失败信号。
-  if (-not $Start) {
+  if ($script:HostKind -eq 'desktop') {
+    Add-Step 'dump-config' 'desktop：CLI 拒绝 --profile desktop，跳过组合校验（深度验证会真起一个桌面宿主）' 'skip'
+  } elseif (-not $Start) {
     $dumpOk = $null
     try {
       $node = (Get-Command node -ErrorAction Stop).Source
@@ -2400,11 +3031,12 @@ try {
 
     # 权限预检：宿主若运行在更高完整性级别、而当前进程没有提升，stop 必然 Access is denied。
     # 这一步排在进行深度验证（约 60s、要起一个临时实例）之前 —— 注定失败就别白跑。
-    if ($script:TargetPid) {
-      $perm = Test-StopPermission $script:TargetPid
+    $permPid = $(if ($script:HostKind -eq 'desktop' -and $script:MainPid) { [int]$script:MainPid } else { $script:TargetPid })
+    if ($permPid) {
+      $perm = Test-StopPermission $permPid
       if (-not $perm.ok) {
         $taskOk = Get-TaskRegistered
-        Add-Step 'elev-gate' ("宿主 pid=$($script:TargetPid) 运行在更高完整性级别，而当前进程 Elevated=False" +
+        Add-Step 'elev-gate' ("宿主 pid=$permPid 运行在更高完整性级别，而当前进程 Elevated=False" +
           " → 停机必然 Access is denied。已跳过深度验证。") 'fail'
         Add-Step 'elev-gate' ("两条出路：① 在**管理员**窗口里重跑 dsh-restart；" +
           "② 用 dsh-restart -ViaTask 让计划任务以完整令牌执行（任务当前" +
@@ -2412,7 +3044,7 @@ try {
         Write-Terminal 'stop-failed' 6
         exit 6
       }
-      Add-Step 'elev-gate' ("可尝试终止宿主 pid=$($script:TargetPid)（" + $perm.reason + "）") 'ok'
+      Add-Step 'elev-gate' ("可尝试终止宿主 pid=$permPid（" + $perm.reason + "）") 'ok'
     }
 
     $script:VerifyTail = @()
@@ -2444,8 +3076,13 @@ try {
                '，跳过 ' + $envPlan.SkippedCount + '）；PATH ' + $envPlan.PathItems + ' 项（Machine 在前、去重）'
     if ($envPlan.MachineFailed -or $envPlan.UserFailed) { $envNote = $envNote + '；注意：某层注册表读取失败，该层退化为继承值' }
     Add-Step 'env' $envNote 'ok'
-    Add-Step 'dry-run' "将执行的停机: taskkill /PID $($script:TargetPid) /T /F（先温和 /T 再强杀）" 'ok'
-    Add-Step 'dry-run' "将执行的拉起: $($launch.file) $($launch.args -join ' ')  cwd=$($launch.cwd)  [来源: $($launch.source)]" 'ok'
+    if ($script:HostKind -eq 'desktop') {
+      Add-Step 'dry-run' "将执行的停机: taskkill /PID $($script:MainPid) /T /F（DSH Desktop 主进程整棵树）" 'ok'
+      Add-Step 'dry-run' "将执行的拉起: $($launch.file)（DSH Desktop 主进程），随后用 netstat 反查新的随机端口" 'ok'
+    } else {
+      Add-Step 'dry-run' "将执行的停机: taskkill /PID $($script:TargetPid) /T /F（先温和 /T 再强杀）" 'ok'
+      Add-Step 'dry-run' "将执行的拉起: $($launch.file) $($launch.args -join ' ')  cwd=$($launch.cwd)  [来源: $($launch.source)]" 'ok'
+    }
     Add-Step 'dry-run' "将写续跑通知: $(Join-Path $DshHome '.smart-restart\pending-notice.json') session=$(Normalize-SessionId $Session)" 'ok'
     Write-Terminal 'dry-run' 0
     exit 0
@@ -2488,7 +3125,8 @@ try {
       Add-Step 'stop' "目标 pid=$($script:TargetPid) 未通过判活复核（R14），按已消失处理" 'warn'
     } else {
       if ($TryCtrlC) { [void](Invoke-TryCtrlC $script:TargetPid); Start-Sleep -Seconds 2 }
-      $stopped = Stop-DshInstance $script:TargetPid $GraceSec
+      $stopMain = $(if ($script:HostKind -eq 'desktop' -and $script:MainPid) { [int]$script:MainPid } else { 0 })
+      $stopped = Stop-DshInstance $script:TargetPid $GraceSec $stopMain
       if (-not $stopped) { Write-Terminal 'stop-failed' 6; exit 6 }
     }
   } else { Add-Step 'stop' '无目标实例，跳过停机（冷启动）' 'skip' }
@@ -2534,9 +3172,13 @@ try {
   }
 
   # ---- 11. 扫尾（R8/R9）
-  $resid = @(Get-ResidualChildren $proc.Id)
-  if ($resid.Count) { Add-Step 'sweep' "仍有 $($resid.Count) 个 node 进程存活（可能是本实例的 MCP/隧道子进程，属正常）：$($resid.pid -join ',')" 'warn' }
-  else { Add-Step 'sweep' '无其他 node 残留' 'ok' }
+  if ($script:HostKind -eq 'desktop') {
+    Add-Step 'sweep' 'DSH Desktop：进程树由 Electron 管理，跳过 node 残留扫描' 'skip'
+  } else {
+    $resid = @(Get-ResidualChildren $proc.Id)
+    if ($resid.Count) { Add-Step 'sweep' "仍有 $($resid.Count) 个 node 进程存活（可能是本实例的 MCP/隧道子进程，属正常）：$($resid.pid -join ',')" 'warn' }
+    else { Add-Step 'sweep' '无其他 node 残留' 'ok' }
+  }
 
   # ---- 12. 两层生效提示（R15）
   Add-Step 'client-plugin' '客户端插件由宿主启动时生成分发（rev= 带 immutable 缓存）→ 浏览器需硬刷新 Ctrl+Shift+R 才生效' 'ok'
