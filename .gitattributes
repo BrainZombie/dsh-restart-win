@@ -1,0 +1,19 @@
+# Line endings are part of this package's contract: the PowerShell engine must be
+# UTF-8 BOM + pure LF on every machine, and a Windows checkout must not rewrite it
+# to CRLF. (`check-encoding.ps1` fails the build if CRLF appears.)
+* text=auto eol=lf
+*.ps1 text eol=lf
+*.psm1 text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.xml text eol=lf
+*.task.xml text eol=lf
+
+# Generated launchers are written at run time for cmd.exe, which wants CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf

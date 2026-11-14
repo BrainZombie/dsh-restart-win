@@ -1,0 +1,43 @@
+# dsh bundle patch: inserts this plugin into a profile's layer stack.
+#
+# Plugin row id is `dsh-restart-win`; the `name` is the npm specifier the row is
+# resolved through, so it must stay `@brainzombie/dsh-restart-win`.
+- insert:
+    - id: dsh-restart-win
+      name: '@brainzombie/dsh-restart-win'
+      config:
+        # DSH profile the engine restarts (the profile whose port is probed).
+        profile: web
+        # Host port and bind address the engine discovers the running instance by.
+        port: 3080
+        bindHost: 127.0.0.1
+        # Empty = %USERPROFILE%\.dsh (or $DSH_HOME when the host sets it).
+        dshHome: ''
+        # Empty = %LOCALAPPDATA%\dsh-restart. Keep the default so existing logs,
+        # boot records and restart notices stay where they already are.
+        stateDir: ''
+        # Scheduled-task name used by -ViaTask / -RegisterTask / -UnregisterTask.
+        taskName: DSH Restart
+        # Empty = auto: pwsh first, then Windows PowerShell (powershell.exe).
+        pwshPath: ''
+        readySec: 90
+        verifyReadySec: 150
+        graceSec: 3
+        portFreeSec: 30
+        # Restart tools return their result first, then the detached engine acts
+        # after this delay so the tool result is already on disk.
+        restartDelayMs: 1500
+        # Foreground short actions / detached preflight verification budget.
+        toolTimeoutMs: 30000
+        verifyTimeoutMs: 600000
+        # Engine-side switch: when false, every engine launch (foreground tools
+        # and the detached supervisor) carries DSH_RESTART_INJECT_HOST_ENV=0, so
+        # the engine skips injecting its own host-process variables
+        # (DSH_UC_PROFILE_NODE_MODULES / NPM_CONFIG_LEGACY_PEER_DEPS) into the
+        # instance it starts. true = the engine's default behavior.
+        injectHostEnv: true
+        tools:
+          restart: true
+          status: true
+          preflight: true
+          result: true
