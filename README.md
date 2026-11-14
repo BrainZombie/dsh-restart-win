@@ -163,6 +163,49 @@ After the host restarts, the four `win_restart*` tools should be visible in a se
 
 ---
 
+### 4.6 DSH Desktop (Electron) hosts
+
+The engine also drives the DSH Desktop shell (`DeepSeek Harness.exe`), whose shape differs from `dsh web` in four ways a restarter must respect:
+
+| | `dsh web` | DSH Desktop |
+|---|---|---|
+| Host process | `node.exe ... dsh\lib\bin.js web` | an Electron **Node-mode child** (`--expose-internals ...\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\index.js`), process name `DeepSeek Harness.exe` |
+| Port | fixed (`--port 3080`) | `--port 0`: **random on every launch** |
+| Stop | kill the port listener | kill the Electron **main** process tree; killing the child alone leaves the shell on a host-crash dialog |
+| Isolated verification | `dsh web` in a temporary home | the same Electron host entry in a temporary home (the app holds a single-instance lock, so a second `DeepSeek Harness.exe` only focuses the window) |
+
+`hostKind` (config key, per-call argument, or `-HostKind`) selects `auto` (default), `web`, or `desktop`. On a desktop profile, point the row at that profile in the user layer:
+
+```yaml
+# %USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml
+- id: dsh-restart-win
+  config:
+    profile: desktop      # the plugin's own default is `web`
+```
+
+With `desktop`, the engine discovers the host by command line **and** parent chain (four identity checks), reverse-looks the real port from `netstat`, writes the resume notice, stops the Electron main tree with `taskkill /T /F`, relaunches the recorded executable, and waits for a **new** host child whose listening port answers `401`/`200`. `-Status` reports `hostKind`, `mainPid`, `resolvedPort`, `configuredPort`, `portSource` and `instanceShape`; `-Port` becomes a hint (`status.portSource = "netstat"`). Record the app once so a cold start knows what to launch:
+
+```powershell
+dsh-restart-win -Record -RecordCommand '"C:\<app>\DeepSeek Harness.exe"' -RecordWorkingDirectory "$env:USERPROFILE"
+```
+
+`-Preflight` on a desktop profile boots the Electron host entry directly (Node mode + isolated home), so it validates the same plugin stack without touching the running app.
+
+
+### 4.7 The sidebar panel
+
+The package ships a client half (`client.js`, declared through `dsh.client` in the manifest), so a desktop or web host grows a **DSH 重启 / DSH restart** tab in the right sidebar:
+
+- **Status**: host shape, resolved vs configured port, Electron main pid, host pid, HTTP probe, profile, version, and the authenticated launch URL with a copy button. Refreshes every 8 s.
+- **Actions**: refresh, dry run, deep preflight, safe restart, stop only, start only. `restart` and `stop` ask for a second click.
+- **Output**: a detached run is followed by `runId`; the panel renders the engine's `steps` line by line, then the summary, exit code and result file. The `runId` is kept in `localStorage`, so the panel resumes polling after the host restarts.
+- **History**: the last five `restart-history.jsonl` records.
+
+The panel talks to `/dsh-restart-win/api/*` on the same origin (the host's session auth applies; mutating calls must prove their `Origin`). The routes delegate to the same four tool implementations the agent calls — no second code path. A host without a web server cannot load the plugin (`inject: ['tools', 'webServer']`), which is the same trade-off other panel plugins make.
+
+The client half is part of the package, so it appears after one host restart; no build step is involved.
+
+
 ## 5. The four tools
 
 Every argument is whitelist-validated before it reaches an argv array (a shell string is never built); an invalid value returns an error instead of falling back to a default. Each tool can be switched off through `tools`.
@@ -183,6 +226,7 @@ Start a restart (or start / stop / dry-run / record / scheduled-task management)
 | `idleMaxSec` | integer | 300 | Hard cap on the idle wait |
 | `delayMs` | integer | config `restartDelayMs` | Detached actions: delay before the engine touches the host |
 | `profile` / `port` / `bindHost` | string / integer / string | config values | Per-call override of profile, port, probe address |
+| `hostKind` | string enum | config value | `auto` / `web` / `desktop`; desktop discovers the random port and stops the Electron main tree |
 | `dshHome` / `stateDir` | string | config values | Per-call override of the DSH home and the engine state directory |
 | `taskName` | string | config value | Scheduled-task name |
 | `pwshPath` | string | auto | PowerShell executable (default `pwsh`, then `powershell.exe`) |
@@ -263,6 +307,7 @@ The `%LOCALAPPDATA%\dsh-restart\bin\dsh-restart-win.cmd` shim that `install.ps1`
 | `-ResultFile` | path | Write the final result JSON there (every terminal outcome) |
 | `-NoWait` | — | Do not linger at the end: skip the 20 s boot-token wait and scan once |
 | `-Profile` | string | DSH profile (default `web`) |
+| `-HostKind` | `auto` / `web` / `desktop` | Host shape; `auto` detects DSH Desktop and otherwise stays on `dsh web` |
 | `-Port` | int | Host port (default `3080`; also names the mutex) |
 | `-BindHost` | string | Probe address (default `127.0.0.1`). It does **not** change the host's listen address — see §8 |
 | `-DshHome` | path | DSH home (default `%DSH_HOME%`, else `%USERPROFILE%\.dsh`) |
@@ -285,6 +330,7 @@ Configuration lives under the plugin row's `config` in `cordis.patch.yml` (or in
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `profile` | string | `web` | DSH profile being restarted |
+| `hostKind` | string | `auto` | Host shape: `auto` detects DSH Desktop, `web` / `desktop` pin it |
 | `port` | integer | `3080` | Host port; also the mutex name and the discovery key |
 | `bindHost` | string | `127.0.0.1` | Address used for probes and status display. **Changing it does not change the host's listen address** (see §8) |
 | `dshHome` | string | `''` | Empty = `%DSH_HOME%`, then `%USERPROFILE%\.dsh` |
@@ -384,7 +430,7 @@ Default state directory: `%LOCALAPPDATA%\dsh-restart` (override with `stateDir`;
 | `restart-history.jsonl` | engine | One JSON audit record per execution (16 fields: `ts` / `version` / `result` / `rc` / `profile` / `port` / `target_pid` / `new_pid` / `url` / `session` / `reason` / `host` / `user` / `steps` / `warnings` / `audit`). **Never rotated** |
 | `dsh-restart.log` | engine | One human-readable terminal line per execution |
 | `web-auth-url.txt` | engine | Launch-URL cache: `url` / `token` / `pid` / `port` / `profile` / `savedAt` / `source`. Contains a real token — treat it as a credential |
-| `host.out.log` / `host.err.log` | engine | stdout / stderr of the launched host (banner appended, then redirected) |
+| `host.<hostKind>.out.log` / `.err.log` | engine | stdout / stderr of the launched host (banner appended, then redirected). Separate files per host kind: the desktop app keeps its own log handle for its whole lifetime, so sharing one name makes the other kind's launch fail |
 | `dsh-restart.task.xml` | engine (`-RegisterTask`) | Scheduled-task definition, UTF-16LE with BOM (`schtasks` requires it) |
 | `fallback\` | engine | Second location when the log / history write fails |
 | `runs\<runId>.pending.json` | plugin | Detached-run registration (action, delay, engine script, pwsh source, host pid, launcher pid) |
