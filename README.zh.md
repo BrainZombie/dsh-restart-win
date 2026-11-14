@@ -192,6 +192,20 @@ dsh-restart-win -Record -RecordCommand '"C:\<app>\DeepSeek Harness.exe"' -Record
 桌面版上的 `-Preflight` 直接以 Node 模式起 Electron 宿主入口（隔离 home），不碰正在运行的 App，验证的是同一套插件栈。
 
 
+### 4.7 右栏面板
+
+包里带一个客户端半端（`client.js`，通过 manifest 的 `dsh.client` 声明），桌面版和 web 版都会在右栏长出一个 **DSH 重启** 标签页：
+
+- **状态**：宿主形态、实测端口 vs 配置端口、Electron 主进程 pid、宿主 pid、HTTP 探针、profile、版本，以及带复制按钮的鉴权访问地址；每 8 秒自动刷新。
+- **动作**：刷新、演练、深度验证、安全重启、只停、只拉；`restart` / `stop` 需要点两次确认。
+- **回显**：分离执行的动作用 `runId` 跟进，面板逐条渲染引擎的 `steps`，再给结论、退出码和结果文件；`runId` 存在 `localStorage`，宿主重启后面板会接着轮询同一个 run。
+- **历史**：最近五条 `restart-history.jsonl`。
+
+面板只打同源的 `/dsh-restart-win/api/*`（沿用宿主的会话认证；写操作必须证明 `Origin`）。路由内部直接复用 agent 调用的那四个工具实现，不存在第二套逻辑。没有 web server 的宿主加载不了本插件（`inject: ['tools', 'webServer']`），这与其他面板插件的取舍一致。
+
+客户端半端随包分发，**重启一次宿主**就会出现，不需要构建。
+
+
 ## 5. 四个工具
 
 四个工具的输入都先过白名单校验再拼 argv 数组（从不拼 shell 字符串），非法值直接返回错误而不是回退到默认值。`tools` 配置可以逐个关掉。

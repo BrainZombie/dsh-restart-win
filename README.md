@@ -192,6 +192,20 @@ dsh-restart-win -Record -RecordCommand '"C:\<app>\DeepSeek Harness.exe"' -Record
 `-Preflight` on a desktop profile boots the Electron host entry directly (Node mode + isolated home), so it validates the same plugin stack without touching the running app.
 
 
+### 4.7 The sidebar panel
+
+The package ships a client half (`client.js`, declared through `dsh.client` in the manifest), so a desktop or web host grows a **DSH 重启 / DSH restart** tab in the right sidebar:
+
+- **Status**: host shape, resolved vs configured port, Electron main pid, host pid, HTTP probe, profile, version, and the authenticated launch URL with a copy button. Refreshes every 8 s.
+- **Actions**: refresh, dry run, deep preflight, safe restart, stop only, start only. `restart` and `stop` ask for a second click.
+- **Output**: a detached run is followed by `runId`; the panel renders the engine's `steps` line by line, then the summary, exit code and result file. The `runId` is kept in `localStorage`, so the panel resumes polling after the host restarts.
+- **History**: the last five `restart-history.jsonl` records.
+
+The panel talks to `/dsh-restart-win/api/*` on the same origin (the host's session auth applies; mutating calls must prove their `Origin`). The routes delegate to the same four tool implementations the agent calls — no second code path. A host without a web server cannot load the plugin (`inject: ['tools', 'webServer']`), which is the same trade-off other panel plugins make.
+
+The client half is part of the package, so it appears after one host restart; no build step is involved.
+
+
 ## 5. The four tools
 
 Every argument is whitelist-validated before it reaches an argv array (a shell string is never built); an invalid value returns an error instead of falling back to a default. Each tool can be switched off through `tools`.

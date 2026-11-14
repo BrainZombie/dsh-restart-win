@@ -36,6 +36,7 @@ import {
 } from '../lib/config.js';
 import { parseLaunchRequest, settleNotice, writeNoticeFile } from '../lib/delayed-spawn.mjs';
 import { loadHostModule, hostModuleCandidates } from '../lib/host.js';
+import { ROUTE, createApi, isSameOrigin } from '../lib/api.js';
 import {
     engineScriptPath,
     findExecutable,
@@ -496,6 +497,103 @@ test('host loader: a pnpm store entry outranks the global CLI tree', () => {
     assert.ok(storeIndex > 0, 'the pnpm store entry must be a candidate');
     const globalIndex = candidates.findIndex((candidate) => candidate.includes('AppData/Roaming/npm'));
     assert.ok(globalIndex === -1 || storeIndex < globalIndex, 'the profile store must win over the global CLI tree');
+});
+
+test('panel API: status / action / result / history go through the tool definitions', async () => {
+    const stateDir = tempDir('panel-api');
+    writeFileSync(join(stateDir, 'restart-history.jsonl'), [
+        JSON.stringify({ ts: '2026-01-01T00:00:00.000Z', result: 'restarted-ok', rc: 0, host_kind: 'desktop', resolved_port: 4123, new_pid: 99, main_pid: 42 }),
+        JSON.stringify({ ts: '2026-01-02T00:00:00.000Z', result: 'aborted', rc: 1, host_kind: 'desktop', resolved_port: 5000, new_pid: null, main_pid: 43 }),
+        '',
+    ].join('\n'));
+    const calls = [];
+    const tools = [
+        { name: 'win_restart_status', execute: async () => { calls.push(['status']); return { ok: true, state: 'ok', status: { hostKind: 'desktop', port: 4123 } }; } },
+        { name: 'win_restart', execute: async (args) => { calls.push(['restart', args]); return { ok: true, state: 'running', runId: 'r-1', action: args.action }; } },
+        { name: 'win_restart_result', execute: async (args) => { calls.push(['result', args]); return { ok: true, state: 'ok', runId: args.runId }; } },
+    ];
+    const api = createApi({ config: normalizeConfig({ profile: 'desktop' }), paths: { stateDir, dshHome: stateDir }, tools, version: '9.9.9' });
+    const base = 'http://127.0.0.1' + ROUTE;
+
+    const status = await api.dispatch({ method: 'GET', url: new URL(base + '/api/status'), body: {} });
+    assert.equal(status.status.port, 4123);
+    assert.deepEqual(calls[0], ['status']);
+
+    const meta = await api.dispatch({ method: 'GET', url: new URL(base + '/api/meta'), body: {} });
+    assert.equal(meta.version, '9.9.9');
+    assert.equal(meta.hostKind, 'auto');
+
+    const started = await api.dispatch({ method: 'POST', url: new URL(base + '/api/action'), body: { action: 'restart' } });
+    assert.equal(started.runId, 'r-1');
+    assert.equal(calls[1][1].action, 'restart');
+
+    const result = await api.dispatch({ method: 'GET', url: new URL(base + '/api/result?runId=r-1&waitMs=1000'), body: {} });
+    assert.equal(result.runId, 'r-1');
+    assert.equal(calls[2][1].waitMs, 1000);
+
+    const history = await api.dispatch({ method: 'GET', url: new URL(base + '/api/history?limit=2'), body: {} });
+    assert.equal(history.entries.length, 2);
+    assert.equal(history.entries[0].result, 'aborted', 'newest first');
+    assert.equal(history.entries[1].port, 4123);
+
+    await assert.rejects(
+        () => api.dispatch({ method: 'POST', url: new URL(base + '/api/action'), body: { action: 'record' } }),
+        (error) => error.status === 400,
+    );
+    await assert.rejects(
+        () => api.dispatch({ method: 'GET', url: new URL(base + '/api/nope'), body: {} }),
+        (error) => error.status === 404,
+    );
+});
+
+test('panel API: same-origin guard rejects cross-site mutation', () => {
+    assert.equal(isSameOrigin({ method: 'GET', headers: {} }), true);
+    assert.equal(isSameOrigin({ method: 'POST', headers: {} }), false);
+    assert.equal(isSameOrigin({ method: 'POST', headers: { origin: 'http://127.0.0.1:4123', host: '127.0.0.1:4123' } }), true);
+    assert.equal(isSameOrigin({ method: 'POST', headers: { origin: 'https://evil.example', host: '127.0.0.1:4123' } }), false);
+});
+
+test('client bundle: registers a sidebar tab and survives a host-free load', () => {
+    const root = dirname(dirname(fileURLToPath(import.meta.url)));
+    const source = readFileSync(join(root, 'client.js'), 'utf8');
+    let loaded = null;
+    const fakeWindow = { __ModuleLoader__: { load: (module) => { loaded = module; } } };
+    const fakeStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+    new Function('window', 'localStorage', 'fetch', 'navigator', source)(fakeWindow, fakeStorage, () => Promise.resolve({ json: () => Promise.resolve({}) }), { clipboard: { writeText: () => {} } });
+    assert.equal(loaded.id, 'dsh-restart-win');
+    const fakeReact = {
+        createElement: () => ({}),
+        useState: (value) => [value, () => {}],
+        useEffect: () => {},
+        useCallback: (fn) => fn,
+        useRef: (value) => ({ current: value }),
+        Component: class { constructor(props) { this.props = props } },
+    };
+    const moduleExports = loaded.factory((name) => (name === 'react' ? fakeReact : {}));
+    assert.ok(moduleExports.inject.includes('slots'));
+    assert.ok(moduleExports.inject.includes('sidebarRightTabs'));
+    const seen = [];
+    const ctx = {
+        effect: (fn) => { seen.push(fn()); },
+        sidebarRightTabs: { register: (def) => { seen.push(def); return () => {}; } },
+        slots: {
+            inject: (name, fn) => { seen.push(name); return fn(); },
+            register: (key) => { seen.push(key); return () => {}; },
+        },
+    };
+    moduleExports.apply(ctx);
+    assert.ok(seen.some((entry) => entry && entry.id === 'dsh-restart-win'), 'tab definition registered');
+    assert.ok(seen.includes('sidebar.right.pane.tab'));
+    assert.ok(seen.includes('sidebar.right.pane.tab.title'));
+});
+
+test('manifest: the client half is declared for the host', () => {
+    const root = dirname(dirname(fileURLToPath(import.meta.url)));
+    const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+    assert.equal(pkg.exports['./client'], './client.js');
+    assert.ok(pkg.files.includes('client.js'));
+    assert.equal(pkg.dsh.client.platform, 'web');
+    assert.deepEqual(pkg.dsh.client.inject, ['@deepseek-ai/dsh-client-ui-layout', '@deepseek-ai/dsh-client-ui-sidebar']);
 });
 
 test('host loader: an unresolvable host package reports every candidate', async () => {
@@ -1101,7 +1199,7 @@ test('host integration: apply registers four tools and disposes them on unload',
 
 test('plugin entry: name, inject and module-level load without the host', () => {
     assert.equal(pluginEntry.name, 'dsh-restart-win');
-    assert.deepEqual(pluginEntry.inject, ['tools']);
+    assert.deepEqual(pluginEntry.inject, ['tools', 'webServer']);
     assert.equal(typeof pluginEntry.apply, 'function');
     const source = readFileSync(new URL('../lib/tools.js', import.meta.url), 'utf8');
     assert.ok(!source.includes("from '@deepseek-ai/"), 'lib/tools.js must not import the host package');

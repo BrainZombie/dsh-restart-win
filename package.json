@@ -10,7 +10,8 @@
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./client": "./client.js"
   },
   "bin": {
     "dsh-restart-win": "bin/dsh-restart-win.mjs"
@@ -46,12 +47,20 @@
     },
     "compatibility": {
       "dsh": ">=0.2.1-rc.1 <0.3.0-0"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
     }
   },
   "files": [
     "lib",
     "bin",
     "scripts",
+    "client.js",
     "cordis.patch.yml",
     "install.ps1",
     "README.md",
