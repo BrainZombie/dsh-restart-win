@@ -1,0 +1,145 @@
+name: ci
+
+# Two lanes, because the two halves of this package fail in different ways:
+#   - node:    the JavaScript layer (config validation, argv building, tool
+#              definitions, detached-run bookkeeping) must work without any
+#              PowerShell. Runs on Ubuntu so a Windows-only assumption shows up
+#              as a test failure instead of hiding.
+#   - windows: the PowerShell engine must parse and round-trip under BOTH engines
+#              (pwsh 7 and Windows PowerShell 5.1), and the capability matrix must
+#              still match the code.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    name: node ${{ matrix.node }} (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # No dependency install step on purpose: the package has no runtime or dev
+      # dependencies. If one is ever added, this job must grow `npm ci`.
+      - name: Syntax check every JavaScript file
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=0
+          while IFS= read -r file; do
+            node --check "$file"
+            count=$((count + 1))
+          done < <(git ls-files '*.js' '*.mjs')
+          echo "node --check passed for $count file(s)"
+
+      - name: Unit and contract tests
+        run: npm test
+
+  windows:
+    name: powershell + parity (windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Report the two PowerShell engines
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString() + " | " + $PSVersionTable.PSEdition'
+          powershell.exe -NoProfile -Command '$PSVersionTable.PSVersion.ToString() + " | " + $PSVersionTable.PSEdition'
+
+      # BOM + LF + Parser::ParseFile for the engine and this checker, under both
+      # engines. This is the check the repository has always relied on; CI runs
+      # exactly the same script a developer runs.
+      - name: Encoding and parser check (pwsh 7)
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/check-encoding.ps1
+
+      - name: Encoding and parser check (Windows PowerShell 5.1)
+        shell: pwsh
+        run: powershell.exe -NoProfile -File scripts/check-encoding.ps1
+
+      # check-encoding only covers the engine plus itself. Every other script in
+      # the repository (install.ps1, anything added later) is parsed here, once
+      # per engine, so a 5.1-only syntax error cannot reach a user.
+      - name: Parse every .ps1 with pwsh 7
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(Get-ChildItem -Recurse -File -Filter *.ps1 |
+            Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' })
+          if ($files.Count -eq 0) { throw 'no .ps1 files found' }
+          $failed = 0
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $failed++
+              Write-Host ("FAIL {0}: {1}" -f $file.Name, $errors[0].Message)
+            }
+          }
+          Write-Host ("parsed {0} file(s) with {1}, failures={2}" -f $files.Count, $PSVersionTable.PSVersion, $failed)
+          if ($failed -gt 0) { exit 1 }
+
+      - name: Parse every .ps1 with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(Get-ChildItem -Recurse -File -Filter *.ps1 |
+            Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' })
+          if ($files.Count -eq 0) { throw 'no .ps1 files found' }
+          $failed = 0
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $failed++
+              Write-Host ("FAIL {0}: {1}" -f $file.Name, $errors[0].Message)
+            }
+          }
+          Write-Host ("parsed {0} file(s) with {1}, failures={2}" -f $files.Count, $PSVersionTable.PSVersion, $failed)
+          if ($failed -gt 0) { exit 1 }
+
+      - name: Unit and contract tests
+        shell: pwsh
+        run: npm test
+
+      # Every row of docs/parity-matrix.md must still resolve to an existing
+      # implementation symbol and an evidence entry. A missing file is a real
+      # failure, not a skipped check.
+      - name: Capability matrix parity
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath 'test/parity.mjs' -PathType Leaf)) {
+            throw 'test/parity.mjs is missing: docs/parity-matrix.md cannot be verified without it'
+          }
+          node test/parity.mjs

@@ -1,0 +1,36 @@
+# 依赖与打包产物
+node_modules/
+*.tgz
+*.tar.gz
+
+# 本地工作区（契约、论证、审计、取证）：绝不发布
+.local/
+.evidence/
+evidence/
+_bak/
+
+# 运行期产物：日志、状态目录、分离执行的 run 记录与结果文件
+*.log
+*.result.json
+*.pending.json
+*.launch.json
+*.request.json
+*.tmp-*
+runs/
+.dsh-restart-run/
+dsh-verify.*/
+*.db
+*.db-wal
+*.db-shm
+
+# 临时与覆盖率
+tmp/
+temp/
+coverage/
+*.bak
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

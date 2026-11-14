@@ -1,0 +1,62 @@
+{
+  "name": "@brainzombie/dsh-restart-win",
+  "version": "0.1.0",
+  "description": "Safe, verified restart of a DSH Web host on Windows: port-based instance discovery, fail-closed preflight, detached restart with a result file, and four host tools (win_restart / win_restart_status / win_restart_preflight / win_restart_result).",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-restart-win": "bin/dsh-restart-win.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BrainZombie/dsh-restart-win.git"
+  },
+  "homepage": "https://github.com/BrainZombie/dsh-restart-win#readme",
+  "bugs": {
+    "url": "https://github.com/BrainZombie/dsh-restart-win/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "restart",
+    "windows",
+    "powershell",
+    "service-restart",
+    "self-restart"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.1"
+  },
+  "scripts": {
+    "test": "node test/selftest.mjs && node test/parity.mjs && node test/integration.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dsh": ">=0.2.1-rc.1 <0.3.0-0"
+    }
+  },
+  "files": [
+    "lib",
+    "bin",
+    "scripts",
+    "cordis.patch.yml",
+    "install.ps1",
+    "README.md",
+    "README.zh.md",
+    "docs/migration.md",
+    "LICENSE"
+  ]
+}
