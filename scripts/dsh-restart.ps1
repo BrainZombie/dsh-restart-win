@@ -104,7 +104,8 @@ param(
 
   # 分离执行支撑（插件/自动化用；人工使用时不必传）
   [string]$ResultFile = '',   # 最终结果 JSON 落盘路径（任何终态都写）
-  [switch]$NoWait             # 收尾不停留：跳过等新 boot token 的 20s，只做一次非阻塞扫描
+  [switch]$NoWait,            # 收尾不停留：跳过等新 boot token 的 20s，只做一次非阻塞扫描
+  [string]$LaunchRecord = ''  # 内部：交接模式下引擎自报 pid（见 lib/delayed-spawn.mjs 的 handoff）
 )
 
 $ErrorActionPreference = 'Stop'
@@ -2729,6 +2730,15 @@ function Test-DesktopVerify {
 
 $exit = 1
 try {
+  # ---- -0. 交接模式（desktop host）：先把自己的 pid 写进 launch 记录。
+  #      独立执行的 supervisor 可能已经被宿主进程树带走，宿主侧靠这条记录跟踪引擎。
+  if ($LaunchRecord) {
+    try {
+      $rec = [ordered]@{ phase = 'engine-running'; enginePid = $PID; at = (Get-NowIso); via = 'handoff' }
+      New-Utf8NoBom $LaunchRecord ($rec | ConvertTo-Json -Compress)
+    } catch { }
+  }
+
   # ---- 0. 分离执行支撑的入参（新增参数：只影响入参校验，不改任何既有退出码语义）
   #   -ResultFile 必须先证明写得进去再动手：否则一次重启成功后却拿不到结果文件，消费方
   #   只能靠超时判失败。写不进去属于「入参不可用」，按既有 invalid-args 语义退出 2。
