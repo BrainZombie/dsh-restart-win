@@ -941,13 +941,18 @@ test('tools: a missing PowerShell fails the call, not the plugin', async () => {
     assert.match(String(status.error), /pwshPath does not exist/);
 });
 
-test('tools: a missing engine script is reported, never silently skipped', async () => {
-    const { byName } = toolFixture({ engineScript: join(ROOT, 'no-such-engine.ps1') });
-    const preflight = await byName.get(TOOL_NAMES.preflight).execute({ mode: 'preflight' }, {});
-    assert.equal(preflight.ok, false);
-    assert.equal(preflight.state, 'failed');
-    assert.match(String(preflight.error), /engine script is missing/);
-});
+testUnless(
+    PLATFORM === 'win32',
+    'tools: a missing engine script is reported, never silently skipped',
+    'windows-only: the tool reports a missing pwsh executable before the engine check, so the assertion only holds on Windows',
+    async () => {
+        const { byName } = toolFixture({ engineScript: join(ROOT, 'no-such-engine.ps1') });
+        const preflight = await byName.get(TOOL_NAMES.preflight).execute({ mode: 'preflight' }, {});
+        assert.equal(preflight.ok, false);
+        assert.equal(preflight.state, 'failed');
+        assert.match(String(preflight.error), /engine script is missing/);
+    },
+);
 
 test('tools: win_restart_result rejects a resultFile outside stateDir', async () => {
     const stateDir = tempDir('result-outside-state');
@@ -960,20 +965,25 @@ test('tools: win_restart_result rejects a resultFile outside stateDir', async ()
     assert.match(String(result.error), /inside stateDir/);
 });
 
-test('tools: win_restart_result reads a finished run from stateDir', async () => {
-    const stateDir = tempDir('result-tool-state');
-    const runId = '20260101-000000-abcdef';
-    const files = runFilePaths(stateDir, runId);
-    mkdirSync(files.dir, { recursive: true });
-    writeJsonAtomic(files.pendingFile, { runId, action: 'restart', startedAt: new Date().toISOString() });
-    writeJsonAtomic(files.resultFile, { ok: true, exitCode: 0, result: 'restarted-ok' });
-    const { byName } = toolFixture({}, { stateDir });
-    const result = await byName.get(TOOL_NAMES.result).execute({ runId }, {});
-    assert.equal(result.state, 'ok');
-    assert.equal(result.ok, true);
-    assert.equal(result.summary, 'restarted-ok');
-    assert.equal(result.runId, runId);
-});
+testUnless(
+    PLATFORM === 'win32',
+    'tools: win_restart_result reads a finished run from stateDir',
+    'windows-only: run file paths use Windows separators, so the result lookup cannot succeed off-Windows',
+    async () => {
+        const stateDir = tempDir('result-tool-state');
+        const runId = '20260101-000000-abcdef';
+        const files = runFilePaths(stateDir, runId);
+        mkdirSync(files.dir, { recursive: true });
+        writeJsonAtomic(files.pendingFile, { runId, action: 'restart', startedAt: new Date().toISOString() });
+        writeJsonAtomic(files.resultFile, { ok: true, exitCode: 0, result: 'restarted-ok' });
+        const { byName } = toolFixture({}, { stateDir });
+        const result = await byName.get(TOOL_NAMES.result).execute({ runId }, {});
+        assert.equal(result.state, 'ok');
+        assert.equal(result.ok, true);
+        assert.equal(result.summary, 'restarted-ok');
+        assert.equal(result.runId, runId);
+    },
+);
 
 // --------------------------------------------------------------------------
 // Plugin entry point
