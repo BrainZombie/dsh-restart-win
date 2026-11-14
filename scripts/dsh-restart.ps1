@@ -2806,13 +2806,17 @@ try {
     exit 0
   }
 
-  # ---- 0. 锁
-  if (-not (Enter-RestartLock)) {
-    Add-Step 'lock' "已有另一个 dsh-restart 在跑（Local\dsh-restart-$Port），立刻退出" 'fail'
-    Write-Terminal 'locked' 2
-    exit 2
+  # ---- 0. 锁（只读的 -Status 不取锁：面板每 8s 刷一次状态，取锁会把真正的动作挤成 locked）
+  if (-not $Status) {
+    if (-not (Enter-RestartLock)) {
+      Add-Step 'lock' "已有另一个 dsh-restart 在跑（$(Get-MutexName)），立刻退出" 'fail'
+      Write-Terminal 'locked' 2
+      exit 2
+    }
+    Add-Step 'lock' ("已取得互斥体 " + (Get-MutexName) + "（句柄不继承）") 'ok'
+  } else {
+    Add-Step 'lock' '只读状态：不取重启锁（不阻塞也不会被阻塞）' 'skip'
   }
-  Add-Step 'lock' ("已取得互斥体 " + (Get-MutexName) + "（句柄不继承）") 'ok'
 
   # ---- 0a. 引擎能力闸门：验证型重启需要 pwsh 7（5.1 缺 Start-Process -Environment 与
   #      New-Item -ItemType SymbolicLink）。必须在**停机之前**明确报错 —— 否则异常会落在

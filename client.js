@@ -205,10 +205,11 @@ window.__ModuleLoader__.load({
 
     // ─────────────────────────────────────────────────────── 历史
     function HistoryCard(props) {
-      var entries = props.entries
+      // 引擎每次 -Status 也会写一条审计；面板的「最近重启」只看真正的动作。
+      var entries = (props.entries || []).filter(function (entry) { return entry && entry.result !== 'status' })
       return h('div', { style: S.card },
         h('div', { style: S.sectionTitle }, '最近重启'),
-        !entries || !entries.length ? h('div', { style: S.dim }, '暂无记录。') :
+        !entries.length ? h('div', { style: S.dim }, '暂无记录。') :
           entries.map(function (entry, index) {
             var color = entry.result === 'restarted-ok' ? S.ok : (entry.rc === 0 ? S.dim : S.danger)
             return h('div', { key: index, style: { ...S.row, fontSize: 11 } },
@@ -244,8 +245,12 @@ window.__ModuleLoader__.load({
 
       var timer = React.useRef(null)
       var alive = React.useRef(true)
+      var busyRef = React.useRef('')
+      var runningRef = React.useRef(false)
 
       var refresh = React.useCallback(function () {
+        // 动作在跑的时候别刷状态：引擎的 status 也要跑一次脚本，纯属抢资源。
+        if (busyRef.current || runningRef.current) return
         api('/api/status').then(function (payload) {
           if (!alive.current) return
           if (!payload || typeof payload !== 'object') payload = { ok: false, error: '空响应' }
@@ -272,6 +277,7 @@ window.__ModuleLoader__.load({
 
       var poll = React.useCallback(function (runId, label) {
         stopPolling()
+        runningRef.current = true
         setRun({ runId: runId, label: label, value: null, running: true, waitingHost: false })
         function tick() {
           if (!alive.current) return
@@ -282,6 +288,7 @@ window.__ModuleLoader__.load({
             if (payload.state === 'running') {
               timer.current = setTimeout(tick, 1200)
             } else {
+              runningRef.current = false
               try { localStorage.removeItem(STORE_KEY) } catch (e) { /* ignore */ }
               refresh()
             }
@@ -300,7 +307,7 @@ window.__ModuleLoader__.load({
       React.useEffect(function () {
         alive.current = true
         refresh()
-        var interval = setInterval(refresh, 8000)
+        var interval = setInterval(refresh, 10000)
         var saved = null
         try { saved = localStorage.getItem(STORE_KEY) } catch (e) { saved = null }
         if (saved) poll(saved, '恢复上次运行')
@@ -324,6 +331,7 @@ window.__ModuleLoader__.load({
           setConfirm('')
         }
         setBusy(action)
+        busyRef.current = action
         api('/api/action', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -331,6 +339,7 @@ window.__ModuleLoader__.load({
         }).then(function (payload) {
           if (!alive.current) return
           setBusy('')
+          busyRef.current = ''
           if (!payload || payload.ok !== true) {
             setRun({ runId: null, label: action, value: payload || { ok: false, error: '空响应' }, running: false, waitingHost: false })
             return
@@ -345,6 +354,7 @@ window.__ModuleLoader__.load({
         }).catch(function (err) {
           if (!alive.current) return
           setBusy('')
+          busyRef.current = ''
           setRun({ runId: null, label: action, value: { ok: false, error: String((err && err.message) || err) }, running: false, waitingHost: false })
         })
       }

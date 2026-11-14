@@ -546,11 +546,17 @@ test('panel API: status / action / result / history go through the tool definiti
     );
 });
 
-test('panel API: same-origin guard rejects cross-site mutation', () => {
-    assert.equal(isSameOrigin({ method: 'GET', headers: {} }), true);
-    assert.equal(isSameOrigin({ method: 'POST', headers: {} }), false);
-    assert.equal(isSameOrigin({ method: 'POST', headers: { origin: 'http://127.0.0.1:4123', host: '127.0.0.1:4123' } }), true);
-    assert.equal(isSameOrigin({ method: 'POST', headers: { origin: 'https://evil.example', host: '127.0.0.1:4123' } }), false);
+test('panel API: same-origin guard accepts the app origins and rejects the web', () => {
+    const loopback = '127.0.0.1:4123';
+    assert.equal(isSameOrigin({ method: 'GET', headers: { host: loopback } }), true);
+    assert.equal(isSameOrigin({ method: 'POST', headers: { host: loopback } }), true);
+    assert.equal(isSameOrigin({ method: 'POST', headers: { host: loopback, origin: 'http://127.0.0.1:4123' } }), true);
+    // The desktop shell renders from dsh-app://, so its fetches carry an opaque origin.
+    assert.equal(isSameOrigin({ method: 'POST', headers: { host: loopback, origin: 'null' } }), true);
+    assert.equal(isSameOrigin({ method: 'POST', headers: { host: loopback, origin: 'dsh-app://dsh' } }), true);
+    assert.equal(isSameOrigin({ method: 'POST', headers: { host: loopback, origin: 'https://evil.example' } }), false);
+    assert.equal(isSameOrigin({ method: 'POST', headers: {} }), false, 'no Host header is never same-origin');
+    assert.equal(isSameOrigin({ method: 'POST', headers: { host: 'evil.example', origin: 'https://evil.example' } }), false);
 });
 
 test('client bundle: registers a sidebar tab and survives a host-free load', () => {
