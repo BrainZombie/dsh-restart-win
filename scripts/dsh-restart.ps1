@@ -208,6 +208,8 @@ $script:Desktop           = $null
 $script:MainPid           = $null
 $script:NewMainPid        = $null
 $script:DesktopAppPath    = $null
+# -Profile 是否由用户显式指定：桌面版下若没指定，profile 从运行中的宿主推导
+$script:ProfileExplicit   = $PSBoundParameters.ContainsKey('Profile')
 
 # 启动形状兜底。
 # 【实测踩坑记录（2026-09-12，真实事故）】这里曾经写成 `pnpm dsh web ...` + cwd=<仓库根>，
@@ -2119,6 +2121,9 @@ function Exit-RestartLock {
 function Show-Status {
   Resolve-HostKind
   $instances = @(Get-DshInstances)   # @() 强制成数组：函数返回空数组会被解包成 $null
+  if ($script:HostKind -eq 'desktop' -and $instances.Count -ge 1 -and -not $script:ProfileExplicit -and $instances[0].profile) {
+    $Profile = [string]$instances[0].profile
+  }
   if ($script:HostKind -eq 'desktop' -and $instances.Count -ge 1 -and $instances[0].port -gt 0) {
     $Port = $instances[0].port
     $script:ResolvedPort = $Port
@@ -2365,6 +2370,8 @@ function Get-DesktopInstances {
     $paths = Get-DesktopPaths $mainPath
     if (-not (Test-Path -LiteralPath $paths.asar -PathType Leaf)) { continue }
     if ($h.commandLine -notlike ('*' + $paths.runtimeDir + '*')) { continue }
+    $profileName = ''
+    if ($h.commandLine -match '[\\/]profiles[\\/]([A-Za-z0-9][A-Za-z0-9._-]{0,63})') { $profileName = $Matches[1] }
     $ports = @(Get-ListeningPorts $h.pid)
     $chosen = 0
     $httpStatus = 0
@@ -2381,6 +2388,7 @@ function Get-DesktopInstances {
       isNode         = $true
       kind           = 'desktop-host'
       mainPid        = $h.mainPid
+      profile        = $profileName
       mainPath       = $mainPath
       exe            = $paths.exe
       appRoot        = $paths.appRoot
@@ -2410,6 +2418,31 @@ function Resolve-HostKind {
     $script:HostKind = 'desktop'; return
   }
   $script:HostKind = 'web'
+}
+
+function Resolve-DesktopProfileName {
+  <#
+    桌面版下 -Profile 的默认值（web）是错的：宿主只跑 desktop。若用户没显式给 -Profile，
+    从运行中宿主的命令行（...\profiles\<name>）推导，其次用启动档案里的 profile。
+    必须在 -Preflight / -VerifyOnly 分支之前调用 —— 那条路不经过实例发现。
+  #>
+  if ($script:ProfileExplicit) { return }
+  if ($script:HostKind -ne 'desktop') { return }
+  foreach ($h in @(Get-DesktopHostProcesses)) {
+    if ($h.commandLine -match '[\\/]profiles[\\/]([A-Za-z0-9][A-Za-z0-9._-]{0,63})') {
+      $name = [string]$Matches[1]
+      if ($name -and $name -ne $Profile) {
+        Add-Step 'profile' "profile 自动取自运行中的宿主：$name（默认值 $Profile 是 dsh web 的）" 'ok'
+        $script:Profile = $name
+      }
+      return
+    }
+  }
+  $rec = Get-BootRecord
+  if ($rec -and $rec.profile -and [string]$rec.profile -ne $Profile) {
+    Add-Step 'profile' "profile 自动取自启动档案：$($rec.profile)" 'ok'
+    $script:Profile = [string]$rec.profile
+  }
 }
 
 function Resolve-DesktopAppPath {
@@ -2577,7 +2610,8 @@ function Test-DesktopVerify {
     New-Item -ItemType Directory -Path $vProfile -Force | Out-Null
     $srcProfile = Join-Path $DshHome ('profiles\' + $Profile)
     if (-not (Test-Path -LiteralPath $srcProfile)) {
-      $why = "真实 profile 不存在：$srcProfile（-Profile '$Profile' 是否正确？）"
+      $existing = @(Get-ChildItem -LiteralPath (Join-Path $DshHome 'profiles') -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+      $why = "真实 profile 不存在：$srcProfile（-Profile '$Profile' 是否正确？现有 profile：$($existing -join ', ')）"
       Add-Step 'deep-verify' $why 'fail'
       return [pscustomobject]@{ ok = $false; reason = 'profile-missing' }
     }
@@ -2733,6 +2767,7 @@ try {
   # ---- 0-host. 宿主形态（auto → web/desktop）：必须在取锁之前，互斥体名字依赖它
   Resolve-HostKind
   Add-Step 'host-kind' $(if ($script:HostKind -eq 'desktop') { 'desktop：DSH Desktop（Electron 主进程 + dsh-desktop-host 子进程，端口实测）' } else { 'web：dsh web 进程（按端口发现）' }) 'ok'
+  Resolve-DesktopProfileName
 
   if ($UnregisterTask) {
     $o = & schtasks.exe /Delete /TN $TaskName /F 2>&1
@@ -2836,10 +2871,19 @@ try {
       $script:Desktop = $instances[0]
       $script:MainPid = $instances[0].mainPid
       $script:DesktopAppPath = $instances[0].exe
+      if (-not $script:ProfileExplicit -and $instances[0].profile -and $Profile -ne $instances[0].profile) {
+        Add-Step 'profile' "profile 自动取自运行中的宿主：$($instances[0].profile)（默认值 $Profile 是 dsh web 的）" 'ok'
+        $Profile = [string]$instances[0].profile
+      }
       if ($instances[0].port -gt 0) { $Port = $instances[0].port; $script:ResolvedPort = $Port }
       Add-Step 'discover' "桌面版：主进程 pid=$($script:MainPid)，宿主 pid=$($instances[0].pid)，实测端口 $(if ($instances[0].port -gt 0) { $instances[0].port } else { '未就绪' })（配置端口 $($script:ConfiguredPort) 仅作期望值）" 'ok'
     } else {
       Add-Step 'discover' "桌面版：没有运行中的 DSH Desktop 宿主（冷启动；启动档案 exe=$(if (Resolve-DesktopAppPath) { Resolve-DesktopAppPath } else { '未找到' })）" $(if ($Start) { 'ok' } else { 'warn' })
+      $bootRec = Get-BootRecord
+      if (-not $script:ProfileExplicit -and $bootRec -and $bootRec.profile) {
+        Add-Step 'profile' "profile 自动取自启动档案：$($bootRec.profile)" 'ok'
+        $Profile = [string]$bootRec.profile
+      }
     }
   }
 
