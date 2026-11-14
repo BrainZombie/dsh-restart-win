@@ -1193,33 +1193,50 @@ PROBES['M-14'] = [{ file: PACKAGE, fn: (ctx) => {
  * Prove the scanner still catches what it is for, on this machine, without
  * ever printing the matched text:
  *
- *   - an injected profile path (built from the environment at run time) is found;
+ *   - an injected Windows profile path is found (`C:\Users\<name>\…`);
+ *   - an injected POSIX home path is found (`/home/<name>/…`);
  *   - a local machine term is found when the term list exists;
  *   - an empty scope returns zero hits instead of throwing.
+ *
+ * The injected names are fixed literals that are deliberately *not* in
+ * `PLACEHOLDER_NAMES`: a value taken from the environment (e.g. `USERNAME`)
+ * would be absent on a CI runner and fall back to something the scanner
+ * correctly ignores as a placeholder, which would make this check fail for the
+ * wrong reason.
  *
  * @returns {string} one-line summary
  */
 function scannerSelfCheck() {
     const terms = redactionTerms();
-    const username = process.env.USERNAME || 'sample';
-    const injectedPath = ['C:', 'Users', username, 'Documents'].join('\\');
-    const injected = scanForLeaks(`prefix ${injectedPath} suffix`, terms);
+
+    const windowsPath = ['C:', 'Users', 'k7x-not-a-placeholder', 'Documents'].join('\\');
+    const windowsHits = scanForLeaks(`prefix ${windowsPath} suffix`, terms);
     assert.ok(
-        injected.some((hit) => hit.category === 'windows-user-profile' || hit.category === 'machine-term'),
-        'the scanner did not detect an injected profile path',
+        windowsHits.some((hit) => hit.category === 'windows-user-profile'),
+        `the scanner did not report category windows-user-profile for an injected Windows profile path (got: ${windowsHits.map((hit) => hit.category).join(', ') || 'no hits'})`,
+    );
+
+    const posixPath = ['', 'home', 'k7x-not-a-placeholder', 'docs'].join('/');
+    const posixHits = scanForLeaks(`prefix ${posixPath} suffix`, terms);
+    assert.ok(
+        posixHits.some((hit) => hit.category === 'posix-home'),
+        `the scanner did not report category posix-home for an injected POSIX home path (got: ${posixHits.map((hit) => hit.category).join(', ') || 'no hits'})`,
     );
 
     let termNote = 'machine terms: 0 (no local list and an empty environment)';
     if (terms.terms.length > 0) {
         const injectedTerm = scanForLeaks(`prefix ${terms.terms[0]} suffix`, terms);
-        assert.ok(injectedTerm.some((hit) => hit.category === 'machine-term'), 'the scanner did not detect a machine term');
+        assert.ok(
+            injectedTerm.some((hit) => hit.category === 'machine-term'),
+            `the scanner did not report category machine-term for a term from ${terms.source}`,
+        );
         termNote = `machine terms: ${terms.terms.length} from ${terms.source}`;
     }
 
     const empty = scanForLeaks('clean text with no identifiers at all', { terms: [], shapes: [], allow: [], source: 'none' });
     assert.deepEqual(empty, [], 'an empty scope produced a hit');
 
-    return `scan-selfcheck: ok (injected profile path detected; ${termNote}; empty scope: 0 hits, no crash)`;
+    return `scan-selfcheck: ok (injected windows-user-profile + posix-home detected; ${termNote}; empty scope: 0 hits, no crash)`;
 }
 
 /**
