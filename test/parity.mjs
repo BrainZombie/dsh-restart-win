@@ -776,7 +776,7 @@ PROBES['S-05'] = [{
         assert.ok(/host\.out\.log（-Status 校验后补写）/.test(text), 'source value for the -Status refresh');
     },
 }];
-PROBES['S-06'] = [eng(/'host\.out\.log'/), eng(/'host\.err\.log'/)];
+PROBES['S-06'] = [eng(/host\.\$\(\$script:HostKind\)\.out\.log/), eng(/host\.\$\(\$script:HostKind\)\.err\.log/)];
 PROBES['S-07'] = [eng(/UnicodeEncoding\(\$false, \$true\)/), eng(/function Get-TaskXmlPath/), eng(/'dsh-restart\.task\.xml'/)];
 PROBES['S-08'] = [eng(/Join-Path \(Get-StatePath 'fallback'\) 'dsh-restart\.log'/), eng(/Join-Path \(Get-StatePath 'fallback'\) 'restart-history\.jsonl'/), eng(/break/g, { min: 2 })];
 PROBES['S-09'] = [eng(/"dsh-verify\." \+ \[guid\]::NewGuid/), eng(/KeepDir/)];
@@ -865,7 +865,10 @@ PROBES['D-03'] = [{ file: ENGINE, inFunction: 'Get-HostCandidate', fn: (ctx) => 
     }
 } }];
 PROBES['D-04'] = [eng(/\$proc\.ProcessName -match '\^\(node\|dsh\|bun\)\$'/)];
-PROBES['D-05'] = [{ file: ENGINE, inFunction: 'Get-HostCandidate', lacks: /CommandLine/, note: 'never fuzzy-matches a command line (R4)' }];
+PROBES['D-05'] = [
+    { file: ENGINE, inFunction: 'Get-HostCandidate', has: /Get-PortOwner \$Port/, note: 'the port listener stays the authority (R4)' },
+    { file: ENGINE, inFunction: 'Get-HostCandidate', has: /\$cmd -match/, note: 'the command line only refines isNode when the dsh web host is the Electron CLI shim' },
+];
 PROBES['D-06'] = [{ file: ENGINE, inFunction: 'Test-HostAlive', has: /Get-PortOwner/ }];
 PROBES['D-07'] = [{ file: ENGINE, inFunction: 'Get-CimAvailable', has: /CimInstance|Win32_Process/ }, eng(/CIM 不可用（沙箱\/权限）→ 以端口监听者为权威/)];
 PROBES['D-08'] = [eng(/\$hop -lt 6/), eng(/port-owner-mismatch/)];

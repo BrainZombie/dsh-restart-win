@@ -430,7 +430,7 @@ dsh-restart-win -DryRun
 | `restart-history.jsonl` | 引擎 | 每次执行一条 JSON 审计记录（16 个字段：`ts` / `version` / `result` / `rc` / `profile` / `port` / `target_pid` / `new_pid` / `url` / `session` / `reason` / `host` / `user` / `steps` / `warnings` / `audit`）。**不轮转** |
 | `dsh-restart.log` | 引擎 | 每次执行一行人类可读终态 |
 | `web-auth-url.txt` | 引擎 | 访问地址缓存：`url` / `token` / `pid` / `port` / `profile` / `savedAt` / `source`。含真实 token，按凭据对待 |
-| `host.out.log` / `host.err.log` | 引擎 | 被拉起宿主的 stdout / stderr（追加 banner 后重定向） |
+| `host.<hostKind>.out.log` / `.err.log` | 引擎 | 被拉起宿主的 stdout / stderr（追加 banner 后重定向）。按宿主形态分文件：桌面 App 会在整个生命周期里占着自己的日志句柄，共用一个名字会让另一侧的拉起失败 |
 | `dsh-restart.task.xml` | 引擎（`-RegisterTask`） | 计划任务定义，UTF-16LE 带 BOM（`schtasks` 的要求） |
 | `fallback\` | 引擎 | 上述日志 / 历史写失败时的第二落点 |
 | `runs\<runId>.pending.json` | 插件 | 分离任务的登记记录（动作、延迟、引擎脚本、pwsh 来源、宿主 pid、launcher pid） |

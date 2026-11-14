@@ -1175,6 +1175,16 @@ function Get-HostCandidate {
     $proc = Get-Process -Id $p -ErrorAction SilentlyContinue
     if (-not $proc) { continue }
     $isNode = ($proc.ProcessName -match '^(node|dsh|bun)$')
+    $cmd = ''
+    if (-not $isNode) {
+      # 这台机器的 `dsh` 是桌面版自带的 CLI shim：`dsh web` 实际是 Electron 进程跑
+      # dsh-desktop-host\lib\cli.js web，进程名不是 node —— 只按进程名判会误拒 -Stop。
+      try {
+        $ci = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue
+        if ($ci) { $cmd = [string]$ci.CommandLine }
+      } catch { $cmd = '' }
+      if ($cmd -match '(?i)(lib[\\/](bin|cli)\.js["'']?\s+web|dsh(\.cmd|\.exe)?["'']?\s+web)') { $isNode = $true }
+    }
     [void]$cands.Add([pscustomobject]@{
       pid     = $p
       name    = $proc.ProcessName
@@ -1220,6 +1230,7 @@ function Save-BootRecord([string]$CommandLine, [string]$WorkingDirectory) {
     command    = $CommandLine
     cwd        = $WorkingDirectory
     profile    = $Profile
+    hostKind   = $script:HostKind
     port       = $Port
     host       = $BindHost
     dshHome    = $DshHome
@@ -1239,6 +1250,15 @@ function Resolve-Launch {
   # 统一用 cmd.exe /c 重放命令文本：启动档案里记的就是用户在 shell 里敲的那一行，
   # 重放它比把命令拆成 argv 更贴近真实（也避免 pnpm/node 路径解析差异）。
   $rec = Get-BootRecord
+  # 启动档案是**共享**的：桌面版记的是 App 的 exe，web 模式绝不能重放它
+  # （否则 `-Profile web` 会把 web 宿主停掉、却把桌面 App 拉起来）。
+  if ($rec -and $rec.command) {
+    $desktopRecord = ([string](Get-JsonField $rec 'hostKind') -eq 'desktop') -or ([string]$rec.command -match '(?i)DeepSeek Harness\.exe')
+    if ($desktopRecord) {
+      Add-Step 'launch' "启动档案是 DSH Desktop 的记录（$($rec.command)）→ web 模式忽略它，改用 DEFAULT_LAUNCH" 'warn'
+      $rec = $null
+    }
+  }
   if ($rec -and $rec.command) {
     $cwd = if ($rec.cwd) { $rec.cwd } else { (Get-Location).Path }
     $resolved = Resolve-DirectLaunch ($rec.command) "$Port"
@@ -1978,8 +1998,10 @@ function Start-DshInstance {
   }
 
   $launch = Resolve-Launch
-  $webOut = Get-StatePath 'host.out.log'
-  $webErr = Get-StatePath 'host.err.log'
+  # 日志按宿主形态分文件：桌面 App 会用 stdout 句柄长期占住自己的日志，
+  # 与 web 宿主共用同一个 host.out.log 时，后拉起的一方连 banner 都写不进去。
+  $webOut = Get-StatePath ("host.$($script:HostKind).out.log")
+  $webErr = Get-StatePath ("host.$($script:HostKind).err.log")
   if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Force -Path $StateDir | Out-Null }
 
   foreach ($f in @($webOut, $webErr)) {
@@ -1989,7 +2011,7 @@ function Start-DshInstance {
     # 的 UTF8 明确写死 —— Add-Content -Encoding UTF8 在两个引擎上并不等价：实测新建文件时
     # 5.1 会先写 EF BB BF、pwsh 7 不写（追加到已有文件时两者才一致）。显式编码后 banner
     # 的字节在 5.1 与 pwsh 下完全相同，不会出现 GBK/混编码。
-    [System.IO.File]::AppendAllText($f, $banner, (New-Object System.Text.UTF8Encoding($false)))
+    try { [System.IO.File]::AppendAllText($f, $banner, (New-Object System.Text.UTF8Encoding($false))) } catch { }
   }
 
   # boot token 判据的基线：拉起前记下旧 token 与日志长度。
@@ -2524,12 +2546,12 @@ function Start-DesktopApp {
   } else {
     Add-Step 'env' '按 DSH_RESTART_INJECT_HOST_ENV=0 跳过宿主环境注入' 'skip'
   }
-  $webOut = Get-StatePath 'host.out.log'
-  $webErr = Get-StatePath 'host.err.log'
+  $webOut = Get-StatePath ("host.$($script:HostKind).out.log")
+  $webErr = Get-StatePath ("host.$($script:HostKind).err.log")
   if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Force -Path $StateDir | Out-Null }
   foreach ($f in @($webOut, $webErr)) {
     $banner = ("`n===== dsh-restart {0} 拉起 DSH Desktop cmd={1} =====`r`n" -f (Get-Date -Format o), $plan.raw)
-    [System.IO.File]::AppendAllText($f, $banner, (New-Object System.Text.UTF8Encoding($false)))
+    try { [System.IO.File]::AppendAllText($f, $banner, (New-Object System.Text.UTF8Encoding($false))) } catch { }
   }
   $script:HostOutPath = $webOut
   $script:HostErrPath = $webErr

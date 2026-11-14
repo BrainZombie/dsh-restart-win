@@ -430,7 +430,7 @@ Default state directory: `%LOCALAPPDATA%\dsh-restart` (override with `stateDir`;
 | `restart-history.jsonl` | engine | One JSON audit record per execution (16 fields: `ts` / `version` / `result` / `rc` / `profile` / `port` / `target_pid` / `new_pid` / `url` / `session` / `reason` / `host` / `user` / `steps` / `warnings` / `audit`). **Never rotated** |
 | `dsh-restart.log` | engine | One human-readable terminal line per execution |
 | `web-auth-url.txt` | engine | Launch-URL cache: `url` / `token` / `pid` / `port` / `profile` / `savedAt` / `source`. Contains a real token — treat it as a credential |
-| `host.out.log` / `host.err.log` | engine | stdout / stderr of the launched host (banner appended, then redirected) |
+| `host.<hostKind>.out.log` / `.err.log` | engine | stdout / stderr of the launched host (banner appended, then redirected). Separate files per host kind: the desktop app keeps its own log handle for its whole lifetime, so sharing one name makes the other kind's launch fail |
 | `dsh-restart.task.xml` | engine (`-RegisterTask`) | Scheduled-task definition, UTF-16LE with BOM (`schtasks` requires it) |
 | `fallback\` | engine | Second location when the log / history write fails |
 | `runs\<runId>.pending.json` | plugin | Detached-run registration (action, delay, engine script, pwsh source, host pid, launcher pid) |
