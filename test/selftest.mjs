@@ -560,7 +560,7 @@ test('client bundle: registers a sidebar tab and survives a host-free load', () 
     const fakeWindow = { __ModuleLoader__: { load: (module) => { loaded = module; } } };
     const fakeStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
     new Function('window', 'localStorage', 'fetch', 'navigator', source)(fakeWindow, fakeStorage, () => Promise.resolve({ json: () => Promise.resolve({}) }), { clipboard: { writeText: () => {} } });
-    assert.equal(loaded.id, 'dsh-restart-win');
+    assert.equal(loaded.id, '@brainzombie/dsh-restart-win', 'the bundle id must be the package name');
     const fakeReact = {
         createElement: () => ({}),
         useState: (value) => [value, () => {}],

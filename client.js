@@ -11,8 +11,14 @@
  * 走宿主同源 cookie，不额外拿 token。本文件是手工维护的 __ModuleLoader__ bundle
  * （与 dsh-card-library 同一约定），不含 JSX；改完 `node --check client.js`。
  */
+// 宿主在某些安装形态下会把同一个 bundle 执行两次（scoped link: 包实测）：第二次会触发
+// client-modules 的 duplicate factory registration，整个插件被丢弃。这里做幂等。
+if (!window.__dshRestartWinBundleLoaded) {
+window.__dshRestartWinBundleLoaded = true
 window.__ModuleLoader__.load({
-  id: 'dsh-restart-win',
+  // 必须是**包名**：client 加载器按 manifest 的 id（= 包名）把 factory 与插件记录对上，
+  // 写成短名只会注册 factory、永远不调用 apply（实测：面板不出现且没有任何报错）。
+  id: '@brainzombie/dsh-restart-win',
   factory(require) {
     var React = require('react')
     var h = React.createElement
@@ -441,3 +447,5 @@ window.__ModuleLoader__.load({
     }
   },
 })
+
+}
