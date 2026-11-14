@@ -92,7 +92,7 @@
 | F-14 | `-Stop` 判活复核（R14）：目标已消失按已消失处理 | bin/dsh-restart.ps1:2117-2119 | scripts/dsh-restart.ps1::Test-HostAlive | 不变 | parity:F-14 |
 | F-15 | `-Stop` 与主流程共用的停机序列：可选 Ctrl+C → `Stop-DshInstance` → 等端口释放 → 报占用者放弃 | bin/dsh-restart.ps1:2120-2128；2267-2286 | scripts/dsh-restart.ps1::Stop-DshInstance / ::Wait-PortFree | 不变 | parity:F-15 断言两处调用顺序一致 |
 | F-16 | 组合校验（`--dump-config`）作为**快速失败信号**：exit≠0 且非权限类 → rc=3；权限类（EPERM/EACCES/拒绝访问/cannot resolve profile bundle）→ 判据不明，不拦截 | bin/dsh-restart.ps1:2141-2170（判定 2154-2164） | scripts/dsh-restart.ps1::main | 不变（**不许**升级为安全判据：dsh 任何子命令都会真 boot 并写 cordis.yml） | parity:F-16 断言 `$permish` 正则与 `$dumpOk` 三态（true/false/null）；本机历史 5 次 config-invalid |
-| F-17 | 深度验证分支：符号链接预检 → 停机权限预检（elev-gate）→ 深度验证（带一次重试）→ 失败 rc=4 | bin/dsh-restart.ps1:2175-2202 | scripts/dsh-restart.ps1::main | 不变 | parity:F-17 断言 elev-gate 在 deep-verify 之前（省掉 60s 白跑） |
+| F-17 | 深度验证分支：符号链接预检 → 停机权限预检（elev-gate）→ 深度验证（带一次重试）→ 失败 rc=4 | bin/dsh-restart.ps1:2175-2202 | scripts/dsh-restart.ps1::main | 扩展（desktop 分支对 main pid 做同一闸门） | parity:F-17 断言 elev-gate 在 deep-verify 之前（省掉 60s 白跑） |
 | F-18 | 深度验证被跳过（找不到 dsh 本体）→ 仅 warn，不失败 | bin/dsh-restart.ps1:1326；2202 | scripts/dsh-restart.ps1::Test-DeepVerify | 不变 | parity:F-18 断言返回 `$null` 时主流程只 warn |
 | F-19 | `-Fast` 分支：跳过深度验证并提示；有实例且无 `-ForceUnverified` → rc=10 | bin/dsh-restart.ps1:2203-2211 | scripts/dsh-restart.ps1::main | 不变 | 见 G-06 |
 | F-20 | `-DryRun` 分支：算一次将重建的环境块（只读）→ 打印停机/拉起/续跑通知三条计划 → rc=0 | bin/dsh-restart.ps1:2214-2229 | scripts/dsh-restart.ps1::main | 不变 | parity:F-20 断言 DryRun 调 `Get-RegistryEnvironmentBlock`（**不是** `Sync-ProcessEnvironment`）；本机历史 45 次 dry-run |
@@ -237,7 +237,7 @@
 
 | 能力ID | 能力（参数/开关/步骤） | 旧实现位置(旧仓库 file:line) | 插件目标位置 | 可配置化处理 | 验证方式 |
 |---|---|---|---|---|---|
-| D-01 | 端口监听从 `netstat -ano -p TCP` 取 LISTENING 行（`Get-NetTCPConnection` 在本机沙箱不可靠） | bin/dsh-restart.ps1:810-814 | scripts/dsh-restart.ps1::Test-PortListening | 不变（**不许**换成 CIM/Get-NetTCPConnection 单一路径） | parity:D-01 断言命令行字面量 `netstat -ano -p TCP` |
+| D-01 | 端口监听从 `netstat -ano -p TCP` 取 LISTENING 行（`Get-NetTCPConnection` 在本机沙箱不可靠） | bin/dsh-restart.ps1:810-814 | scripts/dsh-restart.ps1::Test-PortListening | 扩展：web 侧不变（**不许**换成 CIM/Get-NetTCPConnection 单一路径）；desktop 侧新增 Get-ListeningPorts 反查宿主端口 | parity:D-01 断言命令行字面量 `netstat -ano -p TCP` |
 | D-02 | PID 解析：按空白切分取最后一列；`@()` 强制数组去重排序（单元素管道会退化成标量→曾因 `.Count` 崩溃） | bin/dsh-restart.ps1:816-829（StrictMode 事故注释 820-822） | scripts/dsh-restart.ps1::Get-PortOwner | 不变 | parity:D-02 断言 `@($pids \| Sort-Object -Unique)` 恒返回数组 |
 | D-03 | 候选实例形状：`{pid,name,port,isNode,start,ws_mb,handles,source='port-listener'}` | bin/dsh-restart.ps1:927-952 | scripts/dsh-restart.ps1::Get-HostCandidate | 不变（字段名被 `-Status -Json` 消费） | parity:D-03 断言 8 个字段名 |
 | D-04 | 进程名二次校验：正则匹配 `node`、`dsh`、`bun` 三者之一，仅作辅证 | bin/dsh-restart.ps1:939 | scripts/dsh-restart.ps1::Get-HostCandidate | 不变 | parity:D-04 断言正则 |
