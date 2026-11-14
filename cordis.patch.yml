@@ -8,6 +8,10 @@
       config:
         # DSH profile the engine restarts (the profile whose port is probed).
         profile: web
+        # Host shape: auto = detect DSH Desktop (Electron shell + a
+        # dsh-desktop-host child process) and drive it; otherwise keep the
+        # dsh web semantics. web / desktop pin the shape explicitly.
+        hostKind: auto
         # Host port and bind address the engine discovers the running instance by.
         port: 3080
         bindHost: 127.0.0.1

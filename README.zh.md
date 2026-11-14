@@ -163,6 +163,35 @@ dsh-restart-win -Preflight               # 深度验证（耗时长，会真启�
 
 ---
 
+### 4.6 DSH Desktop（Electron）宿主
+
+引擎同样驱动 DSH Desktop（`DeepSeek Harness.exe`）。它与 `dsh web` 有四处硬差异，重启器必须按这四处建模：
+
+| | `dsh web` | DSH Desktop |
+|---|---|---|
+| 宿主进程 | `node.exe ... dsh\lib\bin.js web` | Electron 的 **Node 模式子进程**（`--expose-internals ...\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\index.js`），进程名 `DeepSeek Harness.exe` |
+| 端口 | 固定（`--port 3080`） | `--port 0`：**每次启动都随机** |
+| 停机 | 杀端口监听者 | 杀 Electron **主进程**整棵树；只杀子进程会把壳留在 host crash 对话框 |
+| 隔离验证 | 临时 home 里起 `dsh web` | 临时 home 里直接起同一个 Electron 宿主入口（App 有单实例锁，再开一个 `DeepSeek Harness.exe` 只会聚焦旧窗口） |
+
+`hostKind`（配置键 / 工具参数 / `-HostKind`）取值 `auto`（默认）、`web`、`desktop`。装到桌面版 profile 时，在用户层把该行指向 desktop：
+
+```yaml
+# %USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml
+- id: dsh-restart-win
+  config:
+    profile: desktop      # 插件自身的默认值是 `web`
+```
+
+`desktop` 模式下，引擎按「命令行 + 父进程链」四要素发现宿主，用 `netstat` 反查真实端口，写续跑通知后 `taskkill /T /F` 杀 Electron 主进程整棵树，重放记录的可执行文件，再等一个**新的**宿主子进程、且它监听的端口回 `401`/`200`。`-Status` 会给出 `hostKind`、`mainPid`、`resolvedPort`、`configuredPort`、`portSource`、`instanceShape`；`-Port` 退化为期望值（`status.portSource = "netstat"`）。冷启动前先记录一次 App 路径：
+
+```powershell
+dsh-restart-win -Record -RecordCommand '"C:\<app>\DeepSeek Harness.exe"' -RecordWorkingDirectory "$env:USERPROFILE"
+```
+
+桌面版上的 `-Preflight` 直接以 Node 模式起 Electron 宿主入口（隔离 home），不碰正在运行的 App，验证的是同一套插件栈。
+
+
 ## 5. 四个工具
 
 四个工具的输入都先过白名单校验再拼 argv 数组（从不拼 shell 字符串），非法值直接返回错误而不是回退到默认值。`tools` 配置可以逐个关掉。
@@ -183,6 +212,7 @@ dsh-restart-win -Preflight               # 深度验证（耗时长，会真启�
 | `idleMaxSec` | integer | 300 | 空闲等待的硬上限 |
 | `delayMs` | integer | 配置 `restartDelayMs` | 分离动作：引擎触碰宿主前的延迟 |
 | `profile` / `port` / `bindHost` | string / integer / string | 配置值 | 覆盖本次调用的 profile、端口、探针地址 |
+| `hostKind` | string enum | 配置值 | `auto` / `web` / `desktop`；desktop 下端口实测、停机杀 Electron 主进程树 |
 | `dshHome` / `stateDir` | string | 配置值 | 覆盖 DSH 家目录 / 引擎状态目录 |
 | `taskName` | string | 配置值 | 计划任务名 |
 | `pwshPath` | string | 自动 | 指定 PowerShell 可执行文件（默认 `pwsh`，回落 `powershell.exe`） |
@@ -263,6 +293,7 @@ dsh-restart-win -DryRun
 | `-ResultFile` | path | 把最终结果 JSON 写到该文件（任何终态都写） |
 | `-NoWait` | — | 收尾不停留：跳过等新 boot token 的 20 s，只做一次非阻塞扫描 |
 | `-Profile` | string | DSH profile（默认 `web`） |
+| `-HostKind` | `auto` / `web` / `desktop` | 宿主形态；`auto` 检测 DSH Desktop，否则按 `dsh web` |
 | `-Port` | int | 宿主端口（默认 `3080`，同时决定互斥体名） |
 | `-BindHost` | string | 探针地址（默认 `127.0.0.1`）。它**不影响**宿主监听地址，见 §8 |
 | `-DshHome` | path | DSH 家目录（默认 `%DSH_HOME%`，否则 `%USERPROFILE%\.dsh`） |
@@ -285,6 +316,7 @@ dsh-restart-win -DryRun
 | 键 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `profile` | string | `web` | 被重启的 DSH profile |
+| `hostKind` | string | `auto` | 宿主形态：`auto` 检测 DSH Desktop，`web` / `desktop` 钉死 |
 | `port` | integer | `3080` | 宿主端口，也是互斥体名与进程发现的依据 |
 | `bindHost` | string | `127.0.0.1` | 探针与状态展示用的地址。**改它不会改变宿主监听地址**（见 §8） |
 | `dshHome` | string | `''` | 空 = `%DSH_HOME%`，再回落 `%USERPROFILE%\.dsh` |

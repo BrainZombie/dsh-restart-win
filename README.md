@@ -163,6 +163,35 @@ After the host restarts, the four `win_restart*` tools should be visible in a se
 
 ---
 
+### 4.6 DSH Desktop (Electron) hosts
+
+The engine also drives the DSH Desktop shell (`DeepSeek Harness.exe`), whose shape differs from `dsh web` in four ways a restarter must respect:
+
+| | `dsh web` | DSH Desktop |
+|---|---|---|
+| Host process | `node.exe ... dsh\lib\bin.js web` | an Electron **Node-mode child** (`--expose-internals ...\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\index.js`), process name `DeepSeek Harness.exe` |
+| Port | fixed (`--port 3080`) | `--port 0`: **random on every launch** |
+| Stop | kill the port listener | kill the Electron **main** process tree; killing the child alone leaves the shell on a host-crash dialog |
+| Isolated verification | `dsh web` in a temporary home | the same Electron host entry in a temporary home (the app holds a single-instance lock, so a second `DeepSeek Harness.exe` only focuses the window) |
+
+`hostKind` (config key, per-call argument, or `-HostKind`) selects `auto` (default), `web`, or `desktop`. On a desktop profile, point the row at that profile in the user layer:
+
+```yaml
+# %USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml
+- id: dsh-restart-win
+  config:
+    profile: desktop      # the plugin's own default is `web`
+```
+
+With `desktop`, the engine discovers the host by command line **and** parent chain (four identity checks), reverse-looks the real port from `netstat`, writes the resume notice, stops the Electron main tree with `taskkill /T /F`, relaunches the recorded executable, and waits for a **new** host child whose listening port answers `401`/`200`. `-Status` reports `hostKind`, `mainPid`, `resolvedPort`, `configuredPort`, `portSource` and `instanceShape`; `-Port` becomes a hint (`status.portSource = "netstat"`). Record the app once so a cold start knows what to launch:
+
+```powershell
+dsh-restart-win -Record -RecordCommand '"C:\<app>\DeepSeek Harness.exe"' -RecordWorkingDirectory "$env:USERPROFILE"
+```
+
+`-Preflight` on a desktop profile boots the Electron host entry directly (Node mode + isolated home), so it validates the same plugin stack without touching the running app.
+
+
 ## 5. The four tools
 
 Every argument is whitelist-validated before it reaches an argv array (a shell string is never built); an invalid value returns an error instead of falling back to a default. Each tool can be switched off through `tools`.
@@ -183,6 +212,7 @@ Start a restart (or start / stop / dry-run / record / scheduled-task management)
 | `idleMaxSec` | integer | 300 | Hard cap on the idle wait |
 | `delayMs` | integer | config `restartDelayMs` | Detached actions: delay before the engine touches the host |
 | `profile` / `port` / `bindHost` | string / integer / string | config values | Per-call override of profile, port, probe address |
+| `hostKind` | string enum | config value | `auto` / `web` / `desktop`; desktop discovers the random port and stops the Electron main tree |
 | `dshHome` / `stateDir` | string | config values | Per-call override of the DSH home and the engine state directory |
 | `taskName` | string | config value | Scheduled-task name |
 | `pwshPath` | string | auto | PowerShell executable (default `pwsh`, then `powershell.exe`) |
@@ -263,6 +293,7 @@ The `%LOCALAPPDATA%\dsh-restart\bin\dsh-restart-win.cmd` shim that `install.ps1`
 | `-ResultFile` | path | Write the final result JSON there (every terminal outcome) |
 | `-NoWait` | — | Do not linger at the end: skip the 20 s boot-token wait and scan once |
 | `-Profile` | string | DSH profile (default `web`) |
+| `-HostKind` | `auto` / `web` / `desktop` | Host shape; `auto` detects DSH Desktop and otherwise stays on `dsh web` |
 | `-Port` | int | Host port (default `3080`; also names the mutex) |
 | `-BindHost` | string | Probe address (default `127.0.0.1`). It does **not** change the host's listen address — see §8 |
 | `-DshHome` | path | DSH home (default `%DSH_HOME%`, else `%USERPROFILE%\.dsh`) |
@@ -285,6 +316,7 @@ Configuration lives under the plugin row's `config` in `cordis.patch.yml` (or in
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `profile` | string | `web` | DSH profile being restarted |
+| `hostKind` | string | `auto` | Host shape: `auto` detects DSH Desktop, `web` / `desktop` pin it |
 | `port` | integer | `3080` | Host port; also the mutex name and the discovery key |
 | `bindHost` | string | `127.0.0.1` | Address used for probes and status display. **Changing it does not change the host's listen address** (see §8) |
 | `dshHome` | string | `''` | Empty = `%DSH_HOME%`, then `%USERPROFILE%\.dsh` |

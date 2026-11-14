@@ -659,7 +659,7 @@ PROBES['F-15'] = [
     eng(/Wait-PortFree \$Port \$PortFreeSec/, { count: 2 }),
 ];
 PROBES['F-16'] = [eng(/\$dumpOk = \$null/), eng(/\$dumpOk = \$false/), eng(/\$dumpOk = \$true/), eng(/if \(\$dumpOk -eq \$false\)/)];
-PROBES['F-17'] = [eng(/Test-StopPermission \$script:TargetPid/), eng(/Test-StopPermission \$script:TargetPid[\s\S]*Invoke-DeepVerifyWithRetry/, { note: 'elevation gate before the 60s deep verification' })];
+PROBES['F-17'] = [eng(/Test-StopPermission \$permPid/), eng(/Test-StopPermission \$permPid[\s\S]*Invoke-DeepVerifyWithRetry/, { note: 'elevation gate before the 60s deep verification (desktop: main pid)' })];
 PROBES['F-18'] = [eng(/if \(-not \$dv\) \{ Add-Step 'deep-verify' '验证被跳过（找不到 dsh 本体）' 'warn' \}/)];
 PROBES['F-19'] = [eng(/Write-Terminal 'verify-required' 10/)];
 PROBES['F-20'] = [eng(/\$envPlan = Get-RegistryEnvironmentBlock/), eng(/-DryRun 不做副作用/)];
@@ -856,7 +856,7 @@ PROBES['V-14'] = [eng(/if \(\$VerifyOnly -or \$Preflight\) \{[\s\S]{0,500}Test-S
 PROBES['V-15'] = [eng(/if \(\$VerifyOnly -or \$Preflight\) \{/, { count: 1 })];
 
 // ------------------------------------------------------------------ §7 port discovery
-PROBES['D-01'] = [eng(/netstat -ano -p TCP/, { count: 2 })];
+PROBES['D-01'] = [eng(/netstat -ano -p TCP/, { count: 3 })];
 PROBES['D-02'] = [eng(/@\(\$pids \| Sort-Object -Unique\)/)];
 PROBES['D-03'] = [{ file: ENGINE, inFunction: 'Get-HostCandidate', fn: (ctx) => {
     const body = ctx.functionBody(ENGINE, 'Get-HostCandidate');
@@ -1018,7 +1018,7 @@ PROBES['U-08'] = [{ file: ENGINE, inFunction: 'Get-ResidualChildren', fn: (ctx) 
 } }];
 PROBES['U-09'] = [
     eng(/\$instances = @\(Get-DshInstances\)/, { note: 'empty array must not unwrap to $null' }),
-    eng(/\$children = @\(if \(\$instances\.Count\)/),
+    eng(/\$children = @\(if \(\$script:HostKind -eq 'desktop'\)/),
     eng(/if \(\$tailProp -and \$tailProp\.Value\)/),
     eng(/@\(\$pids \| Sort-Object -Unique\)/),
 ];

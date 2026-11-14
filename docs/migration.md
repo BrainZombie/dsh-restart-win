@@ -234,3 +234,32 @@ Remove-Item "$env:LOCALAPPDATA\dsh-restart\bin\dsh-restart-win.cmd"
 2. **把 `bindHost` 当成监听地址。** 它只影响探针 URL 与状态显示；宿主绑哪个地址由 `boot-record.json` 里的启动命令决定。想换监听地址，改启动档案或在启动命令里加参数，然后重启。
 3. **用 Windows PowerShell 5.1 跑验证型重启。** 会以退出码 2 `engine-requires-pwsh` 停在停机之前（这是设计如此，不是坏了）。装 pwsh 7.4+，或用 `pwshPath` / 配置项指过去。
 4. **删掉了 `restart-history.jsonl`。** 它是审计与排障的唯一时间线。迁移前后都不要动它；真嫌大就归档而不是删除。
+
+---
+
+## 8. 装到 DSH Desktop（Electron）profile
+
+桌面版与 `dsh web` 不是同一种宿主：它由 Electron 主进程 spawn 一个 Node 模式子进程（命令行含 `dsh-desktop-host\lib\index.js`），用 `--port 0` 启动（端口每次随机），真正的关闭是杀主进程整棵树。插件用 `hostKind` 区分：
+
+```powershell
+# 1) 装进桌面版 profile（插件的默认 profile 是 web，装法不变）
+pwsh -NoProfile -File .\install.ps1 -Profile desktop
+
+# 2) 在用户层把这一行指向 desktop（写进 %USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml）
+#    - id: dsh-restart-win
+#      config:
+#        profile: desktop
+
+# 3) 记录一次 App 路径，冷启动时引擎才知道拉什么
+dsh-restart-win -Record -RecordCommand '"C:\<app>\DeepSeek Harness.exe"' -RecordWorkingDirectory $env:USERPROFILE
+
+# 4) 重启宿主后自检
+dsh-restart-win -Status -Json      # status.hostKind=desktop, status.port=实测端口, status.mainPid=Electron 主进程
+dsh-restart-win -Preflight         # 以 Node 模式起 Electron 宿主入口（隔离 home），不碰运行中的 App
+```
+
+三条与 web 侧不同的注意点：
+
+1. **端口不是配置。** `-Port` / `port` 只是期望值；`status.portSource = "netstat"` 时以实测为准。
+2. **不要用 `taskkill` 只杀宿主子进程。** 会把 App 留在 host crash 对话框；引擎杀的是主进程整棵树（先写续跑通知）。
+3. **`--profile desktop` 的 `--dump-config` 会被 CLI 拒绝**，组合校验改由深度验证负责（真的起一个隔离宿主）。

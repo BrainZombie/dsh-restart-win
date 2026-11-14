@@ -27,6 +27,7 @@ import {
     ACTIONS,
     ConfigError,
     DEFAULTS,
+    HOST_KINDS,
     TOOL_FLAGS,
     assertActionRequirements,
     normalizeConfig,
@@ -147,6 +148,7 @@ async function waitForLaunchFinished(stateDir, runId, timeoutMs = 30000) {
 test('defaults match CONTRACT §4 exactly', () => {
     assert.deepEqual(DEFAULTS, {
         profile: 'web',
+        hostKind: 'auto',
         port: 3080,
         bindHost: '127.0.0.1',
         dshHome: '',
@@ -175,6 +177,28 @@ test('normalizeConfig fills defaults and freezes the result', () => {
     assert.equal(config.tools.result, true);
     assert.ok(Object.isFrozen(config));
     assert.ok(Object.isFrozen(config.tools));
+});
+
+test('hostKind: defaults to auto, accepts web/desktop, rejects the rest', () => {
+    assert.equal(normalizeConfig({}).hostKind, 'auto');
+    assert.equal(normalizeConfig({ hostKind: 'web' }).hostKind, 'web');
+    assert.equal(normalizeConfig({ hostKind: 'desktop' }).hostKind, 'desktop');
+    assert.deepEqual([...HOST_KINDS], ['auto', 'web', 'desktop']);
+    assert.throws(() => normalizeConfig({ hostKind: 'electron' }), (error) => {
+        assert.ok(error instanceof ConfigError);
+        assert.equal(error.field, 'hostKind');
+        assert.match(error.message, /auto, web, desktop/);
+        return true;
+    });
+});
+
+test('hostKind: a per-call override reaches the engine argv', () => {
+    const config = normalizeConfig({});
+    const invocation = resolveInvocation(config, { hostKind: 'desktop' });
+    assert.equal(invocation.hostKind, 'desktop');
+    const args = buildScriptArgs({ scriptPath: 'C:\\fake\\engine.ps1', action: 'status', invocation, platform: 'win32' });
+    assert.equal(args[args.indexOf('-HostKind') + 1], 'desktop');
+    assert.throws(() => resolveInvocation(config, { hostKind: 'bogus' }), /hostKind/);
 });
 
 test('normalizeConfig accepts explicit overrides', () => {
@@ -500,6 +524,7 @@ test('argv: restart with a fake -File target, no shell string anywhere', () => {
         '-File', scriptPath,
         '-Json',
         '-Profile', 'web',
+        '-HostKind', 'auto',
         '-Port', '3080',
         '-BindHost', '127.0.0.1',
         '-TaskName', 'DSH Restart',
