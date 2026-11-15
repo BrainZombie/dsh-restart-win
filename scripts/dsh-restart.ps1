@@ -775,6 +775,12 @@ function Get-Ps7RuntimeStatus {
 
 function Get-StatePath([string]$Name) { Join-Path $StateDir $Name }
 
+function Get-HostLogName([string]$Which) {
+  # 宿主日志按形态分文件（桌面 App 会长期占住自己那份）。命名只在这里定义：
+  # 拉起时写入与 -Status 回读必须用同一个名字，否则 web-auth-url 的自愈补写会读空。
+  return ('host.{0}.{1}.log' -f $script:HostKind, $Which)
+}
+
 function Get-EmptyStdinPath {
   <#
     拉起 GUI/宿主时把 stdin 接到一个空文件。
@@ -981,9 +987,9 @@ function Resolve-WebAuthUrl($CurrentPids) {
     $why = '持久文件里的 token 未被当前实例接受（pid=' + $rec.Pid + '；宿主可能仍在启动，或该记录已过期）'
   }
 
-  $hit = Get-HostAuthUrlRecord (Get-StatePath 'host.out.log')
+  $hit = Get-HostAuthUrlRecord (Get-StatePath (Get-HostLogName 'out'))
   if ($hit -and (Test-WebAuthUrl $hit.Url)) {
-    [void](Save-WebAuthUrlRecord $hit.Url ([int]$pids[0]) 'host.out.log（-Status 校验后补写）')
+    [void](Save-WebAuthUrlRecord $hit.Url ([int]$pids[0]) ((Get-HostLogName 'out') + '（-Status 校验后补写）'))
     $fresh = Read-WebAuthUrlRecord
     if ($fresh -and $fresh.Url) {
       return [pscustomobject]@{ Url = $fresh.Url; State = 'ok'; Detail = ('持久文件已补写（pid=' + $fresh.Pid + '，token 已被当前实例接受）'); Refreshed = $true }
@@ -2000,8 +2006,8 @@ function Start-DshInstance {
   $launch = Resolve-Launch
   # 日志按宿主形态分文件：桌面 App 会用 stdout 句柄长期占住自己的日志，
   # 与 web 宿主共用同一个 host.out.log 时，后拉起的一方连 banner 都写不进去。
-  $webOut = Get-StatePath ("host.$($script:HostKind).out.log")
-  $webErr = Get-StatePath ("host.$($script:HostKind).err.log")
+  $webOut = Get-StatePath (Get-HostLogName 'out')
+  $webErr = Get-StatePath (Get-HostLogName 'err')
   if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Force -Path $StateDir | Out-Null }
 
   foreach ($f in @($webOut, $webErr)) {
@@ -2546,8 +2552,8 @@ function Start-DesktopApp {
   } else {
     Add-Step 'env' '按 DSH_RESTART_INJECT_HOST_ENV=0 跳过宿主环境注入' 'skip'
   }
-  $webOut = Get-StatePath ("host.$($script:HostKind).out.log")
-  $webErr = Get-StatePath ("host.$($script:HostKind).err.log")
+  $webOut = Get-StatePath (Get-HostLogName 'out')
+  $webErr = Get-StatePath (Get-HostLogName 'err')
   if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Force -Path $StateDir | Out-Null }
   foreach ($f in @($webOut, $webErr)) {
     $banner = ("`n===== dsh-restart {0} 拉起 DSH Desktop cmd={1} =====`r`n" -f (Get-Date -Format o), $plan.raw)

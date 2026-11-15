@@ -1203,9 +1203,46 @@ test('host integration: apply registers four tools and disposes them on unload',
     assert.equal(disposed.length, 4);
 });
 
+test('host integration: a webServer mounts the panel API, a host without one still gets the tools', async () => {
+    const routes = [];
+    const tools = [];
+    const withServer = {
+        tools: { register(definition) { tools.push(definition); return () => {}; } },
+        webServer: {
+            register(route) {
+                routes.push(route);
+                return () => {};
+            },
+        },
+        effect() {},
+    };
+    try {
+        await pluginEntry.apply(withServer, { pwshPath: fakePwsh });
+    } catch (error) {
+        if (/cannot resolve host package/.test(String(error?.message))) return 'skip';
+        throw error;
+    }
+    assert.equal(tools.length, 4, 'the four tools must register with a web server present');
+    assert.equal(routes.length, 1, 'the panel API must mount exactly once');
+    assert.equal(routes[0].kind, 'prefix');
+    assert.match(String(routes[0].path), /dsh-restart-win/);
+    assert.equal(typeof routes[0].handler, 'function');
+
+    // No webServer (headless host): the panel is impossible, the tools are not.
+    const headlessTools = [];
+    const headless = {
+        tools: { register(definition) { headlessTools.push(definition); return () => {}; } },
+        effect() {},
+    };
+    await pluginEntry.apply(headless, { pwshPath: fakePwsh });
+    assert.equal(headlessTools.length, 4, 'a headless host must still get the four tools');
+});
+
 test('plugin entry: name, inject and module-level load without the host', () => {
     assert.equal(pluginEntry.name, 'dsh-restart-win');
-    assert.deepEqual(pluginEntry.inject, ['tools', 'webServer']);
+    // Only `tools` is a hard requirement: a host without a web server (headless)
+    // must still get the four tools, just no panel.
+    assert.deepEqual(pluginEntry.inject, ['tools']);
     assert.equal(typeof pluginEntry.apply, 'function');
     const source = readFileSync(new URL('../lib/tools.js', import.meta.url), 'utf8');
     assert.ok(!source.includes("from '@deepseek-ai/"), 'lib/tools.js must not import the host package');
