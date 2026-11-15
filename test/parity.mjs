@@ -773,10 +773,15 @@ PROBES['S-05'] = [{
         const text = ctx.text(ENGINE);
         assert.ok(/url 步（token 变化判据）/.test(text), 'source value for the launch step');
         assert.ok(/rescue 步（token 变化判据）/.test(text), 'source value for the rescue step');
-        assert.ok(/host\.out\.log（-Status 校验后补写）/.test(text), 'source value for the -Status refresh');
+        assert.ok(/\(Get-HostLogName 'out'\) \+ '（-Status 校验后补写）'/.test(text), 'source value for the -Status refresh (names the per-kind log it actually read)');
     },
 }];
-PROBES['S-06'] = [eng(/host\.\$\(\$script:HostKind\)\.out\.log/), eng(/host\.\$\(\$script:HostKind\)\.err\.log/)];
+PROBES['S-06'] = [
+    eng(/function Get-HostLogName/),
+    eng(/host\.\{0\}\.\{1\}\.log/),
+    eng(/Get-HostLogName 'out'/),
+    eng(/Get-HostLogName 'err'/),
+];
 PROBES['S-07'] = [eng(/UnicodeEncoding\(\$false, \$true\)/), eng(/function Get-TaskXmlPath/), eng(/'dsh-restart\.task\.xml'/)];
 PROBES['S-08'] = [eng(/Join-Path \(Get-StatePath 'fallback'\) 'dsh-restart\.log'/), eng(/Join-Path \(Get-StatePath 'fallback'\) 'restart-history\.jsonl'/), eng(/break/g, { min: 2 })];
 PROBES['S-09'] = [eng(/"dsh-verify\." \+ \[guid\]::NewGuid/), eng(/KeepDir/)];
