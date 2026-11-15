@@ -34,7 +34,7 @@ import {
     normalizeSessionId,
     resolveInvocation,
 } from '../lib/config.js';
-import { parseLaunchRequest, settleNotice, waitForEngineRecord, writeNoticeFile } from '../lib/delayed-spawn.mjs';
+import { parseLaunchRequest, settleNotice, waitForEngineRecord, writeHandoff, writeNoticeFile } from '../lib/delayed-spawn.mjs';
 import { loadHostModule, hostModuleCandidates } from '../lib/host.js';
 import { ROUTE, createApi, isSameOrigin } from '../lib/api.js';
 import {
@@ -436,6 +436,32 @@ test('engine and launcher paths are derived from the package, not hardcoded', ()
     assert.ok(engineScriptPath().endsWith(join('scripts', 'dsh-restart.ps1')));
     assert.ok(launcherScriptPath().endsWith(join('lib', 'delayed-spawn.mjs')));
     assert.ok(isFile(launcherScriptPath()), 'the launcher file must exist');
+});
+
+test('detached: the handoff script fails silently instead of showing a dialog', () => {
+    const dir = tempDir('handoff-script');
+    const runId = '20261115-000000-abcdef';
+    const handoff = writeHandoff(
+        {
+            runId,
+            runDir: dir,
+            execPath: 'C:\\Program Files\\PowerShell\\7\\pwsh.exe',
+            args: ['-File', 'C:\\path with space\\engine.ps1', '-Json'],
+            notice: null,
+            engineEnv: null,
+        },
+        join(dir, `${runId}.launch.json`),
+        null,
+    );
+    assert.equal(handoff.ok, true, 'the handoff script must be written');
+    const text = readFileSync(handoff.vbsPath, 'utf8');
+    assert.match(text, /^On Error Resume Next\r\n/, 'WScript must not raise a modal dialog');
+    assert.match(text, /pwsh\.exe/, 'the command line must be present');
+    assert.ok(text.includes('sh.Run "'), 'the script must call WScript.Shell.Run');
+    assert.ok(
+        text.includes('"C:\\path with space\\engine.ps1"'),
+        `arguments with spaces stay quoted; got: ${text.split('\r\n')[2] ?? ''}`,
+    );
 });
 
 test('detached: the supervisor waits for the engine launch record after a handoff', async () => {
