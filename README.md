@@ -488,8 +488,8 @@ Look at three places first: the tool's `error` (or the CLI's stderr), the last l
 | 5 `gate-blocked` | An unfinished configuration transaction or lock file | Clear `*.transaction` / `RECOVERY_REQUIRED*` first; the log prints the stale-lock recovery command |
 | 6 `stop-failed` | Insufficient rights, or the process survived | Read the `Access is denied` section and its two ways out; retry from the same user or an elevated shell |
 | 7 `port-busy` | The old instance is gone but the port is still held | Find the owner (`netstat -ano -p TCP`) and clear it deliberately |
-| 8 `ready-failed:timeout` | The new host was not ready within budget | Raise `readySec`; read `host.err.log` |
-| 8 `ready-failed:exited` | The new host started and immediately exited | Read the tail of `host.err.log` / `host.out.log`; usually the launch command or the profile |
+| 8 `ready-failed:timeout` | The new host was not ready within budget | Raise `readySec`; read `host.<hostKind>.err.log` (on a web host: `host.web.err.log`) |
+| 8 `ready-failed:exited` | The new host started and immediately exited | Read the tail of `host.<hostKind>.err.log` / `.out.log`; usually the launch command or the profile |
 | 8 `ready-failed:port-owner-mismatch` | The listener on the port is not the process this run launched | Check for a wrapper script; the engine walks the parent chain |
 | 9 `via-task-failed` | Task not registered, or triggering failed | `-RegisterTask` first, then `-ViaTask` |
 | 10 `verify-required` | `-Fast` met a running instance | Drop `-Fast` and verify, or pass `-ForceUnverified` explicitly |
