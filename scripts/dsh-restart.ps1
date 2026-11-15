@@ -105,6 +105,7 @@ param(
   # 分离执行支撑（插件/自动化用；人工使用时不必传）
   [string]$ResultFile = '',   # 最终结果 JSON 落盘路径（任何终态都写）
   [switch]$NoWait,            # 收尾不停留：跳过等新 boot token 的 20s，只做一次非阻塞扫描
+  [switch]$RepairSharedScope, # 只做一件事：从 app.asar 重建 <DSH_HOME>\profiles\node_modules 并退出
   [string]$LaunchRecord = ''  # 内部：交接模式下引擎自报 pid（见 lib/delayed-spawn.mjs 的 handoff）
 )
 
@@ -2317,6 +2318,131 @@ function Invoke-RescueLaunch([string]$Cause) {
   }
 }
 
+
+# ---------------------------------------------------------------- 共享投影（profiles\node_modules）
+
+function Get-SharedScopePath { return (Join-Path $DshHome 'profiles\node_modules') }
+
+function Test-SharedScope {
+  <#
+    桌面宿主解析 @deepseek-ai/* 用的是 <DSH_HOME>\profiles\node_modules（app.asar\dsh\node_modules 的投影），
+    不是 asar 本身。2026-11-15 实测：这份投影被删掉后，App 每次新启动的宿主都会 177 个基础包全部
+    ERR_MODULE_NOT_FOUND，App 直接打不开（且用全新 profile 复现，容易误判成 profile 损坏）。
+    判据用两个“必需的基石包”，缺一即视为投影不完整。
+  #>
+  $root = Get-SharedScopePath
+  foreach ($pkg in @('dsh-base', 'dsh-web-app')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $root ('@deepseek-ai\' + $pkg + '\package.json')))) { return $false }
+  }
+  return $true
+}
+
+function Read-AsarIndex([string]$AsarPath) {
+  $fs = [System.IO.File]::OpenRead($AsarPath)
+  try {
+    $br = New-Object System.IO.BinaryReader($fs)
+    [void]$br.ReadUInt32()
+    $headerSize = [int64]$br.ReadUInt32()
+    [void]$br.ReadUInt32()          # 第三个 uint32 与 jsonLen 同值，占位
+    $jsonLen = [int]$br.ReadUInt32()  # 第四个才是 JSON 长度（asar 头部：4, headerSize, len, len）
+    $fs.Position = 16
+    $json = [System.Text.Encoding]::UTF8.GetString($br.ReadBytes($jsonLen))
+    return [pscustomobject]@{ DataStart = (8 + $headerSize); Index = ($json | ConvertFrom-Json) }
+  } finally { $fs.Dispose() }
+}
+
+function Expand-AsarTree {
+  <# 把 asar 里的一个子树写到磁盘（已存在且大小相同的文件跳过 → 修复可增量、可重入）。 #>
+  param($Node, [string]$RelPath, [string]$OutDir, $Stream, [int64]$DataStart, [string]$UnpackedRoot, [ref]$Stats)
+  if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
+  foreach ($prop in $Node.PSObject.Properties) {
+    $name = $prop.Name
+    $ent = $prop.Value
+    $childRel = if ($RelPath) { $RelPath + '/' + $name } else { $name }
+    $childOut = Join-Path $OutDir $name
+    if ($ent.PSObject.Properties['files']) {
+      Expand-AsarTree -Node $ent.files -RelPath $childRel -OutDir $childOut -Stream $Stream -DataStart $DataStart -UnpackedRoot $UnpackedRoot -Stats $Stats
+      continue
+    }
+    if ($ent.PSObject.Properties['link']) { $Stats.Value.Links++; continue }
+    $size = 0
+    if ($ent.PSObject.Properties['size']) { $size = [int64]$ent.size }
+    if ((Test-Path -LiteralPath $childOut) -and ((Get-Item -LiteralPath $childOut).Length -eq $size)) { $Stats.Value.Skipped++; continue }
+    try {
+      if ($ent.PSObject.Properties['unpacked'] -and $ent.unpacked) {
+        $src = Join-Path $UnpackedRoot ($childRel -replace '/', '\')
+        if (-not (Test-Path -LiteralPath $src)) { $Stats.Value.Missing++; continue }
+        Copy-Item -LiteralPath $src -Destination $childOut -Force
+        $Stats.Value.Unpacked++
+      } else {
+        $parent = Split-Path -Path $childOut -Parent
+        if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+        $Stream.Position = $DataStart + [int64]$ent.offset
+        $buf = New-Object byte[] $size
+        $read = 0
+        while ($read -lt $size) {
+          $n = $Stream.Read($buf, $read, [int]($size - $read))
+          if ($n -le 0) { break }
+          $read += $n
+        }
+        [System.IO.File]::WriteAllBytes($childOut, $buf)
+        $Stats.Value.Files++
+      }
+      $Stats.Value.Bytes += $size
+    } catch {
+      $Stats.Value.Errors++
+      Write-Audit 'warn' "共享投影：写入失败 $childRel :: $($_.Exception.Message.Split([char]10)[0])"
+    }
+  }
+}
+
+function Repair-SharedScope {
+  <# 从已安装的 app.asar 重建 <DSH_HOME>\profiles\node_modules。返回 @{ ok; stats; reason }。 #>
+  $exe = Resolve-DesktopAppPath
+  if (-not $exe) { return [pscustomobject]@{ ok = $false; reason = 'desktop-app-missing' } }
+  $paths = Get-DesktopPaths $exe
+  if (-not (Test-Path -LiteralPath $paths.asar -PathType Leaf)) { return [pscustomobject]@{ ok = $false; reason = 'app-asar-missing' } }
+  $root = Get-SharedScopePath
+  New-Item -ItemType Directory -Force -Path $root | Out-Null
+  $stats = [pscustomobject]@{ Files = 0; Unpacked = 0; Skipped = 0; Links = 0; Missing = 0; Errors = 0; Bytes = [int64]0 }
+  $stream = $null
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  try {
+    $asar = Read-AsarIndex $paths.asar
+    $dshNode = $asar.Index.files.dsh
+    if ($null -eq $dshNode) { return [pscustomobject]@{ ok = $false; reason = 'asar-layout-unknown' } }
+    $stream = [System.IO.File]::OpenRead($paths.asar)
+    $nmNode = $dshNode.files.node_modules
+    if ($null -eq $nmNode) { return [pscustomobject]@{ ok = $false; reason = 'asar-node-modules-missing' } }
+    $ref = [ref]$stats
+    Expand-AsarTree -Node $nmNode.files -RelPath 'node_modules' -OutDir $root -Stream $stream -DataStart $asar.DataStart -UnpackedRoot (Join-Path (Split-Path $paths.asar -Parent) 'app.asar.unpacked\dsh') -Stats $ref
+  } catch {
+    return [pscustomobject]@{ ok = $false; reason = ('extract-failed: ' + $_.Exception.Message.Split([char]10)[0]); stats = $stats }
+  } finally {
+    if ($stream) { $stream.Dispose() }
+  }
+  $sw.Stop()
+  return [pscustomobject]@{ ok = (Test-SharedScope); stats = $stats; reason = 'extracted'; elapsedSec = [math]::Round($sw.Elapsed.TotalSeconds, 1) }
+}
+
+function Backup-ProfileConfig {
+  <# 重启前把用户的 cordis.patch.yml 留一份（保留最近 5 份）——配置管理器重写文件时不至于无迹可寻。 #>
+  if (-not $Profile) { return }
+  $src = Join-Path $DshHome ('profiles\' + $Profile + '\cordis.patch.yml')
+  if (-not (Test-Path -LiteralPath $src)) { return }
+  try {
+    $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+    $dst = $src + '.bak-dsh-restart-' + $stamp
+    Copy-Item -LiteralPath $src -Destination $dst -Force
+    $keep = @(Get-ChildItem -LiteralPath (Split-Path $src -Parent) -Filter 'cordis.patch.yml.bak-dsh-restart-*' -File |
+      Sort-Object LastWriteTime -Descending | Select-Object -Skip 5)
+    foreach ($old in $keep) { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue }
+  } catch {
+    Write-Audit 'warn' ("配置备份失败：" + $_.Exception.Message.Split([char]10)[0])
+  }
+}
+
+
 # ---------------------------------------------------------------- DSH Desktop（Electron 宿主）
 #
 # 与 `dsh web` 的四处硬差异（本机实测 2026-11-14，DSH 0.2.2-rc.3）：
@@ -2543,6 +2669,12 @@ function Start-DesktopApp {
   $plan = Get-DesktopLaunch
   if (-not $plan) {
     throw '找不到 DSH Desktop 可执行文件：先用 -Record -RecordCommand "\"<path>\DeepSeek Harness.exe\"" 记录一次'
+  }
+  if (-not (Test-SharedScope)) {
+    Add-Step 'shared-scope' '共享投影缺失（宿主会连基础包都 import 不到、App 直接打不开）→ 从 app.asar 重建' 'warn'
+    $rep = Repair-SharedScope
+    if (-not $rep.ok) { throw ('共享投影重建失败：' + $rep.reason + '；可单独跑 dsh-restart-win -RepairSharedScope') }
+    Add-Step 'shared-scope' ("已重建 " + $rep.stats.Files + " 个文件（" + $rep.elapsedSec + "s）") 'ok'
   }
   $env:DSH_HOME = $DshHome
   if ($env:DSH_RESTART_INJECT_HOST_ENV -ne '0') {
@@ -2844,6 +2976,20 @@ try {
     exit 0
   }
 
+  if ($RepairSharedScope) {
+    $rep = Repair-SharedScope
+    if ($rep.ok) {
+      Add-Step 'shared-scope' ("已重建共享投影 " + (Get-SharedScopePath) + "：" + $rep.stats.Files + " 个文件、" +
+        [math]::Round($rep.stats.Bytes / 1MB, 1) + "MB、" + $rep.elapsedSec + "s（unpacked " + $rep.stats.Unpacked +
+        "，跳过 " + $rep.stats.Skipped + "）") 'ok'
+      Write-Terminal 'shared-scope-repaired' 0
+      exit 0
+    }
+    Add-Step 'shared-scope' ("重建共享投影失败：" + $rep.reason) 'fail'
+    Write-Terminal 'shared-scope-failed' 1
+    exit 1
+  }
+
   if ($Record) {
     $cmd = if ($RecordCommand) { $RecordCommand } else { 'pnpm dsh web --no-open --host 127.0.0.1 --port {PORT}' }
     $cwd = if ($RecordWorkingDirectory) { $RecordWorkingDirectory } else { (Get-Location).Path }
@@ -3133,6 +3279,9 @@ try {
     $sid = Normalize-SessionId $Session
     [void](Write-PendingNotice $sid $Reason)
   }
+
+  # ---- 6b. 重启前给 profile 配置留一份（Live Config 会重写 cordis.patch.yml）
+  if (-not $Start) { Backup-ProfileConfig }
 
   # ---- 7. 停机
   if ($script:TargetPid) {

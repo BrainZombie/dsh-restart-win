@@ -308,6 +308,7 @@ The `%LOCALAPPDATA%\dsh-restart\bin\dsh-restart-win.cmd` shim that `install.ps1`
 | `-NoWait` | — | Do not linger at the end: skip the 20 s boot-token wait and scan once |
 | `-Profile` | string | DSH profile (default `web`) |
 | `-HostKind` | `auto` / `web` / `desktop` | Host shape; `auto` detects DSH Desktop and otherwise stays on `dsh web` |
+| `-RepairSharedScope` | — | Rebuild `<DSH_HOME>\profiles\node_modules` (the base-package projection the desktop host resolves `@deepseek-ai/*` from) out of the installed `app.asar`, then exit. Use it when the app no longer starts and its crash log lists base packages as `ERR_MODULE_NOT_FOUND` |
 | `-Port` | int | Host port (default `3080`; also names the mutex) |
 | `-BindHost` | string | Probe address (default `127.0.0.1`). It does **not** change the host's listen address — see §8 |
 | `-DshHome` | path | DSH home (default `%DSH_HOME%`, else `%USERPROFILE%\.dsh`) |
@@ -477,6 +478,8 @@ This plugin **kills and restarts the DSH host you are using**. You own the conse
 ## 13. Troubleshooting
 
 Look at three places first: the tool's `error` (or the CLI's stderr), the last line of `<stateDir>\dsh-restart.log`, and the last record in `<stateDir>\restart-history.jsonl`.
+
+**The app no longer starts at all, and its host crash log lists base packages as `ERR_MODULE_NOT_FOUND`.** The desktop host resolves `@deepseek-ai/*` from `<DSH_HOME>\profiles\node_modules` — a projection of `app.asar\dsh\node_modules` — and a profile `pnpm install` can prune it. Run `dsh-restart-win -RepairSharedScope` (rebuilds it from the installed `app.asar`); the engine also repairs it automatically before it launches the app. A fresh empty profile fails the same way, so this is not a corrupted profile.
 
 | Symptom / exit code | Cause | Action |
 |---|---|---|

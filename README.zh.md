@@ -308,6 +308,7 @@ dsh-restart-win -DryRun
 | `-NoWait` | — | 收尾不停留：跳过等新 boot token 的 20 s，只做一次非阻塞扫描 |
 | `-Profile` | string | DSH profile（默认 `web`） |
 | `-HostKind` | `auto` / `web` / `desktop` | 宿主形态；`auto` 检测 DSH Desktop，否则按 `dsh web` |
+| `-RepairSharedScope` | — | 从已安装的 `app.asar` 重建 `<DSH_HOME>\profiles\node_modules`（桌面宿主解析 `@deepseek-ai/*` 用的基础包投影）后退出。App 打不开、崩溃日志里基础包全是 `ERR_MODULE_NOT_FOUND` 时用它 |
 | `-Port` | int | 宿主端口（默认 `3080`，同时决定互斥体名） |
 | `-BindHost` | string | 探针地址（默认 `127.0.0.1`）。它**不影响**宿主监听地址，见 §8 |
 | `-DshHome` | path | DSH 家目录（默认 `%DSH_HOME%`，否则 `%USERPROFILE%\.dsh`） |
@@ -477,6 +478,8 @@ dsh-restart-win -DryRun
 ## 13. 故障排查
 
 先看三个地方：工具返回的 `error`（或 CLI 的 stderr）、`<stateDir>\dsh-restart.log` 的最后一行、`<stateDir>\restart-history.jsonl` 的最后一条。
+
+**App 完全打不开，宿主崩溃日志里基础包全是 `ERR_MODULE_NOT_FOUND`。** 桌面宿主从 `<DSH_HOME>\profiles\node_modules` 解析 `@deepseek-ai/*`（那是 `app.asar\dsh\node_modules` 的投影），profile 里跑一次 `pnpm install` 可能把它清掉。执行 `dsh-restart-win -RepairSharedScope` 从已安装的 `app.asar` 重建；引擎在拉起 App 前也会自动修一次。全新空白 profile 也会复现，所以这不是 profile 损坏。
 
 | 现象 / 退出码 | 原因 | 处理 |
 |---|---|---|
