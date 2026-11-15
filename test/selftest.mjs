@@ -1238,6 +1238,41 @@ test('host integration: a webServer mounts the panel API, a host without one sti
     assert.equal(headlessTools.length, 4, 'a headless host must still get the four tools');
 });
 
+test('host integration: the panel waits for webServer through ctx.inject', async () => {
+    // Real cordis resolves a service only for plugins that asked for it, and
+    // `inject` (the module export) makes the whole plugin wait. The panel must
+    // therefore be mounted from a child fiber, so a host without a web server
+    // still runs `apply`.
+    const tools = [];
+    const routes = [];
+    const deferred = [];
+    const ctx = {
+        tools: { register(definition) { tools.push(definition); return () => {}; } },
+        inject(deps, callback) {
+            deferred.push({ deps, callback });
+            return { then() {} };
+        },
+        effect() {},
+    };
+    try {
+        await pluginEntry.apply(ctx, { pwshPath: fakePwsh });
+    } catch (error) {
+        if (/cannot resolve host package/.test(String(error?.message))) return 'skip';
+        throw error;
+    }
+    assert.equal(tools.length, 4, 'tools register before any web server exists');
+    assert.equal(routes.length, 0, 'nothing is mounted until the service appears');
+    assert.equal(deferred.length, 1, 'exactly one deferred injection is requested');
+    assert.deepEqual(deferred[0].deps, ['webServer']);
+
+    deferred[0].callback({
+        webServer: { register(route) { routes.push(route); return () => {}; } },
+    });
+    assert.equal(routes.length, 1, 'the panel mounts once the web server appears');
+    assert.equal(routes[0].kind, 'prefix');
+    assert.match(String(routes[0].path), /dsh-restart-win/);
+});
+
 test('plugin entry: name, inject and module-level load without the host', () => {
     assert.equal(pluginEntry.name, 'dsh-restart-win');
     // Only `tools` is a hard requirement: a host without a web server (headless)
