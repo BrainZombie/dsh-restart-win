@@ -100,7 +100,7 @@ dsh-restart-win %*
 | `dsh-restart.log` | 继续追加 |
 | `web-auth-url.txt` | 继续使用（含真实 token，位置与结构不变） |
 | `dsh-restart.task.xml` | 继续使用；`-RegisterTask` 会按当前配置重写它 |
-| `host.out.log` / `host.err.log` | 继续追加 |
+| `host.out.log` / `host.err.log` | 旧文件保留为历史；新引擎写 `host.<hostKind>.*.log`（web 上就是 `host.web.out.log` / `host.web.err.log`） |
 | `<DshHome>\.smart-restart\pending-notice.json` | 继续由插件在停机前写入 |
 
 新增的只有 `<stateDir>\runs\` 目录：每次分离执行的 `pending` / `request` / `launch` / `result` 四个记录。旧引擎没有这个概念，它不读这些文件，所以混用期间也不冲突。

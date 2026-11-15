@@ -488,8 +488,8 @@ dsh-restart-win -DryRun
 | 5 `gate-blocked` | 有未完成的配置事务或锁文件 | 先处理 `*.transaction` / `RECOVERY_REQUIRED*`；日志里会提示残留锁的回收命令 |
 | 6 `stop-failed` | 权限不足，或进程没被杀掉 | 看日志里的 `Access is denied` 段与两条出路；必要时用同用户或提权终端 |
 | 7 `port-busy` | 旧实例停了但端口仍被占用 | 找占用者（`netstat -ano -p TCP`），确认后手动清理 |
-| 8 `ready-failed:timeout` | 新宿主在预算内没就绪 | 调大 `readySec`；看 `host.err.log` |
-| 8 `ready-failed:exited` | 新宿主起来又立刻退出 | 看 `host.err.log` / `host.out.log` 尾部；多为启动命令或 profile 问题 |
+| 8 `ready-failed:timeout` | 新宿主在预算内没就绪 | 调大 `readySec`；看 `host.<hostKind>.err.log`（web 宿主上是 `host.web.err.log`） |
+| 8 `ready-failed:exited` | 新宿主起来又立刻退出 | 看 `host.<hostKind>.err.log` / `.out.log` 尾部；多为启动命令或 profile 问题 |
 | 8 `ready-failed:port-owner-mismatch` | 端口上的监听者不是本次启动的进程 | 检查是否有包装器脚本；引擎会沿父链核对 |
 | 9 `via-task-failed` | 计划任务未注册或触发失败 | 先 `-RegisterTask`，再 `-ViaTask` |
 | 10 `verify-required` | `-Fast` 遇到运行中的实例 | 去掉 `-Fast` 做完整验证，或显式加 `-ForceUnverified` |
