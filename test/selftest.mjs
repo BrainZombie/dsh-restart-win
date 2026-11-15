@@ -34,7 +34,7 @@ import {
     normalizeSessionId,
     resolveInvocation,
 } from '../lib/config.js';
-import { parseLaunchRequest, settleNotice, writeNoticeFile } from '../lib/delayed-spawn.mjs';
+import { parseLaunchRequest, settleNotice, waitForEngineRecord, writeNoticeFile } from '../lib/delayed-spawn.mjs';
 import { loadHostModule, hostModuleCandidates } from '../lib/host.js';
 import { ROUTE, createApi, isSameOrigin } from '../lib/api.js';
 import {
@@ -70,6 +70,12 @@ import * as pluginEntry from '../lib/index.js';
 
 const ROOT = mkdtempSync(join(tmpdir(), 'dsh-restart-win-selftest-'));
 const cases = [];
+
+// The supervisor prefers the shell handoff (`explorer.exe <vbs>`) so the engine
+// survives the `taskkill /T` it runs on the host. These tests drive the
+// supervisor directly and expect the engine to be its own child, so they pin
+// the in-tree path; the handoff's wait-for-record logic has its own unit test.
+process.env.DSH_RESTART_HANDOFF = '0';
 
 /**
  * The platform whose *semantics* the suite is exercising.
@@ -430,6 +436,18 @@ test('engine and launcher paths are derived from the package, not hardcoded', ()
     assert.ok(engineScriptPath().endsWith(join('scripts', 'dsh-restart.ps1')));
     assert.ok(launcherScriptPath().endsWith(join('lib', 'delayed-spawn.mjs')));
     assert.ok(isFile(launcherScriptPath()), 'the launcher file must exist');
+});
+
+test('detached: the supervisor waits for the engine launch record after a handoff', async () => {
+    const dir = tempDir('handoff-record');
+    const file = join(dir, 'launch.json');
+    writeFileSync(file, JSON.stringify({ phase: 'handoff', enginePid: null, error: null }));
+    assert.equal(await waitForEngineRecord(file, 300), false, 'a handoff record alone must time out');
+
+    const pending = waitForEngineRecord(file, 5000);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    writeFileSync(file, JSON.stringify({ phase: 'engine-running', enginePid: 1234, via: 'handoff' }));
+    assert.equal(await pending, true, 'the engine record must end the wait');
 });
 
 test('findExecutable scans PATH for a real executable', () => {
