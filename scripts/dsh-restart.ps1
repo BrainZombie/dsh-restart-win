@@ -2637,6 +2637,15 @@ function Test-DesktopVerify {
     New-Item -ItemType Directory -Path $v -Force | Out-Null
     $vProfile = Join-Path $v ('profiles\' + $Profile)
     New-Item -ItemType Directory -Path $vProfile -Force | Out-Null
+    # 共享投影：宿主解析 @deepseek-ai/* 用的是 <home>\profiles\node_modules（pnpm install 会删掉它，
+    # 2026-11-15 实测：删掉后桌面版 App 连基础包都 import 不到、直接起不来）。
+    # 隔离实例必须把这份投影也带上，否则深度验证会误报「基础包找不到」。
+    $sharedSrc = Join-Path $DshHome 'profiles\node_modules'
+    $sharedDst = Join-Path $v 'profiles\node_modules'
+    if ((Test-Path -LiteralPath $sharedSrc) -and -not (Test-Path -LiteralPath $sharedDst)) {
+      New-Item -ItemType Directory -Force -Path (Join-Path $v 'profiles') | Out-Null
+      try { New-Item -ItemType Junction -Path $sharedDst -Target $sharedSrc -ErrorAction Stop | Out-Null } catch { }
+    }
     $srcProfile = Join-Path $DshHome ('profiles\' + $Profile)
     if (-not (Test-Path -LiteralPath $srcProfile)) {
       $existing = @(Get-ChildItem -LiteralPath (Join-Path $DshHome 'profiles') -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
