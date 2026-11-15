@@ -30,6 +30,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// The supervisor's shell handoff needs explorer.exe/WScript; these tests drive it
+// directly and assert on the child it spawns, so they pin the in-tree path.
+process.env.DSH_RESTART_HANDOFF = '0';
+
 import { ConfigError, DEFAULTS, normalizeConfig, resolveInvocation } from '../lib/config.js';
 import { loadHostModule } from '../lib/host.js';
 import { engineScriptPath, launcherScriptPath, resolvePwsh } from '../lib/paths.js';
