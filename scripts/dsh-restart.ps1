@@ -106,6 +106,7 @@ param(
   [string]$ResultFile = '',   # 最终结果 JSON 落盘路径（任何终态都写）
   [switch]$NoWait,            # 收尾不停留：跳过等新 boot token 的 20s，只做一次非阻塞扫描
   [switch]$RepairSharedScope, # 只做一件事：从 app.asar 重建 <DSH_HOME>\profiles\node_modules 并退出
+  [switch]$CheckShadowed,     # 只做一件事：移走 profile 里遮蔽基础包的旧版本 @deepseek-ai/* 并退出
   [string]$LaunchRecord = ''  # 内部：交接模式下引擎自报 pid（见 lib/delayed-spawn.mjs 的 handoff）
 )
 
@@ -2443,6 +2444,43 @@ function Backup-ProfileConfig {
 }
 
 
+
+function Repair-ShadowedBasePackages {
+  <#
+    第三方插件会把 @deepseek-ai/* 作为依赖装进 profile 的 node_modules（pnpm 提升到顶层），
+    从而**遮蔽** App 自带的基础包。实测：profile 里出现 @deepseek-ai/dsh-settings@0.1.0-rc.8
+    （App 是 0.2.2-rc.3）→ settings 服务永远不注册 → 依赖它的 6 个插件全部 PENDING →
+    欢迎窗口的 settings RPC 失败，App 显示「无法使用 / Web RPC failed」。
+    这里把版本与共享投影不一致的基础包移进 .stale-packages（可回溯），让解析落回 App 自带版本。
+  #>
+  $shared = Join-Path $DshHome 'profiles\node_modules\@deepseek-ai'
+  if (-not (Test-Path -LiteralPath $shared)) { return [pscustomobject]@{ ok = $false; moved = @(); reason = 'shared-scope-missing' } }
+  $nm = Join-Path $DshHome ('profiles\' + $Profile + '\node_modules\@deepseek-ai')
+  $moved = New-Object System.Collections.ArrayList
+  if (Test-Path -LiteralPath $nm) {
+    $stale = Join-Path $DshHome ('profiles\' + $Profile + '\.stale-packages')
+    New-Item -ItemType Directory -Force -Path $stale | Out-Null
+    $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+    foreach ($dir in @(Get-ChildItem -LiteralPath $nm -Directory -ErrorAction SilentlyContinue)) {
+      $sharedPkg = Join-Path $shared ($dir.Name + '\package.json')
+      $localPkg = Join-Path $dir.FullName 'package.json'
+      if (-not (Test-Path -LiteralPath $sharedPkg) -or -not (Test-Path -LiteralPath $localPkg)) { continue }
+      $lv = ''; $sv = ''
+      try {
+        $lv = [string](Get-Content -LiteralPath $localPkg -Raw -Encoding UTF8 | ConvertFrom-Json).version
+        $sv = [string](Get-Content -LiteralPath $sharedPkg -Raw -Encoding UTF8 | ConvertFrom-Json).version
+      } catch { continue }
+      if (-not $lv -or -not $sv -or $lv -eq $sv) { continue }
+      $dst = Join-Path $stale ($dir.Name + '-' + $lv + '-' + $stamp)
+      try {
+        Move-Item -LiteralPath $dir.FullName -Destination $dst -Force -ErrorAction Stop
+        [void]$moved.Add(($dir.Name + '@' + $lv + ' -> ' + $sv))
+      } catch { }
+    }
+  }
+  return [pscustomobject]@{ ok = $true; moved = @($moved.ToArray()); reason = 'checked' }
+}
+
 # ---------------------------------------------------------------- DSH Desktop（Electron 宿主）
 #
 # 与 `dsh web` 的四处硬差异（本机实测 2026-11-14，DSH 0.2.2-rc.3）：
@@ -2669,6 +2707,11 @@ function Start-DesktopApp {
   $plan = Get-DesktopLaunch
   if (-not $plan) {
     throw '找不到 DSH Desktop 可执行文件：先用 -Record -RecordCommand "\"<path>\DeepSeek Harness.exe\"" 记录一次'
+  }
+  $shadow = Repair-ShadowedBasePackages
+  if ($shadow.moved.Count -gt 0) {
+    Add-Step 'shadowed' ("profile 里的旧版基础包会遮蔽 App 自带版本（settings 服务会起不来）→ 已移走：" +
+      ($shadow.moved -join '；') + "（备份在 .stale-packages）") 'warn'
   }
   if (-not (Test-SharedScope)) {
     Add-Step 'shared-scope' '共享投影缺失（宿主会连基础包都 import 不到、App 直接打不开）→ 从 app.asar 重建' 'warn'
@@ -2973,6 +3016,22 @@ try {
     }
     Add-Step 'via-task' '已交给计划任务执行；本次重启的终态记录见 $StateDir\dsh-restart.log（由任务内的进程写入）' 'ok'
     Write-Terminal 'via-task-dispatched' 0
+    exit 0
+  }
+
+  if ($CheckShadowed) {
+    $shadow = Repair-ShadowedBasePackages
+    if (-not $shadow.ok) {
+      Add-Step 'shadowed' ("无法检查：" + $shadow.reason) 'fail'
+      Write-Terminal 'shadowed-check-failed' 1
+      exit 1
+    }
+    if ($shadow.moved.Count -eq 0) {
+      Add-Step 'shadowed' 'profile 里没有遮蔽基础包的旧版本（@deepseek-ai/* 版本与 App 一致）' 'ok'
+    } else {
+      Add-Step 'shadowed' ("已移走旧版本：" + ($shadow.moved -join '；') + "（备份在 .stale-packages）") 'warn'
+    }
+    Write-Terminal 'shadowed-checked' 0
     exit 0
   }
 
