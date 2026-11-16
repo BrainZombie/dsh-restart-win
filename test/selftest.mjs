@@ -454,7 +454,9 @@ test('detached: the handoff script fails silently instead of showing a dialog', 
         null,
     );
     assert.equal(handoff.ok, true, 'the handoff script must be written');
-    const text = readFileSync(handoff.vbsPath, 'utf8');
+    const head = readFileSync(handoff.vbsPath).subarray(0, 2);
+    assert.deepEqual([...head], [0xff, 0xfe], 'the script must start with a UTF-16LE BOM or WScript decodes it as ANSI');
+    const text = readFileSync(handoff.vbsPath, 'utf16le').replace(/^\uFEFF/, '');
     assert.match(text, /^On Error Resume Next\r\n/, 'WScript must not raise a modal dialog');
     assert.match(text, /pwsh\.exe/, 'the command line must be present');
     assert.ok(text.includes('sh.Run "'), 'the script must call WScript.Shell.Run');
