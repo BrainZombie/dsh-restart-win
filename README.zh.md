@@ -309,6 +309,7 @@ dsh-restart-win -DryRun
 | `-Profile` | string | DSH profile（默认 `web`） |
 | `-HostKind` | `auto` / `web` / `desktop` | 宿主形态；`auto` 检测 DSH Desktop，否则按 `dsh web` |
 | `-RepairSharedScope` | — | 从已安装的 `app.asar` 重建 `<DSH_HOME>\profiles\node_modules`（桌面宿主解析 `@deepseek-ai/*` 用的基础包投影）后退出。App 打不开、崩溃日志里基础包全是 `ERR_MODULE_NOT_FOUND` 时用它 |
+| `-CheckShadowed` | — | 把 profile 里版本与 App 自带不一致的 `@deepseek-ai/*` 移进 `.stale-packages`（这类遮蔽会让 `settings` 服务起不来：App 报 *Web RPC failed*，6 个插件一直 pending） |
 | `-Port` | int | 宿主端口（默认 `3080`，同时决定互斥体名） |
 | `-BindHost` | string | 探针地址（默认 `127.0.0.1`）。它**不影响**宿主监听地址，见 §8 |
 | `-DshHome` | path | DSH 家目录（默认 `%DSH_HOME%`，否则 `%USERPROFILE%\.dsh`） |
@@ -478,6 +479,8 @@ dsh-restart-win -DryRun
 ## 13. 故障排查
 
 先看三个地方：工具返回的 `error`（或 CLI 的 stderr）、`<stateDir>\dsh-restart.log` 的最后一行、`<stateDir>\restart-history.jsonl` 的最后一条。
+
+**App 报「应用无法启动 / Web RPC failed」，但宿主其实在监听。** 装第三方插件时 pnpm 可能把旧版 `@deepseek-ai/dsh-settings`（或其它基础包）提升到 profile 的 `node_modules`，遮蔽 App 自带版本；`settings` 服务因此永远不注册，欢迎窗口的 RPC 失败。执行 `dsh-restart-win -CheckShadowed`（引擎在每次拉起前也会自动检查，把旧版本移进 `.stale-packages`）。
 
 **App 完全打不开，宿主崩溃日志里基础包全是 `ERR_MODULE_NOT_FOUND`。** 桌面宿主从 `<DSH_HOME>\profiles\node_modules` 解析 `@deepseek-ai/*`（那是 `app.asar\dsh\node_modules` 的投影），profile 里跑一次 `pnpm install` 可能把它清掉。执行 `dsh-restart-win -RepairSharedScope` 从已安装的 `app.asar` 重建；引擎在拉起 App 前也会自动修一次。全新空白 profile 也会复现，所以这不是 profile 损坏。
 
