@@ -1687,6 +1687,12 @@ function Test-DeepVerify {
 function Invoke-DeepVerifyWithRetry {
   $dv = Test-DeepVerify
   if ($null -eq $dv -or $dv.ok) { return $dv }
+  $retryable = $true
+  if ($dv.PSObject.Properties['retryable']) { $retryable = [bool]$dv.retryable }
+  if (-not $retryable) {
+    Add-Step 'deep-verify' '隔离宿主进程仍存活但一直没就绪（某个插件在启动期挂住）→ 重试不会改变结果，跳过重试' 'warn'
+    return $dv
+  }
   Add-Step 'deep-verify' "首次未就绪（预算 ${VerifyReadySec}s）→ 重试一次；隔离 home 每次都要跑 config-manager 的启动期导出/定时备份，偶发会顶到预算" 'warn'
   $script:VerifyTail = @()
   $dv2 = Test-DeepVerify
@@ -2793,7 +2799,13 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec) {
 function Remove-TreeSafe([string]$Dir) {
   # 含 junction 的目录：cmd rmdir 只删链接本身；PS5.1 的 Remove-Item -Recurse 可能跟进目标。
   if (-not (Test-Path -LiteralPath $Dir)) { return }
-  & cmd.exe /c "rmdir /s /q `"$Dir`"" *> $null
+  try {
+    $rp = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\cmd.exe') `
+          -ArgumentList @('/c', 'rmdir', '/s', '/q', ('"' + $Dir + '"')) -PassThru -WindowStyle Hidden -ErrorAction Stop
+    [void]$rp.WaitForExit(60000)
+  } catch {
+    & cmd.exe /c "rmdir /s /q `"$Dir`"" *> $null
+  }
 }
 
 function Test-DesktopVerify {
@@ -2898,8 +2910,24 @@ function Test-DesktopVerify {
 
     $deadline = (Get-Date).AddSeconds($VerifyReadySec)
     $lastHttp = 0
+    $fatal = ''
+    $lastScan = Get-Date
     while ((Get-Date) -lt $deadline) {
       if ($p.HasExited) { break }
+      # 启动期致命错误要立刻收手：某些插件在隔离宿主里会挂住（例如 tailscale 入口冲突反复重试），
+      # 干等预算只会让一次 -Preflight/重启看起来像卡死。
+      if (((Get-Date) - $lastScan).TotalSeconds -ge 4) {
+        $lastScan = Get-Date
+        try {
+          if (Test-Path -LiteralPath $err) {
+            $tailText = (@(Get-Content -LiteralPath $err -Tail 60 -ErrorAction SilentlyContinue) -join "`n")
+            foreach ($marker in @('StartupError', 'DesktopHostFatalError', 'desktop welcome: Web RPC failed')) {
+              if ($tailText -like ('*' + $marker + '*')) { $fatal = $marker; break }
+            }
+          }
+        } catch { }
+        if ($fatal) { break }
+      }
       $ports = @(Get-ListeningPorts $p.Id)
       foreach ($port in $ports) {
         $s = Test-HttpServing ("http://${BindHost}:$port/")
@@ -2922,17 +2950,25 @@ function Test-DesktopVerify {
       }
     }
     $script:VerifyTail = $tail
-    $why = if ($p.HasExited) { "进程已退出（exit=$($p.ExitCode)）" }
+    $why = if ($fatal) { "启动期致命错误（$fatal）" }
+           elseif ($p.HasExited) { "进程已退出（exit=$($p.ExitCode)）" }
            elseif ($lastHttp -eq 404) { "端口已绑但 $VerifyReadySec s 内路由未就绪（404）" }
-           elseif ($lastHttp -eq 0) { "$VerifyReadySec s 内端口未响应" }
+           elseif ($lastHttp -eq 0) { "$VerifyReadySec s 内端口未响应（进程仍存活，多半是插件在启动期挂住）" }
            else { "最后状态码 $lastHttp" }
     Add-Step 'deep-verify' ("桌面宿主隔离实例未就绪：$why；日志保留在 $v") 'fail'
-    return [pscustomobject]@{ ok = $false; reason = 'not-ready'; logdir = $v; tail = $tail }
+    return [pscustomobject]@{ ok = $false; reason = 'not-ready'; logdir = $v; tail = $tail; retryable = [bool]$p.HasExited }
   } catch {
     Add-Step 'deep-verify' "桌面验证实例启动异常: $($_.Exception.Message)" 'fail'
     return [pscustomobject]@{ ok = $false; error = $_.Exception.Message }
   } finally {
-    if ($p) { & taskkill.exe /PID $p.Id /T /F *> $null; Start-Sleep -Milliseconds 800 }
+    if ($p) {
+      try {
+        $tk = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\taskkill.exe') `
+              -ArgumentList @('/PID', [string]$p.Id, '/T', '/F') -PassThru -WindowStyle Hidden -ErrorAction Stop
+        [void]$tk.WaitForExit(8000)
+      } catch { try { & taskkill.exe /PID $p.Id /T /F *> $null } catch { } }
+      Start-Sleep -Milliseconds 400
+    }
     if ($keepLog) { Add-Step 'deep-verify-cleanup' "失败日志保留：$v" 'warn' }
     else { Remove-TreeSafe $v }
   }
