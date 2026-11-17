@@ -1,6 +1,6 @@
 {
   "name": "@brainzombie/dsh-restart-win",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Safe, verified restart of a DSH host on Windows: port-based discovery for `dsh web` and a desktop-aware path for the DSH Desktop Electron shell (random port, Electron main tree), fail-closed preflight, detached restart with a result file, and four host tools (win_restart / win_restart_status / win_restart_preflight / win_restart_result).",
   "license": "MIT",
   "publishConfig": {

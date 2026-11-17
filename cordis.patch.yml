@@ -34,6 +34,12 @@
         # Foreground short actions / detached preflight verification budget.
         toolTimeoutMs: 30000
         verifyTimeoutMs: 600000
+        # Extra Host authorities the panel API accepts besides loopback, so the
+        # dashboard keeps working when the GUI is reached through a reverse
+        # proxy such as `tailscale serve` (Host: <tailnet-name>). Each entry is
+        # an exact hostname (`host.tailnet.ts.net`) or a `*.suffix` wildcard.
+        # Empty = loopback only.
+        trustedHosts: []
         # Engine-side switch: when false, every engine launch (foreground tools
         # and the detached supervisor) carries DSH_RESTART_INJECT_HOST_ENV=0, so
         # the engine skips injecting its own host-process variables

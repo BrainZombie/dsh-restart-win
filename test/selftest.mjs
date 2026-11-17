@@ -169,6 +169,7 @@ test('defaults match CONTRACT §4 exactly', () => {
         restartDelayMs: 1500,
         toolTimeoutMs: 30000,
         verifyTimeoutMs: 600000,
+        trustedHosts: [],
         injectHostEnv: true,
         tools: TOOL_FLAGS,
     });
@@ -603,6 +604,30 @@ test('panel API: same-origin guard accepts the app origins and rejects the web',
     assert.equal(isSameOrigin({ method: 'POST', headers: { host: loopback, origin: 'https://evil.example' } }), false);
     assert.equal(isSameOrigin({ method: 'POST', headers: {} }), false, 'no Host header is never same-origin');
     assert.equal(isSameOrigin({ method: 'POST', headers: { host: 'evil.example', origin: 'https://evil.example' } }), false);
+});
+
+test('panel API: same-origin guard honours trusted hosts for reverse-proxied origins', () => {
+    const tailnet = 'desktop-demo.tail0demo.ts.net';
+    const trusted = ['desktop-demo.tail0demo.ts.net'];
+    const wildcard = ['*.ts.net'];
+    const req = (origin) => ({ method: 'POST', headers: { host: tailnet, origin } });
+    // The Host is no longer loopback, so without a trusted entry every call is refused.
+    assert.equal(isSameOrigin(req(`https://${tailnet}`)), false);
+    assert.equal(isSameOrigin(req(`https://${tailnet}`), trusted), true);
+    assert.equal(isSameOrigin(req(`https://${tailnet}`), wildcard), true);
+    assert.equal(isSameOrigin({ method: 'GET', headers: { host: tailnet } }, trusted), true);
+    // A Host with an explicit port still matches on the hostname.
+    assert.equal(isSameOrigin({ method: 'POST', headers: { host: `${tailnet}:443`, origin: `https://${tailnet}` } }, trusted), true);
+    // Trusting the tailnet name must not trust a look-alike or another origin.
+    assert.equal(isSameOrigin(req('https://evil.ts.net.example'), trusted), false);
+    assert.equal(isSameOrigin(req('https://evil.example'), trusted), false);
+    assert.equal(isSameOrigin({ method: 'POST', headers: { host: 'evil.ts.net', origin: 'https://evil.ts.net' } }, wildcard), true);
+    assert.equal(isSameOrigin({ method: 'POST', headers: { host: 'ts.net', origin: 'https://ts.net' } }, wildcard), false, 'wildcard needs a label before the suffix');
+    // A proxy may forward the original authority; match it when the browser sends it as Origin.
+    assert.equal(
+        isSameOrigin({ method: 'POST', headers: { host: tailnet, origin: `https://${tailnet}`, 'x-forwarded-host': tailnet } }, trusted),
+        true,
+    );
 });
 
 test('client bundle: registers a sidebar tab and survives a host-free load', () => {
@@ -1384,10 +1409,11 @@ test('cordis.patch.yml inserts the row with every CONTRACT §4 default', () => {
         if (match) scalars[match[1]] = match[2].replace(/^'(.*)'$/, '$1').replace(/^"(.*)"$/, '$1');
     }
     for (const [key, value] of Object.entries(DEFAULTS)) {
-        if (key === 'tools') continue;
+        if (key === 'tools' || Array.isArray(value)) continue;
         assert.ok(Object.hasOwn(scalars, key), `cordis.patch.yml is missing ${key}`);
         assert.equal(scalars[key], String(value), `cordis.patch.yml has the wrong default for ${key}`);
     }
+    assert.match(text, /^ {8}trustedHosts: \[\]$/m, 'trustedHosts must default to an empty list');
     for (const tool of Object.keys(TOOL_FLAGS)) {
         assert.match(text, new RegExp(`^ {10}${tool}: true$`, 'm'), `tools.${tool} must default to true`);
     }

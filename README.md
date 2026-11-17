@@ -346,6 +346,7 @@ Configuration lives under the plugin row's `config` in `cordis.patch.yml` (or in
 | `restartDelayMs` | integer | `1500` | The tool returns first, then waits this long before touching the host |
 | `toolTimeoutMs` | integer | `30000` | Foreground short-task timeout |
 | `verifyTimeoutMs` | integer | `600000` | Budget for a detached verification run (also bounds how long `win_restart_result` waits) |
+| `trustedHosts` | string[] | `[]` | Extra `Host` authorities the dashboard API accepts besides loopback: exact hostnames or `*.suffix` wildcards. Needed when the GUI is reached through a reverse proxy such as `tailscale serve` (`Host: <host>.tailnet.ts.net`); loopback-only stays the default |
 | `injectHostEnv` | boolean | `true` | Whether to inject `DSH_UC_PROFILE_NODE_MODULES` / `NPM_CONFIG_LEGACY_PEER_DEPS` into the child process that becomes the host (see 7.1); `false` starts the engine with `DSH_RESTART_INJECT_HOST_ENV=0` so it skips them |
 | `tools.restart` | boolean | `true` | Register `win_restart` |
 | `tools.status` | boolean | `true` | Register `win_restart_status` |
