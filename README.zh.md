@@ -346,6 +346,7 @@ dsh-restart-win -DryRun
 | `restartDelayMs` | integer | `1500` | 工具先返回，再等这么久才动宿主 |
 | `toolTimeoutMs` | integer | `30000` | 前台短任务超时 |
 | `verifyTimeoutMs` | integer | `600000` | 分离验证任务的预算（`win_restart_result` 等待时也受它约束） |
+| `trustedHosts` | string[] | `[]` | 面板 API 除回环外额外接受的 `Host`：精确 hostname 或 `*.suffix` 通配。经反向代理（如 `tailscale serve`，`Host: <主机>.tailnet.ts.net`）访问 GUI 时必须配；默认只认回环 |
 | `injectHostEnv` | boolean | `true` | 拉起宿主时是否把 `DSH_UC_PROFILE_NODE_MODULES` / `NPM_CONFIG_LEGACY_PEER_DEPS` 注入子进程（见 7.1）；`false` 时以 `DSH_RESTART_INJECT_HOST_ENV=0` 通知引擎跳过 |
 | `tools.restart` | boolean | `true` | 是否注册 `win_restart` |
 | `tools.status` | boolean | `true` | 是否注册 `win_restart_status` |
