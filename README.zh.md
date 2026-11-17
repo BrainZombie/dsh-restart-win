@@ -206,6 +206,60 @@ dsh-restart-win -Record -RecordCommand '"C:\<app>\DeepSeek Harness.exe"' -Record
 客户端半端随包分发，**重启一次宿主**就会出现，不需要构建。
 
 
+### 4.8 远程停止（反向代理域名下的兜底入口）
+
+经反向代理域名（例如 tailscale serve 出来的 `https://<host>.ts.net`）访问时，会话输入框右侧的原生停止方块在部分会话上「点了没反应」：`ui-conversation` 的 `scopedConversation()` 取不到会话作用域时会同步抛错，而 `stop()` 把它 `catch` 掉了，于是既没有请求也没有报错。宿主侧的取消通路本身是好的，所以这里补一个直连它的悬浮入口。
+
+**什么时候出现**：页面主机名**不是回环**（`localhost`、`127.0.0.1`、`[::1]` 都不出现），且命中 `GET /dsh-restart-win/api/meta` 返回的 `trustedHosts`（`.suffix`、`*.suffix`、整串主机名三种写法）；拿不到 `meta` 时退回「主机名以 `.ts.net` 结尾」。因此本机直连时不打扰，经代理访问时才有。
+
+**面板内容**：
+
+- 右侧 34px 圆钮 `⏹`，点开是「进行中的会话」列表（默认每 5 秒刷新）。
+- 列表来自 `GET /dsh-restart-win/api/sessions`：宿主对每个 live session 取最近 400 条事件，最后一个 turn 事件是 `turn/start` 而没有配对的 `turn/end` 才算 `running`。**不再用「浏览器打开过的会话」冒充运行中**——那个接口（`/archived-sessions/active-session`）只表示当前页面打开过谁。
+- 标题经 `/archived-sessions/sidebar-state` 的 `titles` 懒补（侧栏那个接口比 `/archived-sessions/sessions` 快一个数量级），拿不到时显示 `session…末四位` 并保留完整 id 在 `title` 属性里。
+- 停止按钮 `POST /api/session/cancel`，信封必须是
+  `{"type":"client-request","rpcId":"…","method":"session/cancel","payload":{"args":{"request":{"sessionId":"…"}}}}`；
+  按 `result.ok` 与 `result.value.accepted` 区分「已停止」「该会话当前没有进行中的回合」「停止失败（附 error.message/code）」。
+- 没有进行中的会话时给出明确空态文案。
+
+**API 契约（前端只用这四个，不自己发明运行态字段）**：
+
+| 端点 | 方法 | 用途 | 形状 |
+| --- | --- | --- | --- |
+| `/archived-sessions/active-session` | GET | 「当前页面打开过哪些会话」——**不等于在跑**，只用它做快速首屏 | `{"activeSessionIds":["…"]}` |
+| `/archived-sessions/sidebar-state` | GET | 会话标题映射，用来把短 id 换成标题；比 `/archived-sessions/sessions` 快一个数量级 | `{"titles":{"<sessionId>":"<标题>"}}` |
+| `/dsh-restart-win/api/sessions` | GET | 宿主侧真实运行态：每个 live session 最近 400 条事件里最后一个 `turn/start`/`turn/end` | `{"ok":true,"items":[{"sessionId","cwd","createdAt","parentSession","running","turn","runningSince","lastTurnEvent","lastEventAt"}]}` |
+| `/api/session/cancel` | POST | 取消该会话当前回合 | 见下 |
+
+取消走的 RPC 信封（字段名写错会被 gateway 依次回 `gateway/bad-request` / `gateway/arguments-invalid`）：
+
+```json
+{"type":"client-request","rpcId":"…","method":"session/cancel","payload":{"args":{"request":{"sessionId":"…"}}}}
+```
+
+成功响应：`{"type":"server-response","rpcId":"…","result":{"ok":true,"value":{"accepted":true}}}`。`accepted:false` 表示「该会话当前没有进行中的回合」，不是失败。
+
+**怎么验**（改完宿主模块必须重启，模块是启动时 import 的）：
+
+```powershell
+# 1) 端点通不通（本机直连，cookie 用宿主自己的；从 tailnet 域名访问时浏览器会自动带上）
+curl.exe -s --noproxy '*' http://127.0.0.1:<port>/dsh-restart-win/api/sessions
+
+# 2) 起一个长跑探针，再点停止，确认回合真的被取消
+#    session_bridge_create -> 让它跑 Start-Sleep 600，然后点面板里的「停止」
+#    用 session_bridge_status 看 openTurn 是否变 no / idle
+
+# 3) 刷新页面、重启宿主后各看一次：⏹ 是否还在、是否只有一个（面板 id 唯一，
+#    mount 前会先移除同 id 旧节点）
+```
+
+**边界**：只扫描每个会话最近 400 条事件，历史很长但最新就是 `turn/start` 的会话能正确识别；极长的静默回合若中间没有任何事件且起点被挤出 400 条窗口，会被当成空闲——属于可接受的观测误差，停止按钮只是兜底，不替代原生入口。
+
+
+### 4.8 两种安装布局：`app.asar` 与解包后的 `resources\app`
+
+有些补丁/bridge 工具会把 `resources\app.asar` 解成真实目录 `resources\app\dsh`。引擎两种都认：先看 asar 文件，没有再找 `resources\app\dsh`，发现、深度验证、共享投影重建都按实际存在的那一种走。`-Status` 在两种布局下都能报出实例；不会再因为「app.asar 不存在」就判定桌面运行时缺失。
+
 ## 5. 四个工具
 
 四个工具的输入都先过白名单校验再拼 argv 数组（从不拼 shell 字符串），非法值直接返回错误而不是回退到默认值。`tools` 配置可以逐个关掉。

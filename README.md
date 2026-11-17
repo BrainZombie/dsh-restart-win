@@ -206,6 +206,57 @@ The panel talks to `/dsh-restart-win/api/*` on the same origin (the host's sessi
 The client half is part of the package, so it appears after one host restart; no build step is involved.
 
 
+### 4.8 Remote stop (fallback for proxied hostnames)
+
+When the GUI is reached through a reverse-proxy hostname (for example `https://<host>.ts.net` served by tailscale), the composer's native stop square does nothing on some sessions: `ui-conversation`'s `scopedConversation()` throws synchronously when it cannot resolve a session scope, and `stop()` swallows it — so there is no request and no error. The host-side cancel path is fine, so this plugin adds a floating entry that talks to it directly.
+
+**When it appears**: the page hostname is **not loopback** (`localhost`, `127.0.0.1`, `[::1]` never show it) and matches `trustedHosts` from `GET /dsh-restart-win/api/meta` (`.suffix`, `*.suffix` or an exact hostname); if `meta` is unavailable it falls back to "hostname ends with `.ts.net`".
+
+**What the panel shows**:
+
+- A 34px `⏹` button on the right edge; opening it lists running sessions (refreshed every 5 s).
+- The list comes from `GET /dsh-restart-win/api/sessions`: the host scans the last 400 events of every live session and marks it `running` only when the newest turn event is `turn/start` with no matching `turn/end`. "Opened in this browser" (`/archived-sessions/active-session`) is **not** treated as running.
+- Titles are merged lazily from `/archived-sessions/sidebar-state` `titles` (an order of magnitude faster than `/archived-sessions/sessions`); without a title the row shows `session…last4` with the full id in `title`.
+- Stop posts to `/api/session/cancel` with
+  `{"type":"client-request","rpcId":"…","method":"session/cancel","payload":{"args":{"request":{"sessionId":"…"}}}}`
+  and distinguishes "stopped", "no running turn in that session" and "stop failed" via `result.ok` / `result.value.accepted`.
+- An empty list prints an explicit empty state.
+
+**API contract (the client uses only these four; no invented runtime fields)**:
+
+| Endpoint | Method | Purpose | Shape |
+| --- | --- | --- | --- |
+| `/archived-sessions/active-session` | GET | "which sessions this page has opened" — **not** "running"; first paint only | `{"activeSessionIds":["…"]}` |
+| `/archived-sessions/sidebar-state` | GET | title map, used to replace short ids; an order of magnitude faster than `/archived-sessions/sessions` | `{"titles":{"<sessionId>":"<title>"}}` |
+| `/dsh-restart-win/api/sessions` | GET | real runtime state: the newest `turn/start`/`turn/end` among the last 400 events per live session | `{"ok":true,"items":[{"sessionId","cwd","createdAt","parentSession","running","turn","runningSince","lastTurnEvent","lastEventAt"}]}` |
+| `/api/session/cancel` | POST | cancel the session's current turn | see below |
+
+Cancel envelope (a wrong field name is rejected by the gateway as `gateway/bad-request` / `gateway/arguments-invalid`):
+
+```json
+{"type":"client-request","rpcId":"…","method":"session/cancel","payload":{"args":{"request":{"sessionId":"…"}}}}
+```
+
+Success: `{"type":"server-response","rpcId":"…","result":{"ok":true,"value":{"accepted":true}}}`. `accepted:false` means "that session has no running turn", not a failure.
+
+**How to verify** (host modules load at startup, so restart the host first):
+
+```powershell
+curl.exe -s --noproxy '*' http://127.0.0.1:<port>/dsh-restart-win/api/sessions
+# create a long-running probe session (session_bridge_create -> Start-Sleep 600),
+# click Stop in the panel, then confirm with session_bridge_status that openTurn is
+# no / the session is idle. Reload the page and restart the host once each: the ⏹
+# must still be there and must exist exactly once (the widget removes a stale node
+# with the same id before mounting).
+```
+
+**Limits**: only the last 400 events per session are scanned; a very long silent turn whose `turn/start` fell out of that window is reported as idle. The panel is a fallback, not a replacement for the native control.
+
+
+### 4.8 Two install layouts: `app.asar` and unpacked `resources\app`
+
+Some patching tools (bridges that rewrite the desktop bundle) replace `resources\app.asar` with an unpacked `resources\app\dsh` directory. The engine detects both: it looks for the asar file first, then for `resources\app\dsh`, and uses whichever exists for discovery, deep verification and the shared-scope repair. `-Status` reports the instance either way; a missing `app.asar` alone is no longer treated as "desktop runtime missing".
+
 ## 5. The four tools
 
 Every argument is whitelist-validated before it reaches an argv array (a shell string is never built); an invalid value returns an error instead of falling back to a default. Each tool can be switched off through `tools`.
