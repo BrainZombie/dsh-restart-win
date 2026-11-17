@@ -38,6 +38,7 @@ window.__ModuleLoader__.load({
       danger: 'var(--dsw-alias-state-error-primary, #e03131)',
       soft: 'var(--dsw-alias-bg-layer-2, rgba(128,128,128,0.09))',
       soft2: 'var(--dsw-alias-bg-layer-3, rgba(128,128,128,0.15))',
+      panel: 'var(--dsw-alias-bg-layer-1, Canvas)',
     }
     var MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
 
@@ -422,6 +423,264 @@ window.__ModuleLoader__.load({
       return h('span', { style: { fontSize: 12 } }, 'DSH 重启')
     }
 
+    // ─────────────────────────────────────────── 远程停止（非回环页面兜底）
+    // 背景：经 *.ts.net 这类反向代理域名访问时，部分会话的原生停止按钮点了没反应
+    // （ui-conversation 里 scopedConversation 取不到 scope 会同步抛错并被 catch 吞掉，
+    // 于是「按钮在、无请求、无报错」）。宿主侧 /api/session/cancel 的 RPC 是通的，
+    // 这里给一个直连它的悬浮入口；只在非回环页面启用，本机 127.0.0.1 不出现。
+    var REMOTE_STOP_ID = 'dsh-remote-stop-widget'
+    var REMOTE_STOP_RS = { list: 5000 }
+
+    function isLoopbackHost(name) {
+      var host = String(name || '').toLowerCase()
+      if (!host) return true
+      return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1' ||
+        host.slice(-10) === '.localhost' || host.slice(0, 8) === '127.0.0.'
+    }
+
+    // 支持 `host`、`.suffix`、`*.suffix` 三种写法，与宿主 config.trustedHosts 同义。
+    function hostMatches(pattern, host) {
+      var p = String(pattern || '').toLowerCase().trim()
+      if (!p) return false
+      if (p.slice(0, 2) === '*.') return host.slice(-(p.length - 1)) === p.slice(1)
+      if (p.charAt(0) === '.') return host === p.slice(1) || host.slice(-p.length) === p
+      return host === p
+    }
+
+    function mk(tag, style, content) {
+      var node = document.createElement(tag)
+      if (style) node.setAttribute('style', style)
+      if (content !== undefined && content !== null) node.textContent = String(content)
+      return node
+    }
+
+    function rpcId() {
+      return 'remote-stop-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
+    }
+
+    function fetchJson(url, options) {
+      return fetch(url, options).then(function (res) {
+        return res.json().catch(function () { return { ok: false, error: 'HTTP ' + res.status } })
+      })
+    }
+
+    function cancelSession(sessionId) {
+      return fetchJson('/api/session/cancel', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          type: 'client-request',
+          rpcId: rpcId(),
+          method: 'session/cancel',
+          payload: { args: { request: { sessionId: sessionId } } },
+        }),
+      })
+    }
+
+    // 标题不在 sessions 列表里，得从归档插件的 sidebar-state 拿（页面内 ~0.9s）。
+    // 拿不到就退回短 id，面板照样能用。
+    function loadTitles() {
+      return fetchJson('/archived-sessions/sidebar-state').then(function (payload) {
+        var titles = (payload && (payload.titles || (payload.value && payload.value.titles))) || {}
+        return titles && typeof titles === 'object' ? titles : {}
+      }).catch(function () { return {} })
+    }
+
+    function shortId(id) {
+      var raw = String(id || '')
+      var tail = raw.slice(-4)
+      return 'session…' + tail
+    }
+
+    function cwdLabel(cwd) {
+      if (!cwd) return ''
+      var parts = String(cwd).split(/[\\/]+/).filter(Boolean)
+      return parts.length ? parts[parts.length - 1] : String(cwd)
+    }
+
+    function agoLabel(ms) {
+      if (!ms) return ''
+      var diff = Date.now() - ms
+      if (diff < 0) diff = 0
+      var minutes = Math.floor(diff / 60000)
+      if (minutes < 1) return '刚刚'
+      if (minutes < 60) return minutes + ' 分钟'
+      var hours = Math.floor(minutes / 60)
+      if (hours < 24) return hours + ' 小时 ' + (minutes % 60) + ' 分'
+      return Math.floor(hours / 24) + ' 天'
+    }
+
+    function mountRemoteStop() {
+      // 宿主外加载（单测、SSR 探针）时没有 document/location：直接放弃挂载。
+      if (typeof document === 'undefined' || typeof location === 'undefined') return null
+      var host = String(location.hostname || '').toLowerCase()
+      if (isLoopbackHost(host)) return null
+      var existing = document.getElementById(REMOTE_STOP_ID)
+      if (existing && existing.parentNode) existing.parentNode.removeChild(existing)
+
+      var wrap = mk('div', [
+        'position:fixed', 'right:10px', 'top:41vh', 'z-index:2147482000',
+        'display:flex', 'flex-direction:row-reverse', 'align-items:flex-start', 'gap:8px',
+        'font:12px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif',
+      ].join(';'))
+      wrap.id = REMOTE_STOP_ID
+
+      var button = mk('button', [
+        'width:34px', 'height:34px', 'border-radius:999px', 'cursor:pointer',
+        'border:1px solid ' + C.line, 'background:' + C.soft2, 'color:' + C.text,
+        'font-size:15px', 'line-height:1', 'display:flex', 'align-items:center', 'justify-content:center',
+        'box-shadow:0 4px 14px rgba(0,0,0,0.22)',
+      ].join(';'), '⏹')
+      button.type = 'button'
+      button.title = '远程停止进行中的会话'
+      button.setAttribute('aria-label', '远程停止')
+
+      var panel = mk('div', [
+        'display:none', 'width:300px', 'max-height:52vh', 'overflow:auto',
+        'border:1px solid ' + C.line, 'border-radius:10px', 'background:' + C.panel,
+        'box-shadow:0 10px 30px rgba(0,0,0,0.28)', 'padding:10px 12px',
+      ].join(';'))
+
+      var head = mk('div', 'display:flex;align-items:center;justify-content:space-between;gap:8px')
+      head.appendChild(mk('div', 'font-weight:600', '进行中的会话'))
+      var close = mk('button', 'border:0;background:transparent;color:' + C.dim + ';cursor:pointer;font-size:14px', '×')
+      close.type = 'button'
+      close.title = '收起'
+      head.appendChild(close)
+
+      var tip = mk('div', 'color:' + C.dim + ';margin:4px 0 8px', '只列出有进行中回合的会话；停止走宿主 /api/session/cancel。')
+      var list = mk('div', 'display:flex;flex-direction:column;gap:6px')
+      var foot = mk('div', 'display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:8px')
+      var status = mk('span', 'color:' + C.dim, '')
+      var refresh = mk('button', 'border:1px solid ' + C.line + ';background:transparent;color:' + C.text + ';border-radius:6px;padding:2px 8px;cursor:pointer;font-size:11px', '刷新')
+      refresh.type = 'button'
+      foot.appendChild(status)
+      foot.appendChild(refresh)
+
+      panel.appendChild(head)
+      panel.appendChild(tip)
+      panel.appendChild(list)
+      panel.appendChild(foot)
+      wrap.appendChild(button)
+      wrap.appendChild(panel)
+      document.body.appendChild(wrap)
+
+      var titles = {}
+      var timer = null
+      var open = false
+
+      function setStatus(message) {
+        status.textContent = message || ''
+      }
+
+      function renderRows(items) {
+        list.textContent = ''
+        if (!items.length) {
+          list.appendChild(mk('div', 'color:' + C.dim + ';padding:6px 0', '当前没有进行中的会话。'))
+          return
+        }
+        items.forEach(function (item) {
+          var row = mk('div', 'border:1px solid ' + C.line + ';border-radius:8px;padding:6px 8px;display:flex;align-items:center;justify-content:space-between;gap:8px')
+          var meta = mk('div', 'min-width:0;display:flex;flex-direction:column;gap:2px')
+          var title = titles[item.sessionId] || shortId(item.sessionId)
+          var name = mk('div', 'font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap', title)
+          name.title = String(item.sessionId)
+          meta.appendChild(name)
+          var bits = []
+          if (item.cwd) bits.push(cwdLabel(item.cwd))
+          if (item.runningSince) bits.push('已运行 ' + agoLabel(item.runningSince))
+          meta.appendChild(mk('div', 'color:' + C.dim + ';font-size:11px', bits.join(' · ') || '进行中'))
+          var stop = mk('button', 'border:1px solid ' + C.danger + ';background:transparent;color:' + C.danger + ';border-radius:6px;padding:3px 9px;cursor:pointer;font-size:11px', '停止')
+          stop.type = 'button'
+          stop.addEventListener('click', function () {
+            stop.disabled = true
+            stop.textContent = '停止中'
+            setStatus('正在停止 ' + title + ' …')
+            cancelSession(item.sessionId).then(function (payload) {
+              var result = (payload && payload.result) || payload || {}
+              var ok = result.ok === true
+              var accepted = !!(result.value && result.value.accepted)
+              if (ok && accepted) setStatus('已停止：' + title)
+              else if (ok) setStatus('该会话当前没有进行中的回合：' + title)
+              else {
+                var error = (result.error && (result.error.message || result.error.code)) || '取消失败'
+                setStatus('停止失败：' + error)
+              }
+            }).catch(function (error) {
+              setStatus('停止失败：' + String((error && error.message) || error))
+            }).then(function () {
+              stop.disabled = false
+              stop.textContent = '停止'
+              load()
+            })
+          })
+          row.appendChild(meta)
+          row.appendChild(stop)
+          list.appendChild(row)
+        })
+      }
+
+      function load() {
+        return Promise.all([
+          fetchJson(PREFIX + '/api/sessions'),
+          Object.keys(titles).length ? Promise.resolve(titles) : loadTitles(),
+        ]).then(function (results) {
+          var payload = results[0] || {}
+          if (results[1] && typeof results[1] === 'object') titles = results[1]
+          if (payload.ok === false) {
+            list.textContent = ''
+            list.appendChild(mk('div', 'color:' + C.warn + ';padding:6px 0', '会话列表不可用：' + (payload.error || 'unknown')))
+            setStatus('')
+            return
+          }
+          var items = (payload.items || []).filter(function (item) { return item && item.running })
+          renderRows(items)
+          setStatus(items.length ? items.length + ' 个进行中' : '空闲')
+        }).catch(function (error) {
+          list.textContent = ''
+          list.appendChild(mk('div', 'color:' + C.danger + ';padding:6px 0', '读取失败：' + String((error && error.message) || error)))
+        })
+      }
+
+      function show() {
+        open = true
+        panel.style.display = 'block'
+        load()
+        if (timer) clearInterval(timer)
+        timer = setInterval(function () { if (open && document.visibilityState !== 'hidden') load() }, REMOTE_STOP_RS.list)
+      }
+
+      function hide() {
+        open = false
+        panel.style.display = 'none'
+        if (timer) { clearInterval(timer); timer = null }
+      }
+
+      button.addEventListener('click', function () { if (open) hide(); else show() })
+      close.addEventListener('click', hide)
+      refresh.addEventListener('click', function () { setStatus('刷新中…'); load() })
+
+      return function dispose() {
+        hide()
+        if (wrap.parentNode) wrap.parentNode.removeChild(wrap)
+      }
+    }
+
+    // meta 里的 trustedHosts 决定是否在这个域名出现；拿不到时退回 *.ts.net。
+    function shouldMountRemoteStop() {
+      if (typeof document === 'undefined' || typeof location === 'undefined') return Promise.resolve(false)
+      var host = String(location.hostname || '').toLowerCase()
+      if (isLoopbackHost(host)) return Promise.resolve(false)
+      return fetchJson(PREFIX + '/api/meta').then(function (payload) {
+        var hosts = (payload && payload.trustedHosts) || []
+        if (Array.isArray(hosts) && hosts.length) {
+          return hosts.some(function (pattern) { return hostMatches(pattern, host) })
+        }
+        return host.slice(-7) === '.ts.net'
+      }).catch(function () { return host.slice(-7) === '.ts.net' })
+    }
+
     function definition() {
       return {
         id: ID,
@@ -453,6 +712,19 @@ window.__ModuleLoader__.load({
             return ctx.slots.register({ name: 'sidebar.right.pane.tab.title', key: ID }, ChipTitle)
           })
         }, 'dsh-restart-win: tab title')
+        // 远程（非回环）页面才挂悬浮停止入口；dispose 负责摘掉 DOM 与定时器。
+        ctx.effect(function () {
+          var dispose = null
+          var cancelled = false
+          shouldMountRemoteStop().then(function (enabled) {
+            if (!enabled || cancelled) return
+            dispose = mountRemoteStop()
+          })
+          return function () {
+            cancelled = true
+            if (typeof dispose === 'function') dispose()
+          }
+        }, 'dsh-restart-win: remote stop')
       },
     }
   },

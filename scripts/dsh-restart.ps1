@@ -2408,12 +2408,29 @@ function Repair-SharedScope {
   $exe = Resolve-DesktopAppPath
   if (-not $exe) { return [pscustomobject]@{ ok = $false; reason = 'desktop-app-missing' } }
   $paths = Get-DesktopPaths $exe
-  if (-not (Test-Path -LiteralPath $paths.asar -PathType Leaf)) { return [pscustomobject]@{ ok = $false; reason = 'app-asar-missing' } }
   $root = Get-SharedScopePath
   New-Item -ItemType Directory -Force -Path $root | Out-Null
   $stats = [pscustomobject]@{ Files = 0; Unpacked = 0; Skipped = 0; Links = 0; Missing = 0; Errors = 0; Bytes = [int64]0 }
   $stream = $null
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  if (-not (Test-Path -LiteralPath $paths.asar -PathType Leaf)) {
+    # unpacked 布局（bridge/补丁工具把 asar 解开了）：直接复制真实目录，比解 asar 更快
+    $srcNm = Join-Path $paths.runtimeDir 'node_modules'
+    if (-not (Test-Path -LiteralPath $srcNm -PathType Container)) {
+      $sw.Stop()
+      return [pscustomobject]@{ ok = $false; reason = 'desktop-runtime-missing'; stats = $stats }
+    }
+    try {
+      & robocopy.exe $srcNm $root /E /NFL /NDL /NJH /NJS /NP /R:2 /W:1 *> $null
+      $stats.Files = @(Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue).Count
+      $stats.Bytes = [int64]((Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum)
+    } catch {
+      $sw.Stop()
+      return [pscustomobject]@{ ok = $false; reason = ('copy-failed: ' + $_.Exception.Message.Split([char]10)[0]); stats = $stats }
+    }
+    $sw.Stop()
+    return [pscustomobject]@{ ok = (Test-SharedScope); stats = $stats; reason = 'copied'; elapsedSec = [math]::Round($sw.Elapsed.TotalSeconds, 1) }
+  }
   try {
     $asar = Read-AsarIndex $paths.asar
     $dshNode = $asar.Index.files.dsh
@@ -2534,19 +2551,42 @@ function Get-DesktopHostProcesses {
 }
 
 function Get-DesktopPaths([string]$MainPath) {
-  # 桌面版的固定目录形状（全部从可执行文件位置推导，不猜安装路径）
-  $appRoot    = Split-Path -Path $MainPath -Parent
-  $runtimeDir = Join-Path $appRoot 'resources\app.asar\dsh'
+  # 桌面版的目录形状（全部从可执行文件位置推导，不猜安装路径）。
+  # 两种布局都要支持：
+  #   asar     ：resources\app.asar 是文件，运行时代码在 asar 里（官方原版）
+  #   unpacked ：resources\app\dsh 是真实目录（bridge/补丁工具会把 asar 解开，
+  #              2026-11-18 本机实测：app.asar 被改名为 app.asar.before-bridge，宿主从 resources\app\dsh 启动）
+  $appRoot  = Split-Path -Path $MainPath -Parent
+  $asar     = Join-Path $appRoot 'resources\app.asar'
+  $unpacked = Join-Path $appRoot 'resources\app\dsh'
+  $runtimeDir = $null
+  if (Test-Path -LiteralPath $asar -PathType Leaf) {
+    $runtimeDir = Join-Path $appRoot 'resources\app.asar\dsh'
+  } elseif (Test-Path -LiteralPath $unpacked -PathType Container) {
+    $runtimeDir = $unpacked
+  } else {
+    $runtimeDir = Join-Path $appRoot 'resources\app.asar\dsh'
+  }
   return [pscustomobject]@{
     exe            = $MainPath
     appRoot        = $appRoot
     runtimeDir     = $runtimeDir
     entry          = (Join-Path $runtimeDir 'node_modules\@deepseek-ai\dsh-desktop-host\lib\index.js')
-    asar           = (Join-Path $appRoot 'resources\app.asar')
+    asar           = $asar
+    unpacked       = $unpacked
+    layout         = $(if (Test-Path -LiteralPath $asar -PathType Leaf) { 'asar' } elseif (Test-Path -LiteralPath $unpacked -PathType Container) { 'unpacked' } else { 'unknown' })
     primaryRuntime = (Join-Path $appRoot 'resources\runtime\primary-runtime')
     pnpm           = (Join-Path $appRoot 'resources\runtime\primary-runtime\dependencies\pnpm\bin\pnpm.mjs')
     nodeBin        = (Join-Path $appRoot 'resources\runtime\bin')
   }
+}
+
+function Test-DesktopRuntime($Paths) {
+  # asar 布局下 Test-Path 看不到 asar 内部，只能看 asar 文件本身；unpacked 布局看真实目录。
+  if (-not $Paths) { return $false }
+  if (Test-Path -LiteralPath $Paths.asar -PathType Leaf) { return $true }
+  if (Test-Path -LiteralPath $Paths.runtimeDir -PathType Container) { return $true }
+  return $false
 }
 
 function Get-DesktopInstances {
@@ -2567,7 +2607,7 @@ function Get-DesktopInstances {
     if (-not $mainPath) { continue }
     if ([string]$main.CommandLine -match '--type=') { continue }
     $paths = Get-DesktopPaths $mainPath
-    if (-not (Test-Path -LiteralPath $paths.asar -PathType Leaf)) { continue }
+    if (-not (Test-DesktopRuntime $paths)) { continue }
     if ($h.commandLine -notlike ('*' + $paths.runtimeDir + '*')) { continue }
     $profileName = ''
     if ($h.commandLine -match '[\\/]profiles[\\/]([A-Za-z0-9][A-Za-z0-9._-]{0,63})') { $profileName = $Matches[1] }
@@ -2891,8 +2931,8 @@ function Test-DesktopVerify {
       Add-Step 'deep-verify' '找不到 DSH Desktop 可执行文件 → 无法做桌面版深度验证；用 -Record 记录启动命令后重试' 'fail'
       return [pscustomobject]@{ ok = $false; reason = 'desktop-app-missing' }
     }
-    if (-not (Test-Path -LiteralPath $paths.asar -PathType Leaf)) {
-      Add-Step 'deep-verify' "app.asar 不存在：$($paths.asar)" 'fail'
+    if (-not (Test-DesktopRuntime $paths)) {
+      Add-Step 'deep-verify' "找不到桌面版运行时（既没有 app.asar，也没有 resources\app\dsh）：$($paths.appRoot)\resources" 'fail'
       return [pscustomobject]@{ ok = $false; reason = 'desktop-entry-missing' }
     }
 
