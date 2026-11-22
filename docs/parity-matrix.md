@@ -1,4 +1,4 @@
-# 功能对照表（parity matrix）· dsh-restart → @brainzombie/dsh-restart-win
+﻿# 功能对照表（parity matrix）· dsh-restart → @brainzombie/dsh-restart-win
 
 > 本文件是「功能零丢失」的**唯一判据来源**（CONTRACT §0.2 / §7）。
 > 旧实现仓库：本机归档目录（下称「旧仓库」，已冻结为只读归档；绝对路径见 `.local/audit/hardcode-inventory.md`）。
@@ -248,6 +248,10 @@
 | D-09 | 「可 bind」判据（R21）：只 bind 不 accept，避免制造 TIME_WAIT；LISTENING 消失但绑不上时不得放行 | bin/dsh-restart.ps1:836-854 | scripts/dsh-restart.ps1::Test-PortBindable | 不变 | parity:D-09 断言 `TcpListener.Start()` + finally `Stop()` |
 | D-10 | 残留 node 视图（只报不杀）：除根 pid 外的全部 node 进程及内存 | bin/dsh-restart.ps1:1670-1678 | scripts/dsh-restart.ps1::Get-ResidualChildren | 不变 | parity:D-10（注意 U-08：语义是「全部除此 pid」而非「子进程」） |
 | D-11 | 孤儿 DSH 子进程白名单回收：命令行含 `deepseek-ai` 或 `codegraph` **且** 父进程已不存在才杀 | bin/dsh-restart.ps1:1645-1668 | scripts/dsh-restart.ps1::Remove-OrphanDshChildren | 不变 | parity:D-11 断言白名单正则与父进程存活跳过 |
+| D-12 | **一次端口表**：`Get-NetstatListenerRows` 是唯一调 `netstat` 的地方，解析成 `{port,pid,host}` 行；`Get-ListeningPorts` 只按 pid 过滤，可传入已取好的行。进程内缓存 3s（`-Refresh` 强制重扫），等待循环每 2s 显式刷新 | 无旧实现（0.4.0 新增） | scripts/dsh-restart.ps1::Get-NetstatListenerRows | 扩展：web 侧行为不变 | parity:D-12 断言只有 `Get-NetstatListenerRows` 一族调用 netstat 字面量、`Get-ListeningPorts` 接受 `$Rows` |
+| D-13 | **进程表按 pid 索引**：`Get-ProcessIndex` 一次 CIM 全表建 `pid→进程` 字典（同样 3s 缓存），桌面实例发现不再对每个候选单独 `Get-CimInstance -Filter` | 无旧实现（0.4.0 新增） | scripts/dsh-restart.ps1::Get-ProcessIndex | 扩展 | parity:D-13 断言 `Get-DesktopInstances` 用 `Get-ProcessIndex` 且 `ContainsKey` 判空 |
+| D-14 | **宿主 HTTP 面的挑选**：`Resolve-HostPort` 按 200 > 401 > 303 > 其他 排序，逐端口以带毫秒预算的 `Invoke-HttpProbe` 探测（先 TCP connect 判活，再限时 GET，显式 `Proxy=$null`）；命中即返回，不再扫完所有候选。只在「端口通了但给状态码」时 700ms 后重问一次（宿主启动早期先 404 后 401） | 无旧实现（0.4.0 新增；替代「按 netstat 顺序无脑 GET」） | scripts/dsh-restart.ps1::Resolve-HostPort | 扩展：`Test-HttpServing` 语义不变（401/200 = 就绪） | parity:D-14 断言排序表、重问条件、`Proxy = $null`；本机实测 -Status 12.0s → 8.7s、跳过多余端口 |
+| D-15 | **分阶段耗时**：`-Json` / `-ResultFile` 时记录 `phases`（prepare / pre-check / host-kind / probe:<port> / instances / http-probe / auth-url / total），人读模式零开销 | 无旧实现（0.4.0 新增） | scripts/dsh-restart.ps1::Add-Phase | 扩展：既有 14 个信封字段不变，只多一个键 | parity:D-15 断言 `Add-Phase` 在 `$script:PhasesOn` 为假时直接返回 |
 
 ---
 

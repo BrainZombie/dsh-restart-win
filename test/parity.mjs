@@ -879,6 +879,34 @@ PROBES['D-06'] = [{ file: ENGINE, inFunction: 'Test-HostAlive', has: /Get-PortOw
 PROBES['D-07'] = [{ file: ENGINE, inFunction: 'Get-CimAvailable', has: /CimInstance|Win32_Process/ }, eng(/CIM 不可用（沙箱\/权限）→ 以端口监听者为权威/)];
 PROBES['D-08'] = [eng(/\$hop -lt 6/), eng(/port-owner-mismatch/)];
 PROBES['D-09'] = [{ file: ENGINE, inFunction: 'Test-PortBindable', has: /TcpListener/ }, { file: ENGINE, inFunction: 'Test-PortBindable', has: /finally/ }];
+PROBES['D-12'] = [
+    { file: ENGINE, note: 'one authoritative netstat scan: Get-NetstatListenerRows owns the literal', fn: (ctx) => {
+        const text = ctx.text(ENGINE);
+        const hits = text.match(/-ano -p TCP/g) ?? [];
+        assert.equal(hits.length, 1, `netstat -ano -p TCP must appear exactly once, found ${hits.length}`);
+        const start = text.search(/^function Get-NetstatListenerRows\b/m);
+        assert.ok(start >= 0, 'Get-NetstatListenerRows is missing');
+        const body = ctx.functionBody(ENGINE, 'Get-NetstatListenerRows');
+        assert.ok(/-ano -p TCP/.test(body), 'the scan must live inside Get-NetstatListenerRows');
+    } },
+    { file: ENGINE, inFunction: 'Get-ListeningPorts', has: /\$Rows/, note: 'accepts a pre-scanned row set instead of scanning again' },
+    { file: ENGINE, inFunction: 'Get-NetstatListenerRows', has: /\$script:NetstatStamp/, note: 'process-local cache with an explicit Refresh' },
+];
+PROBES['D-13'] = [
+    { file: ENGINE, inFunction: 'Get-ProcessIndex', has: /Get-CimInstance Win32_Process/ },
+    { file: ENGINE, inFunction: 'Get-DesktopInstances', has: /Get-ProcessIndex/ },
+    { file: ENGINE, inFunction: 'Get-DesktopInstances', has: /ContainsKey/, note: 'missing pid is skipped instead of iterating a hashtable as an object' },
+];
+PROBES['D-14'] = [
+    { file: ENGINE, inFunction: 'Resolve-HostPort', has: /200 \{ 0 \} 401 \{ 1 \} 303 \{ 2 \}/, note: '200 > 401 > 303 > other' },
+    { file: ENGINE, inFunction: 'Resolve-HostPort', has: /status -gt 0/, note: 'retry only when the port answered with a status code' },
+    { file: ENGINE, inFunction: 'Invoke-HttpProbe', has: /\$req\.Proxy = \$null/, note: 'loopback probes must not go through the system proxy' },
+    { file: ENGINE, inFunction: 'Invoke-HttpProbe', has: /BeginConnect/, note: 'connect budget is separate from the request budget' },
+];
+PROBES['D-15'] = [
+    { file: ENGINE, inFunction: 'Add-Phase', has: /\$script:PhasesOn/, note: 'no timing overhead outside -Json/-ResultFile' },
+    { file: ENGINE, inFunction: 'Get-ResultEnvelope', has: /phases/, note: 'the envelope carries the phases key' },
+];
 PROBES['D-10'] = [{ file: ENGINE, inFunction: 'Get-ResidualChildren', has: /Get-Process -Name node/ }];
 PROBES['D-11'] = [{ file: ENGINE, inFunction: 'Remove-OrphanDshChildren', has: /deepseek-ai\|codegraph/ }, { file: ENGINE, inFunction: 'Remove-OrphanDshChildren', has: /if \(\$ppid -gt 0 -and \(Get-Process -Id \$ppid/ }];
 

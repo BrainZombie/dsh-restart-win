@@ -1,5 +1,46 @@
 # 变更记录
 
+## 0.4.0 — 一次调用只扫一遍机器状态
+
+这一版全部落在「引擎怎么读机器」上：端口表、进程表、宿主 HTTP 面。行为语义
+（401/200 才算就绪、退出码、终态词、信封 14 个字段）一个都没动，改的是**读它们的代价**。
+
+### 引擎（scripts/dsh-restart.ps1）
+
+- **新增** `Get-NetstatListenerRows`：全脚本唯一调 `netstat` 的地方，解析成 `{port,pid,host}` 行。
+  `Test-PortListening` / `Get-PortOwner` / `Get-ListeningPorts` 全部改读它，进程内缓存 3 秒，
+  等待循环里显式 `-Refresh`。以前一次 `-Status` 要扫两三遍整张端口表。
+- **新增** `Get-ProcessIndex`：一次 CIM 全表建 `pid → 进程` 字典（同样 3 秒缓存）。
+  桌面实例发现不再对每个候选单独 `Get-CimInstance -Filter`。
+- **新增** `Invoke-HttpProbe` + `Resolve-HostPort`：按 **200 > 401 > 303 > 其他** 排序逐端口探测，
+  命中即返回。连接预算（1.5s）与请求预算（5s）分开 —— 用 HttpClient 一个超时砍两头时，
+  3082 端口实测要 1.6-2s，会把一个活着的 200 探成 0（假阴性）。探针显式 `Proxy = $null`，
+  不走系统代理。只在「端口通了但给状态码」时 700ms 后重问一次：宿主启动早期会先在
+  随机端口上回 404、隔一秒才变 401/200。
+- **修复** 端口挑选的稳定性：旧逻辑「第一个回应就算」，桌面宿主同时监听 200 的主面、
+  4173 的浏览器调试面、401 的面板面、404 的兜底面 —— 挑到哪个取决于 netstat 顺序。
+  现在固定优先级，且 `instances[].probe` 里留下每个端口的实测状态与耗时。
+- **修复** 兜底面胜出：401 曾经排在 303 之后，主面读慢一次就会让那个稳定回 404 的兜底端口
+  被报成「就绪」。401 现在是第二序位。
+- **新增** 分阶段耗时：`-Json` / `-ResultFile` 时信封多一个 `phases` 键
+  （prepare / pre-check / host-kind / probe:端口号 / instances / http-probe / auth-url / total），
+  人读模式零开销。14 个必选字段与层级不变。
+- **新增** `status.pnpmResolved` / `status.cliCmd`：把「实际存在的那个 pnpm.mjs」与
+  「安装自带的 dsh.cmd」直接报出来。官方布局在 `resources\runtime` 下，解包后桥把 pnpm 放到
+  `resources\app\runtime` 下，外部工具（`scripts\dsh-repair.ps1`）以前自己拼单一路径会拼错。
+
+### 工具
+
+- `scripts/dsh-repair.ps1` 优先用引擎给的 `pnpmResolved`，自己拼路径只作最后兜底。
+
+### 测试与文档
+
+- `test/parity.mjs` 新增 §7 的 D-12…D-15 四条断言（唯一 netstat 扫描点、进程表索引、
+  端口优先级与代理绕过、分阶段耗时开关），`docs/parity-matrix.md` 同步。**254/254 行全绿**。
+- 本机实测：`-Status -Json` 12.0s → 8.7s（同机、同 561 个进程），单次 `dsh-restart-win -Status`
+  7.6s → 5.5s；端口探测从「4 个端口各等超时」变成 300ms 量级。
+
+
 ## 0.3.0 — 机器事实：不再猜安装位置
 
 这一版把「这台机器上 dsh 装在哪、用哪个 node/pnpm」从**推测**改成**探测 + 落盘**，并修掉四个
