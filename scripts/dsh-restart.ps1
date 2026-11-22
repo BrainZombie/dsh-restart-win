@@ -200,21 +200,32 @@ $script:Mutex     = $null
 $script:Audit     = New-Object System.Collections.ArrayList
 # 机器可读终态（契约 §3.3）：异常原文、耗时基准、按动作附加字段、结果是否已落盘。
 $script:ErrorText     = $null
-$script:StartedAt     = Get-Date
 $script:ResultWritten = $false
 $script:Extra         = [ordered]@{}
 # 分阶段耗时：一次 -Status 里「解析参数/找宿主/探端口/拼信封」各占多少，出问题时不用再猜。
 # 记在 $script:Phases 里，由 -Json 信封的 phases 字段输出；读宿主的工具（脚本/repair）不必关心。
 $script:Phases        = [ordered]@{}
+function Get-PhaseMs {
+  # 距开始计的毫秒数。用 Stopwatch 而不是 Get-Date：Get-Date 本机实测每次 ~1.1ms，
+  # 打点十几次就是十几毫秒的假开销，而且它会混进 total。
+  return [int]$script:Clock.ElapsedMilliseconds
+}
 function Add-Phase([string]$Name_) {
-  # 打点：每次记下「距上一个打点」的毫秒数。第一次调用只设基准（不记数）。
+  <#
+    打点：每次记下「距上一个打点」的毫秒数。第一次调用只设基准（不记数）。
+    点按标签归并（probe:3082 这种一个端口一个标签）：同名点累加而不是后写覆盖 ——
+    同名覆盖会让 total 与明细差出三秒（probe:3082 被后续探针覆盖）。
+  #>
   if (-not $script:PhasesOn) { return }
-  if (-not $script:PhaseT0) { $script:PhaseT0 = $script:StartedAt; return }
-  $now = Get-Date
-  $script:Phases[$Name_] = [int](($now - $script:PhaseT0).TotalMilliseconds)
+  if (-not $script:PhaseT0) { $script:PhaseT0 = Get-PhaseMs; return }
+  $now = Get-PhaseMs
+  $ms = [int]($now - $script:PhaseT0)
+  if ($script:Phases.Contains($Name_)) { $script:Phases[$Name_] = [int]$script:Phases[$Name_] + $ms }
+  else { $script:Phases[$Name_] = $ms }
   $script:PhaseT0 = $now
 }
 $script:PhaseT0 = $null
+$script:Clock = [System.Diagnostics.Stopwatch]::StartNew()
 # 分阶段打点是否启用：只在 -Json / -ResultFile（机器接口）时记，人读模式不增加任何开销。
 $script:PhasesOn = [bool]($Json -or $ResultFile)
 # 进程内复用：一次调用里 netstat 与「全量进程表」各只需要一份（时间戳为 $null = 尚未取过）
@@ -222,6 +233,32 @@ $script:NetstatRows = @()
 $script:NetstatStamp = $null
 $script:ProcIndex = $null
 $script:ProcStamp = $null
+# 这份索引里是否带 CommandLine（默认的那次 CIM 不取，省 ~240ms）
+$script:ProcHasCmd = $false
+# 本进程内已经探过的端口 → @{ status; chosen }。-Status 的第二次采样据此跳过「上一轮已确认
+# 不是宿主面」的附件端口（省掉一次连接/读超时），也避免同一端口在一轮里被问两次。
+$script:ProbedPorts = @{}
+# 宿主发现的两级缓存：WMI 查询结果（HostRows）与已校验的宿主行（HostHits）。
+# -Status 里 Resolve-HostKind / Resolve-DesktopProfileName / 实例发现都会问「宿主在哪」，
+# 一次 130ms 的查询问三遍就是 400ms。等待循环里宿主集会变，那边传 -Refresh。
+$script:HostRows = $null
+$script:HostHits = $null
+# 预热的代价（本机实测，pwsh 7 / 5.1 都一样）：新建第一个 ArrayList 要 ~100ms —— 那是第一次
+# 碰 System.Collections 相关程序集/泛型实化的固定开销，不是脚本在做活。这里在计时开始之前
+# 就把这几类各走一遍，之后逐个打点才是真实耗时。
+# 注意别把 [类型] 直接赋给 $null（类型字面量会落进管道）；泛型名带 [] 时 New-Object 会把它当
+# COM 参数解析（实测报「无法转换 ComObject」），用 ::new() 语法。
+$null = [pscustomobject]@{ warm = 1 }
+$null = New-Object System.Collections.ArrayList
+$null = New-Object System.Collections.Specialized.OrderedDictionary
+$null = [System.Collections.Generic.Dictionary[string, int]]::new()
+$null = (Get-Command netstat -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+# WMI 也有冷启动成本（第一次查询 ~270ms，之后 ~110-120ms）。这里在计时之前把 CIM 也热一次：
+# 它不属于任何一次调用的成本，留在计时里就是一条假的「host-kind 慢了一倍」。
+try { $null = @(Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop) } catch { }
+# 预热结束，从这里开始计时（预热不属于任何一次调用的成本）
+$script:Clock.Restart()
+$script:StartedAt = Get-Date
 $script:LogPath       = Join-Path $StateDir 'dsh-restart.log'
 
 # 宿主形态（desktop 分支的全部状态都在这里；web 分支不读这些变量）
@@ -336,7 +373,7 @@ function Get-ResultEnvelope {
     newPid     = $script:NewPid
     hostUrl    = $script:HostUrl
     error      = $(if ($script:ErrorText) { [string]$script:ErrorText } else { Get-LastFailDetail })
-    durationMs = [int]((Get-Date) - $script:StartedAt).TotalMilliseconds
+    durationMs = (Get-PhaseMs)
     stateDir   = [string]$StateDir
     logPath    = [string]$script:LogPath
     # 分阶段耗时（毫秒，距上一个打点）：机器接口里唯一新增的诊断字段。
@@ -344,7 +381,7 @@ function Get-ResultEnvelope {
     phases     = [ordered]@{}
   }
   if ($script:PhasesOn) {
-    $payload['phases']['total'] = [int]((Get-Date) - $script:StartedAt).TotalMilliseconds
+    $payload['phases']['total'] = (Get-PhaseMs)
     foreach ($k in @($script:Phases.Keys)) { $payload['phases'][$k] = [int]$script:Phases[$k] }
   }
   foreach ($k in @($script:Extra.Keys)) { $payload[$k] = $script:Extra[$k] }
@@ -902,17 +939,43 @@ function Get-TokenFromUrl([string]$Url) {
   return ''
 }
 
+function Read-FileTailText([string]$Path, [int]$MaxBytes = 65536) {
+  <#
+    读文本文件的尾部（最多 $MaxBytes 字节，按 UTF-8 解码）。宿主正持有写句柄时必须
+    FileShare.ReadWrite 打开（[IO.File]::ReadAllText 会因共享冲突直接抛）。
+    为什么要「只读尾部」：token 行只可能在最后几 KB，而日志会长到几十 MB。
+  #>
+  $fs = $null
+  try {
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    $len = $fs.Length
+    if ($len -le 0) { return '' }
+    $start = [long][Math]::Max(0, $len - $MaxBytes)
+    [void]$fs.Seek($start, [System.IO.SeekOrigin]::Begin)
+    $buf = New-Object 'System.Byte[]' ([int]($len - $start))
+    $read = $fs.Read($buf, 0, $buf.Length)
+    if ($read -le 0) { return '' }
+    return [System.Text.Encoding]::UTF8.GetString($buf, 0, $read)
+  } catch {
+    return ''
+  } finally {
+    if ($fs) { try { $fs.Dispose() } catch { } }
+  }
+}
+
 function Get-HostAuthUrlRecord([string]$LogPath) {
   <#
     取宿主 stdout 日志里**最后一条** `dsh web: http://…/?token=…`，返回 @{ Url; Token } 或 $null。
-    用 Select-String 读（按 FileShare.ReadWrite 打开）：宿主正持有该文件的写入句柄时，
-    [IO.File]::ReadAllLines 会因共享模式冲突直接抛「being used by another process」（实测）。
+    只读文件尾部（Read-FileTailText，FileShare.ReadWrite）：宿主正持有写句柄，而 token 行只可能
+    在最后几 KB —— 全文 Select-String 在本机实测要 1-2s（日志几十 MB）。
   #>
   if (-not $LogPath -or -not (Test-Path -LiteralPath $LogPath)) { return $null }
-  $hit = Select-String -LiteralPath $LogPath -Pattern 'dsh\s+web:\s*(https?://\S+)' -ErrorAction SilentlyContinue |
-         Select-Object -Last 1
-  if (-not $hit -or $hit.Matches.Count -eq 0) { return $null }
-  $url = $hit.Matches[0].Groups[1].Value.TrimEnd('.', ',', ')', '"', "'")
+  $tailText = Read-FileTailText $LogPath 65536
+  if (-not $tailText) { return $null }
+  $matches2 = [regex]::Matches($tailText, 'dsh\s+web:\s*(https?://\S+)')
+  if ($matches2.Count -eq 0) { return $null }
+  # 取最后一条：一次重启可能打印多行，前面的都是旧 boot 的地址
+  $url = $matches2[$matches2.Count - 1].Groups[1].Value.TrimEnd('.', ',', ')', '"', "'")
   $tok = Get-TokenFromUrl $url
   if (-not $tok) { return $null }
   return [pscustomobject]@{ Url = $url; Token = $tok }
@@ -975,19 +1038,29 @@ function Save-WebAuthUrlRecord([string]$Url, [int]$Pid_, [string]$Source) {
   return $rec
 }
 
-function Test-WebAuthUrl([string]$Url) {
+function Test-WebAuthUrl([string]$Url, [int]$Port_ = 0) {
   <#
     token 是否被**当前运行实例**接受：带 token 请求根路径。
     本机实测：有效 token → 303（重定向到应用页）；缺失/伪造 token → 401。
     2xx/3xx = 有效；401/403 = 无效；0/404（进程未就绪/路由未注册） = 尚未证明。
-    探测本身走 Get-HttpStatusCode（内部已对 5.1 做 HttpWebRequest 兜底）。
+    走 Get-HttpStatusCodeDetail（原始 TCP）：以前走 .NET 请求栈，一次校验 0.2-2s，
+    而 -Status 每次都要为「持久地址」校验一遍。**路径必须带查询串**（token 在 ?token= 里），
+    只请求 '/' 会让一个有效 token 被判成失效。
   #>
   if (-not $Url) { return $false }
-  $code = Get-HttpStatusCode $Url 6
+  $p = $Port_
+  $path = '/'
+  try {
+    $u = [uri]$Url
+    if (-not $p -and $u.Port -gt 0) { $p = $u.Port }
+    if ($u.PathAndQuery) { $path = $u.PathAndQuery }
+  } catch { return $false }
+  if (-not $p) { return $false }
+  $code = (Get-HttpStatusCodeDetail -Port $p -TimeoutMs 6000 -Path $path).code
   return ($code -ge 200 -and $code -lt 400)
 }
 
-function Resolve-WebAuthUrl($CurrentPids) {
+function Resolve-WebAuthUrl($CurrentPids, $ProbePorts = @(), [switch]$NoLogScan) {
   <#
     -Status 用：返回 @{ Url; State = 'ok'|'stale'|'unknown'; Detail; Refreshed }。
     旧地址绝不能被当成当前有效地址 —— 必须同时满足：
@@ -1004,6 +1077,7 @@ function Resolve-WebAuthUrl($CurrentPids) {
     return [pscustomobject]@{ Url = $null; State = 'stale'; Detail = '当前没有运行实例（端口无监听者）'; Refreshed = $false }
   }
 
+  Add-Phase 'auth-file'
   $rec = Read-WebAuthUrlRecord
   $pidMatches = $false
   if ($rec -and $rec.Pid -gt 0) { $pidMatches = ($pids -contains [int]$rec.Pid) }
@@ -1014,12 +1088,18 @@ function Resolve-WebAuthUrl($CurrentPids) {
     $why = '持久文件记录的是 pid=' + $rec.Pid + ' 的旧 boot，当前监听者 pid=' + ($pids -join ',')
   } elseif (-not $rec.Token) {
     $why = '持久文件缺少 token'
-  } elseif (Test-WebAuthUrl $rec.Url) {
+  } elseif ((-not ([int]$rec.Port -gt 0) -or @($ProbePorts).Count -eq 0 -or @($ProbePorts) -contains [int]$rec.Port) -and (Test-WebAuthUrl $rec.Url)) {
     return [pscustomobject]@{ Url = $rec.Url; State = 'ok'; Detail = ('持久文件 pid=' + $rec.Pid + '，token 已被当前实例接受'); Refreshed = $false }
   } else {
     $why = '持久文件里的 token 未被当前实例接受（pid=' + $rec.Pid + '；宿主可能仍在启动，或该记录已过期）'
   }
 
+  if ($NoLogScan) {
+    # 持久文件记的是别的 pid：日志里只可能有旧 boot 的 token，扫它纯属白花时间
+    Add-Phase 'auth-log'
+    return [pscustomobject]@{ Url = $null; State = 'unknown'; Detail = $why; Refreshed = $false }
+  }
+  Add-Phase 'auth-log'
   $hit = Get-HostAuthUrlRecord (Get-StatePath (Get-HostLogName 'out'))
   if ($hit -and (Test-WebAuthUrl $hit.Url)) {
     [void](Save-WebAuthUrlRecord $hit.Url ([int]$pids[0]) ((Get-HostLogName 'out') + '（-Status 校验后补写）'))
@@ -1172,64 +1252,96 @@ function Get-HttpStatusCode([string]$Url, [int]$TimeoutSec = 6) {
   }
 }
 
+function Get-HttpStatusCodeDetail {
+  <#
+    单次 GET 的状态码，额外告诉调用方「这次是不是重发的那一遍」。
+    走原始 TCP（不用 HttpClient / HttpWebRequest）：两个 .NET 请求栈在本机都有隐性成本 ——
+    HttpClient 每次新建 ~200ms 起步，HttpWebRequest 要读完整响应才回来（3082 实测 1.6-2s）。
+    宿主的面都是本机回环上的纯 HTTP/1.1，写请求 + 读响应头就够回答「几号状态码」。
+
+    【实测坑，三条都踩过】
+      ① TcpClient(host,port) 同步构造函数在**死端口**上要卡 ~14s（SYN 重试），
+         ReceiveTimeout 只管后续读不管连接 —— 所以连接用 ConnectAsync(...).Wait(预算)；
+      ② 在 try 里 return、finally 里 Close 的组合会让一次**成功**的调用固定多出 2s
+         （五连测五次全是 ~2050ms）—— 所以一切返回都放在 try/finally 之外；
+      ③ 读超时必须显式设 NetworkStream.ReadTimeout，光设 ReceiveTimeout 不够。
+    服务器回 Connection: close / 不回内容长度时第一遍可能什么都读不到，所以要能重发一次。
+      返回 @{ code; reconnecting }
+  #>
+  param([int]$Port, [string]$Host_ = $BindHost, [int]$TimeoutMs = 5000, [string]$Path = '/')
+  # $Path 必须带查询串：带 token 的地址是 /?token=… —— token 不在请求行里时宿主按「没凭据」
+  # 回 401，看起来像「token 失效」（实测踩过一次，一个完全有效的 token 被判成失效）。
+  if (-not $Path) { $Path = '/' }
+  if (-not $Path.StartsWith('/')) { $Path = '/' + $Path }
+  $req = "GET $Path HTTP/1.1`r`nHost: ${Host_}:$Port`r`nUser-Agent: dsh-restart-probe`r`nAccept: */*`r`nConnection: close`r`n`r`n"
+  $bytes = [System.Text.Encoding]::ASCII.GetBytes($req)
+  for ($attempt = 0; $attempt -lt 2; $attempt++) {
+    $c = $null
+    $n = 0
+    $head = ''
+    try {
+      $c = [System.Net.Sockets.TcpClient]::new()
+      $maxWait = [Math]::Max(200, [Math]::Min($TimeoutMs, 1500))
+      if (-not $c.ConnectAsync($Host_, [int]$Port).Wait($maxWait)) { $c = $null; continue }
+      $ns = $c.GetStream()
+      $ns.WriteTimeout = [Math]::Max(500, $TimeoutMs)
+      $ns.ReadTimeout = [Math]::Max(500, $TimeoutMs)
+      $ns.Write($bytes, 0, $bytes.Length)
+      $ns.Flush()
+      $buf = New-Object 'System.Byte[]' 512
+      $n = $ns.Read($buf, 0, $buf.Length)
+      if ($n -gt 0) { $head = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n) }
+    } catch {
+      $n = 0
+    } finally {
+      if ($c) { try { $c.Close() } catch { } }
+    }
+    # 走到这里连接一定已经关了：所有判定都在 try/finally 之外
+    if ($n -gt 0) {
+      $m = [regex]::Match($head, '^HTTP/\d\.\d\s+(\d{3})')
+      if ($m.Success) { return [pscustomobject]@{ code = [int]$m.Groups[1].Value; reconnecting = ($attempt -eq 1) } }
+    }
+  }
+  return [pscustomobject]@{ code = 0; reconnecting = $true }
+}
+
 function Invoke-HttpProbe {
   <#
     带毫秒预算的单次 GET，只回答三件事：连上了吗、HTTP 状态码是多少、花了多久。
     它**不**区分 200 和 401 —— 后者属于认证策略，调用方自己判断语义。
 
-    两处硬性约束（都是本机实测出来的）：
-      ① 必须能单独限制 DNS + 连接的时间。3082 端口实测整请求要 ~1.6-2s，用 HttpClient 的
-         Timeout 直接砍在 1.5s 会把一个活着的 200 探成 0（假阴性，切端口时踩过一次）。
-         所以先 TcpClient.ConnectAsync + Wait，连不上就到此为止，连上之后一律给足 5s；
+    三条硬性约束（都是本机实测出来的）：
+      ① 连接与读响应分开给预算。活着的 3082 端口偶发要 1.6-2s，一刀切 1.5s 会把活的 200 探成 0
+         （假阴性，切端口时踩过一次）；死端口也不能拖住整个探针；
       ② 必须不走系统代理。宿主的 HTTP 面是本机回环，走 Clash 的 127.0.0.1:7897 只会绕远
-         而且会让并发探针互相排队 —— HttpWebRequest 显式 Proxy=$null；
-      ③ 一个端口最多问两次。实测宿主在启动早期会「先 404、稍后才 401」，而桌面宿主的
-         401 面第一次请求常要 1-4s（TLS 之外还有认证中间件冷启动）。等 700ms 再问一次能把
-         这种「读时机」的假阴性压掉，代价最多 700ms，而不是把整个请求超时翻倍。
+         还会让并发探针互相排队 —— 原始 TCP 天然不受系统代理影响；
+      ③ 每次探测都是一次**新建连接**，不复用（宿主的面会在启动早期重置 keep-alive）。
   #>
   param([int]$Port, [string]$Host_ = $BindHost, [int]$ConnectTimeoutMs = 1500, [int]$RequestTimeoutMs = 5000)
   $sw = [Diagnostics.Stopwatch]::StartNew()
-  $tcp = New-Object System.Net.Sockets.TcpClient
+  # 先单独判一次「连得上吗」，把这层失败与「连上了但没回状态码」分开报告（别的调用方靠
+  # stage 区分这两种情况，比如「端口绑了但路由没挂完」与「端口还没绑」）。
+  $c = $null
   try {
-    $iar = $tcp.BeginConnect($Host_, $Port, $null, $null)
-    if (-not $iar.AsyncWaitHandle.WaitOne([Math]::Max(200, $ConnectTimeoutMs))) {
+    $c = [System.Net.Sockets.TcpClient]::new()
+    if (-not $c.ConnectAsync($Host_, [int]$Port).Wait([Math]::Max(200, $ConnectTimeoutMs))) {
       $sw.Stop()
       return [pscustomobject]@{ status = 0; code = 0; ms = [int]$sw.ElapsedMilliseconds; stage = 'connect-timeout' }
     }
-    $tcp.EndConnect($iar)
   } catch {
     $sw.Stop()
     return [pscustomobject]@{ status = 0; code = 0; ms = [int]$sw.ElapsedMilliseconds; stage = 'connect-failed' }
   } finally {
-    try { $tcp.Close() } catch { }
+    if ($c) { try { $c.Close() } catch { } }
   }
-  $url = "http://${Host_}:$Port/"
-  $code = 0
-  $req = $null
-  try {
-    $req = [System.Net.HttpWebRequest]::Create($url)
-    $req.Method = 'GET'
-    $req.AllowAutoRedirect = $false
-    $req.Timeout = [Math]::Max(500, $RequestTimeoutMs)
-    $req.ReadWriteTimeout = [Math]::Max(500, $RequestTimeoutMs)
-    $req.Proxy = $null
-    $req.KeepAlive = $false
-    try {
-      $resp = $req.GetResponse()
-      try { $code = [int]$resp.StatusCode } finally { $resp.Close() }
-    } catch [System.Net.WebException] {
-      $errResp = $_.Exception.Response
-      if ($errResp) { $code = [int]$errResp.StatusCode } else { $code = 0 }
-    } catch { $code = 0 }
-  } catch {
-    $code = 0
-  }
+  $r = Get-HttpStatusCodeDetail -Port $Port -Host_ $Host_ -TimeoutMs $RequestTimeoutMs
   $sw.Stop()
   return [pscustomobject]@{
-    status = $code
-    code   = $code
+    status = $r.code
+    code   = $r.code
     ms     = [int]$sw.ElapsedMilliseconds
     stage  = 'http'
+    reconn = [bool]$r.reconnecting
   }
 }
 
@@ -1251,6 +1363,28 @@ function Test-HttpServing([string]$Url) {
     status  = $s
     serving = ($s -ne 0)          # 端口已绑、有 HTTP 响应
     ready   = ($s -eq 401 -or $s -eq 200)   # 路由/认证层已就位
+    authed  = ($s -eq 200)
+  }
+}
+
+function Read-HostServing([string]$Url) {
+  <#
+    Test-HttpServing 的低开销版：只取状态码，走原始 TCP 探针（Get-HttpStatusCodeDetail）。
+    与 Test-HttpServing 返回同样的 @{ status; serving; ready; authed }，判据一模一样：
+      0 = 端口还没绑 / 404 = 路由没挂完 / 401、200 = 就绪。
+    为什么单独一个函数：Test-HttpServing 走 .NET 请求栈（HttpClient→HttpWebRequest 兜底），
+    一次几百毫秒到 2s；验证循环里每 800ms 问一次，光探针就吃掉大半等待预算。
+    保留 Test-HttpServing 不动 —— 它带着「5.1 没有 System.Net.Http」那段历史契约，改它风险更大。
+  #>
+  $p = 0
+  $path = '/'
+  try { $u = [uri]$Url; if ($u.Port -gt 0) { $p = $u.Port }; if ($u.PathAndQuery) { $path = $u.PathAndQuery } } catch { return [pscustomobject]@{ status = 0; serving = $false; ready = $false; authed = $false } }
+  $s = 0
+  if ($p -gt 0) { $s = (Get-HttpStatusCodeDetail -Port $p -TimeoutMs 6000 -Path $path).code }
+  return [pscustomobject]@{
+    status  = $s
+    serving = ($s -ne 0)
+    ready   = ($s -eq 401 -or $s -eq 200)
     authed  = ($s -eq 200)
   }
 }
@@ -1728,7 +1862,7 @@ function Test-DeepVerify {
           }
         }
       }
-      $probe = Test-HttpServing ("http://127.0.0.1:$vPort/")
+      $probe = Read-HostServing ("http://127.0.0.1:$vPort/")
       # 只认 401/200（404 = 路由还没注册完，不算就绪）
       if ($probe.ready) { break }
       Start-Sleep -Milliseconds 800
@@ -2249,8 +2383,36 @@ function Exit-RestartLock {
 # ---------------------------------------------------------------- Status
 
 function Show-Status {
+  Add-Phase 'start'
   Resolve-HostKind
+  Add-Phase 'host-kind'
   $instances = @(Get-DshInstances)   # @() 强制成数组：函数返回空数组会被解包成 $null
+  Add-Phase 'instances'
+  # 第二轮采样（只补探，不重扫）：第一次采样命中 200 就早退，剩下的端口记成 unprobed。
+  # 这些端口必须真的探一次 —— 否则「哪个端口是附件面」永远学不到，下次还是会撞上；
+  # 但不必重扫 netstat/CIM，也不必重问已经确认的那一面。选面结论仍以第一次为准。
+  if ($script:HostKind -eq 'desktop' -and $instances.Count -ge 1 -and @($instances[0].probe | Where-Object { $_.stage -eq 'unprobed' }).Count -gt 0) {
+    $inst2 = @(Get-DesktopInstances -ProbeAll)
+    Add-Phase 'instances-2'
+    if ($inst2.Count -ge 1 -and [int]$inst2[0].port -gt 0) {
+      # 合并成一行一个端口（第二轮的实测结果覆盖第一轮的 unprobed 占位）。
+      # 别用 [ordered]@{} + 整数键：有序字典的键必须是字符串，用整数取会抛 ArgumentOutOfRange（实测）。
+      $merged = @{}
+      $orderPorts = @()
+      foreach ($o in @($instances[0].probe)) {
+        $k = [string][int]$o.port
+        if (-not $merged.ContainsKey($k)) { $orderPorts += $k }
+        $merged[$k] = $o
+      }
+      foreach ($o in @($inst2[0].probe)) {
+        if ($o.stage -eq 'unprobed') { continue }
+        $k = [string][int]$o.port
+        if (-not $merged.ContainsKey($k)) { $orderPorts += $k }
+        $merged[$k] = $o
+      }
+      $instances[0].probe = @($orderPorts | ForEach-Object { $merged[$_] })
+    }
+  }
   if ($script:HostKind -eq 'desktop' -and $instances.Count -ge 1 -and -not $script:ProfileExplicit -and $instances[0].profile) {
     $Profile = [string]$instances[0].profile
   }
@@ -2261,6 +2423,7 @@ function Show-Status {
     $script:MainPid = $instances[0].mainPid
   }
   $cim = Get-CimAvailable
+  Add-Phase 'cim'
   $rec = Get-BootRecord
   $last = $null
   $hist = Get-StatePath 'restart-history.jsonl'
@@ -2268,13 +2431,34 @@ function Show-Status {
     $line = Get-Content -LiteralPath $hist -Tail 1 -Encoding UTF8 -ErrorAction SilentlyContinue
     if ($line) { try { $last = $line | ConvertFrom-Json } catch { } }
   }
-  $probe = Test-HttpServing "http://${BindHost}:$Port/"
+  Add-Phase 'history'
+  # 主面状态码：桌面版已经在 Resolve-HostPort 里探过（实例的 http 字段），这里不再问第二遍 ——
+  # 以前这一行会对着同一个端口重发一次请求（3082 实测多花 1.6-2s）。
+  # 实例的 http 只可能是 200/401/303/404/0，判据与 Test-HttpServing 完全一致。
+  if ($script:HostKind -eq 'desktop' -and $instances.Count -ge 1) {
+    $iHttp = [int]$instances[0].http
+    $probe = [pscustomobject]@{
+      status  = $iHttp
+      serving = ($iHttp -ne 0)
+      ready   = ($iHttp -eq 401 -or $iHttp -eq 200)
+      authed  = ($iHttp -eq 200)
+    }
+  } else {
+    $probe = Test-HttpServing "http://${BindHost}:$Port/"
+  }
   Add-Phase 'http-probe'
   # 访问地址优先读持久文件（url 步/上次 -Status 落盘），并校验 pid 与 token 是否属于当前实例：
   # 旧 boot 的地址一律不展示，宁可明确说「未知/过期」。
   $currentHostPids = @()
   foreach ($inst in $instances) { $currentHostPids += [int]$inst.pid }
-  $auth = Resolve-WebAuthUrl $currentHostPids
+  # 持久地址的端口必须在「这个实例现在真的在监听的端口」里：换端口之后记录里的端口属于上一个
+  # 实例，去探它只会白等一个死端口（实测 1.5s 连接超时）。
+  $livePorts = @()
+  foreach ($inst in $instances) { $livePorts += @($inst.ports) }
+  # 持久记录里的 pid 不是当前实例时，日志里只会有旧 boot 的 token —— 不必扫
+  $preRec = Read-WebAuthUrlRecord
+  $authPidMatches = ($preRec -and [int]$preRec.Pid -gt 0 -and ($currentHostPids -contains [int]$preRec.Pid))
+  $auth = Resolve-WebAuthUrl $currentHostPids -ProbePorts $livePorts -NoLogScan:(-not $authPidMatches)
   Add-Phase 'auth-url'
   $script:HostUrl = $auth.Url
   $stUrl = $script:HostUrl
@@ -2368,7 +2552,11 @@ function Show-Status {
   # 原来分两段打（前缀 -NoNewline + 判定），现在拼成一行再输出：诊断统一走 Write-Diag，
   # 而它没有 -NoNewline。
   $svc = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'dsh' }
-  $task = (schtasks /Query /TN $TaskName /FO LIST 2>$null)
+  # schtasks 查不到任务时会往 stderr 写一行「ERROR: …」，5.1 下那会被当成终结性错误直接
+  # 抛出来（$ErrorActionPreference='Stop' + 原生命令 stderr）—— -Status 因此整行 abort。
+  # 这里显式把 stderr 收掉、失败当「没有任务」，与既有语义一致。
+  $task = $null
+  try { $task = (& (Get-SystemTool 'schtasks') /Query /TN $TaskName /FO LIST 2>&1 | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) } catch { $task = $null }
   $hosting = if ($svc) { " Windows 服务 $($svc.Name -join ',')" }
              elseif ($task) { " 计划任务 '$TaskName' 已注册（可脱离 DSH 进程树，P1）" }
              else { " 未被托管 → 用计划任务 /Run 脱离（P1），兜底 WMI（P2）" }
@@ -2689,34 +2877,80 @@ function Get-ListeningPorts([int]$Pid_, $Rows = $null) {
 
 function Get-ProcessIndex {
   <#
-    一次 CIM 全表（~135ms）换成按 pid 查的字典。以前每个候选宿主都要单独
+    一次 CIM 全表换成按 pid 查的字典。以前每个候选宿主都要单独
     Get-CimInstance -Filter "ProcessId=…"（有的路径一轮查好几个），加起来就是秒级。
     与端口表一样做进程内缓存（默认 3s），-Refresh 强制重取。
+
+    默认**不取** CommandLine：本机实测 520 个进程里带上命令行要 ~250-373ms，去掉只要 ~133ms，
+    而大多数调用点只看「父进程是谁、exe 在哪」。需要命令行的调用点显式 -WithCommandLine
+    （同一 TTL 内会被复用，不会为同一个问题去问两遍 CIM）。
   #>
-  param([int]$MaxAgeMs = 3000, [switch]$Refresh)
-  if (-not $Refresh -and $null -ne $script:ProcIndex -and $script:ProcStamp) {
-    if (((Get-Date) - $script:ProcStamp).TotalMilliseconds -lt $MaxAgeMs) { return $script:ProcIndex }
-  }
+  param([int]$MaxAgeMs = 3000, [switch]$Refresh, [switch]$WithCommandLine)
+  $fresh = $false
+  if ($script:ProcStamp -and ((Get-Date) - $script:ProcStamp).TotalMilliseconds -lt $MaxAgeMs) { $fresh = -not $Refresh }
+  if ($fresh -and $null -ne $script:ProcIndex -and ($script:ProcHasCmd -or -not $WithCommandLine)) { return $script:ProcIndex }
   $map = @{}
-  foreach ($pr in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
-    $map[[int]$pr.ProcessId] = $pr
+  $gotCmd = $false
+  if ($WithCommandLine) {
+    foreach ($pr in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) { $map[[int]$pr.ProcessId] = $pr }
+    $gotCmd = $true
+  } else {
+    # 不带 -CommandLine 的查询省掉最多的那一段开销（~240ms）
+    foreach ($pr in @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate -ErrorAction SilentlyContinue)) {
+      $map[[int]$pr.ProcessId] = $pr
+    }
   }
   $script:ProcIndex = $map
+  $script:ProcHasCmd = $gotCmd
   $script:ProcStamp = Get-Date
   return $map
 }
 
+function Find-DesktopHostRows {
+  <#
+    一次 WMI 查询拿回「命令行像宿主的行」，同一进程内复用（-Refresh 才重问）。
+    注意不是「同一次调用内永久缓存」：等待循环里宿主集会变，那边传 -Refresh。
+  #>
+  param([switch]$Refresh)
+  if (-not $Refresh -and $null -ne $script:HostRows) { return @($script:HostRows) }
+  $rows = @()
+  # 带命令行的查询（~270ms 首次）比按名字查（~110ms）+ 逐个取命令行（~110ms/个）都便宜：
+  # 名字不稳定（改名的壳），而逐个取命令行在 500 个进程上就是几十秒。
+  try { $rows = @(Get-CimInstance Win32_Process -ErrorAction Stop) } catch { $rows = @() }
+  if ($rows.Count -eq 0) {
+    # 全表失败时退回服务端筛（WMI 有过滤器上限，但这条路至少能活）
+    try { $rows = @(Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%dsh-desktop-host%'" -ErrorAction Stop) } catch { $rows = @() }
+  }
+  $script:HostRows = @($rows)
+  return @($rows)
+}
+
 function Get-DesktopHostProcesses {
-  # 命令行含 dsh-desktop-host\lib\index.js 的进程 = 桌面版宿主子进程。
-  # 恒返回数组；CIM 不可用时返回空数组（由调用方按 web 处理 / 明确报错）。
+  param([switch]$Refresh)
+  <#
+    命令行含 dsh-desktop-host\lib\index.js 的进程 = 桌面版宿主子进程。
+    恒返回数组；CIM 不可用/查不到时返回空数组（由调用方按 web 处理或明确报错）。
+
+    发现放在 WMI 服务端做：一条 CommandLine LIKE 让 WMI 只回那几行，不再把 500+ 个进程的
+    完整命令行拉进 PowerShell 再筛（本机实测：全表带命令行 ~250-373ms，服务端筛完只要 ~120ms）。
+    过滤器只筛一段**不带反斜杠的**字面量（'%dsh-desktop-host%'）：WQL 的 LIKE 里反斜杠要写四层
+    才等于一层，写错会静默返回 0 行（实测踩到）。完整路径的严格判定交给下面的正则。
+    不按进程名写死（官方壳叫 DeepSeek Harness.exe，改名的壳同样要认出来）。
+  #>
   $out = New-Object System.Collections.ArrayList
   if (-not (Get-CimAvailable)) { return @() }
-  foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='DeepSeek Harness.exe'" -ErrorAction SilentlyContinue)) {
+  # 每次调用只问一次：-Status 里 Resolve-HostKind / Resolve-DesktopProfileName / 实例发现
+  # 都会问「宿主在哪」，一次 130ms 的 WMI 查询问三遍就是 400ms。
+  $script:HostHits = @(Find-DesktopHostRows -Refresh:$Refresh)
+  foreach ($p in @($script:HostHits)) {
     $cmd = [string]$p.CommandLine
     if (-not $cmd) { continue }
     if ($cmd -notmatch 'dsh-desktop-host[\\/]lib[\\/]index\.js') { continue }
+    # Electron 主进程判定：渲染/GPU/工具进程的命令行都带 --type=
+    if ($cmd -match '--type=') { continue }
     [void]$out.Add([pscustomobject]@{
       pid         = [int]$p.ProcessId
+      name        = [string]$p.Name
       mainPid     = [int]$p.ParentProcessId
       commandLine = $cmd
     })
@@ -2815,13 +3049,24 @@ function Resolve-HostPort {
       4. 404 / 连不上只能兜底，且明确不算「就绪」（404 = 端口绑了但路由还没挂完）。
     同分时按 netstat 顺序，保持既有行为可预测。
   #>
-  param([int[]]$Ports = @(), [string]$Host_ = $BindHost, [int]$ConnectTimeoutMs = 1500)
+  param([int[]]$Ports = @(), [string]$Host_ = $BindHost, [int]$ConnectTimeoutMs = 1500, [int[]]$SkipPorts = @(), [int]$DeadlineMs = 3000, [switch]$ProbeAll)
   $order = New-Object System.Collections.ArrayList
   $all = @($Ports | Where-Object { $_ -gt 0 })
   if ($all.Count -eq 0) { return [pscustomobject]@{ port = 0; status = 0; order = @(); probed = 0 } }
   $best = $null; $bestRank = 99; $bestStatus = 0; $fallback = $null
   $probed = 0
+  $unprobed = New-Object System.Collections.ArrayList
   foreach ($p in @($all | Sort-Object)) {
+    if (@($SkipPorts) -contains [int]$p) {
+      # 已知不是宿主的面（实测过的浏览器调试端口等）。不探、不占预算，也**不算**兜底候选。
+      [void]$order.Add([pscustomobject]@{ port = $p; status = -1; ms = 0; stage = 'skipped'; known = 'aux' })
+      continue
+    }
+    if ($bestRank -eq 0 -and -not $ProbeAll) {
+      # 已经确定是宿主面了（200）。剩下的端口在 -ProbeAll 那一轮再补探，这一轮先记账。
+      [void]$unprobed.Add([int]$p)
+      continue
+    }
     Add-Phase ("probe:" + $p)
     $s = Invoke-HttpProbe -Port $p -Host_ $Host_ -ConnectTimeoutMs $ConnectTimeoutMs
     $probed++
@@ -2829,7 +3074,7 @@ function Resolve-HostPort {
     # 200 是宿主给本机开的默认面；401 是认证层在要 token —— 两者都说明「端口绑了、路由挂上了」。
     # 顺序固定为 200 > 401 > 303 > 其他：主面偶尔读慢（实测先 404、隔一秒 401），若把 401 排末位，
     # 那个稳定回 404 的兜底端口就会胜出，-Status 于是报一个并不存在的「就绪」面。
-    # 4173 那种浏览器调试端口也是 200，只能靠「排在后面」避开，不能靠猜端口号。
+    # 4173 那种浏览器调试端口也是 200，只能靠「已经选定了就别再换」+ 建议表避开，不能靠猜端口号。
     $rank = switch ($s.status) { 200 { 0 } 401 { 1 } 303 { 2 } default { 99 } }
     # 只在「端口通了但给了状态码」时重问；连不上 / 连接超时不重问（那是在给一台死端口翻倍等待）
     if ($rank -eq 99 -and $s.stage -eq 'http' -and $s.status -gt 0) {
@@ -2844,6 +3089,10 @@ function Resolve-HostPort {
     if ($rank -lt $bestRank) { $bestRank = $rank; $best = $p; $bestStatus = $s.status }
     if (-not $fallback -and $s.status -ne 0) { $fallback = $p }
   }
+  # 没探的那些明确标成 unprobed —— 「没看过」和「看过没回」是两件事，消费方要能分清
+  foreach ($q in @($unprobed)) {
+    [void]$order.Add([pscustomobject]@{ port = [int]$q; status = -1; ms = 0; stage = 'unprobed' })
+  }
   if ($bestRank -lt 99) {
     return [pscustomobject]@{ port = [int]$best; status = $bestStatus; order = @($order.ToArray()); probed = $probed }
   }
@@ -2853,9 +3102,36 @@ function Resolve-HostPort {
   return [pscustomobject]@{ port = [int]$pick; status = $status; order = @($order.ToArray()); probed = $probed }
 }
 
+function Get-AuxPortHint([int]$MainPid_) {
+  <#
+    **建议性**缓存：上一次实测认出「不是宿主 HTTP 面」的端口（典型：dsh-browser 的 CDP 端口，
+    同 pid 也在监听、也回 200，但它不是宿主的面 —— 本机实测它曾吃掉一次 10s 的连接超时）。
+    存进 state\aux-ports.json，按 Electron 主进程 pid 归属：pid 变了（App 重启）就不认老结论。
+    只影响「先探谁」，不影响任何判定：被跳过的端口在 order 里标 stage=skipped，
+    并且只有在本轮**已经确定**选到 200/401 面时才写回。
+  #>
+  if (-not $MainPid_) { return @() }
+  $path = Get-StatePath 'aux-ports.json'
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @() }
+  try {
+    $o = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([int](Get-JsonField $o 'mainPid') -ne [int]$MainPid_) { return @() }
+    return @((Get-JsonField $o 'ports') | Where-Object { $_ -and [int]$_ -gt 0 } | ForEach-Object { [int]$_ })
+  } catch { return @() }
+}
+
+function Save-AuxPortHint([int]$MainPid_, [int[]]$Ports) {
+  # 把「本次实测确认不是宿主面」的端口记下来（供下次先跳过）。失败不影响任何行为。
+  if (-not $MainPid_ -or @($Ports).Count -eq 0) { return }
+  try {
+    $rec = [ordered]@{ mainPid = [int]$MainPid_; ports = @($Ports | Sort-Object -Unique); savedAt = (Get-Date).ToString('o') }
+    New-Utf8NoBom (Get-StatePath 'aux-ports.json') ($rec | ConvertTo-Json -Compress)
+  } catch { }
+}
+
 function Get-DesktopInstances {
   # 参数：-Refresh 强制重扫端口表与进程表（等待循环里用，每轮宿主集会变）。
-  param([switch]$Refresh)  <#
+  param([switch]$Refresh, [switch]$ProbeAll)  <#
     桌面版实例 = 宿主子进程 + 它的 Electron 主进程 + 实测监听端口。
     身份四要素（缺一不可，防误杀）：
       a) 进程名 DeepSeek Harness.exe 且命令行含 dsh-desktop-host\lib\index.js；
@@ -2870,7 +3146,10 @@ function Get-DesktopInstances {
   # Get-CimInstance（~135ms 一次），候选一多就变成秒级。
   $rows = Get-NetstatListenerRows -Refresh:$Refresh
   $procMap = Get-ProcessIndex -Refresh:$Refresh
-  foreach ($h in @(Get-DesktopHostProcesses)) {
+  # 一次取成数组变量：function 返回单元素集合时 @() 之外再写 $h.xxx 会踩严格模式的
+  # 「在此对象上找不到属性 commandLine」（实测，服务端筛完只剩 1 个宿主时必现）
+  $hostProcs = @(Get-DesktopHostProcesses)
+  foreach ($h in $hostProcs) {
     if (-not $procMap.ContainsKey([int]$h.mainPid)) { continue }
   $main = $procMap[[int]$h.mainPid]
     if (-not $main) { continue }
@@ -2883,7 +3162,30 @@ function Get-DesktopInstances {
     $profileName = ''
     if ($h.commandLine -match '[\\/]profiles[\\/]([A-Za-z0-9][A-Za-z0-9._-]{0,63})') { $profileName = $Matches[1] }
     $ports = @(Get-ListeningPorts $h.pid $rows)
-    $pick = Resolve-HostPort $ports
+    # 跳过的端口：已知附件面（上次学会的）+ 本进程内上一轮采样已确认「不是宿主面」的。
+    $skip = @(Get-AuxPortHint $h.mainPid)
+    if (-not $ProbeAll) {
+      foreach ($pp in @($script:ProbedPorts.Keys)) {
+        $pObj = $script:ProbedPorts[[int]$pp]
+        if ($pObj -and [int]$pObj.status -gt 0 -and -not $pObj.chosen) { $skip += [int]$pp }
+      }
+    }
+    $pick = Resolve-HostPort $ports -SkipPorts $skip -ProbeAll:$ProbeAll
+    # 本轮实测：记住每个给过状态码的端口（供本轮第二次采样与建议表使用）
+    foreach ($o in @($pick.order)) {
+      if ([int]$o.status -gt 0) {
+        $script:ProbedPorts[[int]$o.port] = @{ status = [int]$o.status; chosen = ([int]$o.port -eq [int]$pick.port) }
+      }
+    }
+    # 附件面 = 探了、给了状态码、却不是被选中的那一面，而且**不是 401**：
+    # 401 = 端口绑了、认证层在要 token（宿主自己的面在启动早期就是这个形状）——
+    # 把 401 当附件面跳过，会漏掉「主面还没挂上、认证面先起来」的那一瞬。
+    # 只在本次选中的那面确实就绪（200/401）时才写回：自己都没看清时，别断定别人是附件。
+    $aux = @($pick.order | Where-Object {
+        $_.stage -eq 'http' -and $_.status -gt 0 -and $_.status -ne 401 -and [int]$_.port -ne [int]$pick.port
+      } | ForEach-Object { [int]$_.port })
+    $pickReady = ([int]$pick.status -eq 200 -or [int]$pick.status -eq 401)
+    if ($aux.Count -gt 0 -and $pick.port -gt 0 -and $pickReady) { Save-AuxPortHint $h.mainPid $aux }
     $proc = Get-Process -Id $h.pid -ErrorAction SilentlyContinue
     [void]$list.Add([pscustomobject]@{
       pid            = $h.pid

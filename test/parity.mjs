@@ -900,8 +900,13 @@ PROBES['D-13'] = [
 PROBES['D-14'] = [
     { file: ENGINE, inFunction: 'Resolve-HostPort', has: /200 \{ 0 \} 401 \{ 1 \} 303 \{ 2 \}/, note: '200 > 401 > 303 > other' },
     { file: ENGINE, inFunction: 'Resolve-HostPort', has: /status -gt 0/, note: 'retry only when the port answered with a status code' },
-    { file: ENGINE, inFunction: 'Invoke-HttpProbe', has: /\$req\.Proxy = \$null/, note: 'loopback probes must not go through the system proxy' },
-    { file: ENGINE, inFunction: 'Invoke-HttpProbe', has: /BeginConnect/, note: 'connect budget is separate from the request budget' },
+    { file: ENGINE, inFunction: 'Resolve-HostPort', has: /stage = 'skipped'/, note: 'a known auxiliary port is not probed' },
+    { file: ENGINE, inFunction: 'Resolve-HostPort', has: /stage = 'unprobed'/, note: 'an unobserved port is not reported as observed' },
+    // 探测走原始 TCP：不走系统代理是结构性的（没有 HttpWebRequest/HttpClient，就没有代理解析），
+    // 连接预算与请求预算分开则体现在 ConnectAsync(...).Wait(预算) 与 ReadTimeout 两处。
+    { file: ENGINE, inFunction: 'Get-HttpStatusCodeDetail', has: /ConnectAsync\(\$Host_, \[int\]\$Port\)\.Wait\(\$maxWait\)/, note: 'connect budget is separate from the request budget' },
+    { file: ENGINE, inFunction: 'Get-HttpStatusCodeDetail', has: /\$ns\.ReadTimeout = /, note: 'the read budget is explicit, not inherited' },
+    { file: ENGINE, inFunction: 'Get-HttpStatusCodeDetail', has: /Connection: close/, note: 'no keep-alive: every probe is a fresh connection' },
 ];
 PROBES['D-15'] = [
     { file: ENGINE, inFunction: 'Add-Phase', has: /\$script:PhasesOn/, note: 'no timing overhead outside -Json/-ResultFile' },
@@ -988,7 +993,7 @@ PROBES['ST-07'] = [eng(/bootRecord = \$rec/)];
 PROBES['ST-08'] = [eng(/lastRestart = \$last/)];
 PROBES['ST-09'] = [eng(/marker\s+= \$\(try \{ Get-Content \(Join-Path \$DshHome '\.smart-restart\\marker\.json'\)/)];
 PROBES['ST-10'] = [eng(/DSH_HOME\s+:/), eng(/状态目录\s+:/), eng(/目标\s+:/), eng(/HTTP\s+:/), eng(/访问地址\s+:/), eng(/进程发现\s+:/), eng(/启动档案\s+:/), eng(/最近一次重启/)];
-PROBES['ST-11'] = [{ file: ENGINE, inFunction: 'Show-Status', has: /schtasks \/Query \/TN \$TaskName/ }, { file: ENGINE, inFunction: 'Show-Status', lacks: /'DSH Restart'/ }];
+PROBES['ST-11'] = [{ file: ENGINE, inFunction: 'Show-Status', has: /\/Query \/TN \$TaskName/ }, { file: ENGINE, inFunction: 'Show-Status', has: /Where-Object \{ \$_ -isnot \[System\.Management\.Automation\.ErrorRecord\] \}/, note: 'schtasks stderr must not abort -Status on 5.1' }, { file: ENGINE, inFunction: 'Show-Status', lacks: /'DSH Restart'/ }];
 PROBES['ST-12'] = [{ file: ENGINE, inFunction: 'Show-Status', has: /profiles\\\$Profile\\node_modules\\dsh-smart-restart/ }, { file: ENGINE, inFunction: 'Show-Status', lacks: /profiles\\web\\/ }];
 PROBES['ST-13'] = [eng(/已提升（Full）/), eng(/未提升（Default）/), eng(/'未知'/)];
 PROBES['ST-14'] = [eng(/\$script:Extra\['status'\]/)];
