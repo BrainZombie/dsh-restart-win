@@ -435,9 +435,19 @@ Three things to know:
 3. **`-DoNotTouchDshHome` is a dead parameter.** It is declared, accepted, and no branch consumes it, so it behaves as a no-op. It stays for command-line compatibility.
 
 With `-Json` / `-ResultFile` the envelope also carries a `phases` key with the milliseconds spent in
-each stage (`prepare`, `pre-check`, `host-kind`, `probe:<port>`, `instances`, `http-probe`, `auth-url`,
-`total`). It is only produced on the machine interface, costs nothing in human mode, and the fourteen
-required envelope fields and their levels are unchanged.
+each stage (`pre-check`, `host-kind`, `instances`, `instances-2`, `cim`, `history`, `probe:<port>`,
+`http-probe`, `auth-file`, `auth-log`, `auth-url`, `total`). Repeated labels (several probes of the same
+port) are summed, not overwritten, so the parts add up to `total`. It is only produced on the machine
+interface, costs nothing in human mode, and the fourteen required envelope fields and their levels are
+unchanged.
+
+Each `instances[].probe` entry also carries a `stage`, which separates the three ways a port can end up
+"not picked": `http` (actually probed, `status` is what it answered), `skipped` (known not to be the
+host's face — learned from an earlier measurement, `known: "aux"`), `unprobed` (not probed this round
+because the first 200 stopped the sweep; `instances-2` fills it in), and `budget-exhausted` (the probe
+budget ran out). Learned auxiliary ports live in `%LOCALAPPDATA%\dsh-restart\aux-ports.json`, keyed by
+the Electron main pid — a new app start invalidates the old conclusions. A `401` face is never recorded
+as auxiliary: it may be the host's own face during early startup.
 
 ### 8.1 When a desktop host listens on several ports, which one is picked
 

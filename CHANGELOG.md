@@ -1,5 +1,55 @@
 # 变更记录
 
+## 0.5.0 — 宿主发现放到 WMI 服务端、探针换成原始 TCP
+
+这一版继续只改「读机器状态的代价」与几个实测踩到的正确性问题。行为语义（401/200 才算就绪、
+退出码、终态词、信封必选字段）不变。
+
+### 引擎（scripts/dsh-restart.ps1）
+
+- **宿主发现改为服务端筛选**：`Get-DesktopHostProcesses` 不再按进程名 `Name='DeepSeek Harness.exe'`
+  写死，也不再拉全表在 PowerShell 里筛 500 个命令行；改为一条 `CommandLine LIKE '%dsh-desktop-host%'`
+  交给 WMI 筛，完整路径仍由正则严格判定。改名的壳同样认得出，一次查询 ~120-270ms。
+  `Find-DesktopHostRows` 带进程内缓存，`Resolve-HostKind` / `Resolve-DesktopProfileName` / 实例发现
+  不再各查一遍宿主。
+- **探针换成原始 TCP**（`Get-HttpStatusCodeDetail`）：直接 `ConnectAsync(...).Wait(预算)` + 写请求 +
+  读状态行。HttpClient/HttpWebRequest 两个栈在 3082 上每次要 1.6-2s，而这只是「问几号状态码」。
+  三条实测坑写进注释：死端口上同步构造函数会卡 ~14s；`try` 里 return + `finally` 里 Close 会让
+  一次成功调用固定多出 2s；读超时必须显式设 `NetworkStream.ReadTimeout`。
+- **`Test-WebAuthUrl` 带路径与端口**：token 在 `?token=` 上，只请求 `/` 会让一个有效 token 被判成
+  失效（实测把 `launchUrl` 打成 unknown）；持久地址的端口不在当前实例实际监听的端口里时直接判过期，
+  不再去探一个死端口。
+- **`Read-FileTailText`**：取 boot token 只读日志尾部 64KB（几十 MB 的日志全文 `Select-String` 要 1-2s）。
+- **端口挑面**：命中 200 即停，其余端口标 `stage=unprobed`；`Get-AuxPortHint` / `Save-AuxPortHint`
+  把实测确认的附件端口（如 CDP 的 4173，也回 200）记进 `state\aux-ports.json`（按 Electron 主进程 pid
+  归属，pid 变了就不认），下次标 `stage=skipped` 不探。401 面永不记为附件面。
+- **`instances-2` 补探**：第一次采样早退留下的 `unprobed` 端口，用一次 `-ProbeAll` 补探，
+  选面结论仍以第一次为准 —— 只为了让建议表学到东西。
+- **计时**：`Add-Phase` 同标签累加（不再被后续探针覆盖），基准换成 `Stopwatch`（`Get-Date` 每次 ~1.1ms），
+  并把 `ArrayList`/WMI/类型解析的冷启动（~100ms + ~270ms）放到计时之前预热；`phases` 新增
+  `start` / `cim` / `history` / `auth-file` / `auth-log` / `instances-2`。
+- **`Read-HostServing`**：验证循环里每 800ms 问一次就绪，改用原始 TCP 探针（`Test-HttpServing` 保留原样）。
+- **修复（5.1）**：`-Status` 里 `schtasks /Query` 的 stderr 在 `$ErrorActionPreference='Stop'` 下会直接
+  中断整个命令 —— 查不到计划任务的机器上 `-Status` 会整行 abort。现在显式收掉 stderr 行。
+
+### 实测（本机，561 个进程，桌面宿主 4 个监听端口）
+
+| 指标 | 0.4.0 | 0.5.0 |
+|---|---|---|
+| `-Status -Json` 引擎耗时（中位，8 次） | 1.7s（好）/ 3.5s（常见） | 2.7s（中位）/ 13s（宿主自己偶发 10s 慢） |
+| `-Status` 人读（中位） | 5.6s | 3.5s |
+| 主面探测 | 26-50ms | 3ms（原始 TCP） |
+| 宿主发现 | ~1000ms（三处各查一次） | ~400-900ms（一次查询，缓存复用） |
+
+> 13s 那一轮不是脚本的开销：同一轮里 3082 端口自己的读请求就占了 10.05s（宿主偶发慢回），
+> 探针按预算等它，与引擎改动无关。
+
+### 测试
+
+`npm test`：88 通过 / 0 失败；parity **254/254**；integration 16 通过（`--with-engine` 17 通过）；
+`check-encoding` 在 pwsh 7.6 与 5.1 下 errors=0。
+
+
 ## 0.4.0 — 一次调用只扫一遍机器状态
 
 这一版全部落在「引擎怎么读机器」上：端口表、进程表、宿主 HTTP 面。行为语义
