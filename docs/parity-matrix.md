@@ -470,3 +470,23 @@ Select-String .\scripts\dsh-restart.ps1 -Pattern 'restarted-ok|status|verify-onl
 | 终态词表 | 26 个全部存在（含 `rescued-after-abort:`、`aborted:`、`task-registered`/`task-register-failed` 三处动态拼接） |
 
 > 该快照只证明**符号存在**，不证明行为等价 —— 行为等价由 `test/parity.mjs`（qa-verifier）与本表「验证方式」列的运行证据共同判定。
+
+## 15. 机器事实与反硬编码（MP 组）
+
+背景：本机把 DSH Desktop 装在非默认目录（`<盘>:\<目录>\`），且 `git-bash` 的 PATH 会把 `netstat`
+解析到别处。两次真实事故都出在「猜」上：App 停着 + 装在非默认位置 → 引擎报「找不到可执行文件」；
+宿主停掉后判定退化 → 退化成 `web` 分支 → 整条重启链走错。这一节把「不猜」写成可执行断言。
+
+| 能力ID | 能力（参数/开关/步骤） | 旧实现位置 | 插件目标位置 | 可配置化处理 | 验证方式 |
+|---|---|---|---|---|---|
+| MP-01 | 桌面版可执行文件从**系统登记处**反查：卸载登记（HKCU/HKLM `Uninstall\*` 的 `DisplayIcon`/`InstallLocation`）、`App Paths`、开始菜单/桌面 `.lnk` 的 `TargetPath`；全部落空才 fail-closed，绝不扫盘 | 无旧实现（旧引擎只认 web 端口） | scripts/dsh-restart.ps1::Get-DesktopInstallPaths | 无需配置 | parity:MP-01 断言三条来源都在、且函数体里没有字面量盘符路径 |
+| MP-02 | `<StateDir>\machine.json` 是**第一候选**（先于运行中实例 / 启动档案 / 默认位置）；文件缺失或坏掉时返回 `$null` 继续探测，绝不抛 | 无旧实现 | scripts/dsh-restart.ps1::Get-MachineConfig + Resolve-DesktopAppPath | `-StateDir` / `%DSH_RESTART_HOME%` 决定位置 | parity:MP-02 断言读取点存在、优先级高于 `running-instance`、缺配置不致命 |
+| MP-03 | 系统工具一律走绝对路径：`Get-SystemTool netstat/taskkill/schtasks/robocopy/cmd` → `%SystemRoot%\System32`，找不到才退回裸名 | 本机：无旧实现（裸名调用，无解析器） | scripts/dsh-restart.ps1::Get-SystemTool | 无需配置 | parity:MP-03 断言四种工具都经解析器；`Get-SystemTool` 体里出现 `System32` |
+| MP-04 | `-Status -Json` 的 `status` 增加安装事实：`desktopApp` / `desktopAppSource` / `runtimeDir` / `appRoot` / `pnpm` / `nodeExe`（外部工具不必自己猜路径） | 无旧实现 | scripts/dsh-restart.ps1::Show-Status | 只读，无副作用 | parity:MP-04 断言五个键写入；本机实跑：`src=machine-config`、`runtimeDir` 与实例一致 |
+| MP-05 | `scripts/dsh-repair.ps1`：插件安装/修复通道。所有机器事实取自引擎 `-Status -Json`，动作全部委托引擎；解析引擎时只认 `.ps1`（`.cmd` 垫片交给 `pwsh -File` 会 `exit=64`）；`-Report` 落 UTF-8 报告 | 本机：原 `plugin-install.ps1`（不在仓库，写死安装根与 node 路径） | scripts/dsh-repair.ps1 | `-Profile` / `-DshHome` / `-NodeExe` / `-PnpmMjs` / `-Engine` / `-StateDir` 覆盖 | parity:MP-05 静态断言 + 本机实跑：`-CensusOnly` / `-WhatIfPlan` / `-CheckShadowed` 全部走通 |
+| MP-06 | `scripts/dsh-config.ps1`：一次探测把 `machine.json` 落盘（`-Show` 预览 / `-Reset` 删除 / `-DesktopApp` 手工指定） | 无旧实现 | scripts/dsh-config.ps1 | 全部参数可选 | parity:MP-06 静态断言；本机实跑 `-Show` 与写入，`machine.json` 字段与实例实测一致 |
+| MP-07 | 回归入口：`scripts/probe-notice.ps1` 只读验证续跑通知契约（AST 抽函数 → 临时目录跑三次 → 键序 / ISO-Z / attempts=0 / 无 BOM / 无 .tmp 残留 / 调用点仍在停机之前）；README 记录两条脚本 | 本机：原 `_probe-notice.ps1`（指向已删除的 plugin-install.ps1） | scripts/probe-notice.ps1；README.zh.md §5.5 / §5.6 | 无参数 | parity:MP-07 静态断言；本机实跑 `RESULT: ALL PASS` |
+
+> 说明：`-DesktopApp <path>` 也是引擎参数，显式给出时优先级最高（用户已给出唯一确定的事实），
+> 探测链整体短路。`scripts/dsh-repair.ps1` 与 `scripts/dsh-config.ps1` 每次运行都会顺带刷新
+> `machine.json`，因此「配置过期」不是需要人工维护的状态。

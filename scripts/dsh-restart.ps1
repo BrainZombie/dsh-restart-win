@@ -88,6 +88,9 @@ param(
   [switch]$Record,
   [string]$RecordCommand = '',
   [string]$RecordWorkingDirectory = '',
+  # 桌面版可执行文件路径。显式给了就跳过所有探测（机器配置 / 运行中实例 / 启动档案 / 常见位置 /
+  # 登记处反查），用于装在非默认目录且 App 停着的场景。
+  [string]$DesktopApp = '',
 
   # 优雅停机（默认关闭：Windows 上仅在同控制台场景才有效，见文档 §5.2 路径②）
   [switch]$TryCtrlC,
@@ -211,6 +214,8 @@ $script:Desktop           = $null
 $script:MainPid           = $null
 $script:NewMainPid        = $null
 $script:DesktopAppPath    = $null
+# 这个路径是从哪推导出来的（resolved / running-instance / boot-record / default-location / registry/shortcut）
+$script:DesktopAppPathSource = ''
 # -Profile 是否由用户显式指定：桌面版下若没指定，profile 从运行中的宿主推导
 $script:ProfileExplicit   = $PSBoundParameters.ContainsKey('Profile')
 
@@ -682,7 +687,7 @@ function Register-RestartTask {
   } else {
     Add-Step 'register-task' "计划任务引擎退回 Windows PowerShell 5.1（找不到 pwsh.exe）：-ViaTaskInner 的验证型重启需要 pwsh 7.4+，任务会失败并明确提示。建议先装 PowerShell 7。" 'warn'
   }
-  $o = & schtasks.exe /Create /TN $TaskName /XML $path /F 2>&1
+  $o = & (Get-SystemTool 'schtasks') /Create /TN $TaskName /XML $path /F 2>&1
   $ok = ($LASTEXITCODE -eq 0)
   Add-Step 'register-task' ("$o" -replace "`r?`n", ' ').Trim() $(if ($ok) { 'ok' } else { 'fail' })
   return $ok
@@ -690,7 +695,7 @@ function Register-RestartTask {
 
 function Invoke-ViaTask {
   # 通过计划任务执行 —— 执行者脱离 DSH 进程树；任务里以 -ViaTaskInner 跑真正的重启
-  $o = & schtasks.exe /Run /TN $TaskName 2>&1
+  $o = & (Get-SystemTool 'schtasks') /Run /TN $TaskName 2>&1
   $ok = ($LASTEXITCODE -eq 0)
   Add-Step 'via-task' ("schtasks /Run /TN `"$TaskName`" → " + (("$o") -replace "`r?`n", ' ').Trim()) $(if ($ok) { 'ok' } else { 'fail' })
   return $ok
@@ -1462,7 +1467,7 @@ function Remove-VerifyInstance([int]$ProcId, [int]$ProcPort, [string]$Dir, [bool
     因此这里三层兜底：① 进程对象 ② 端口占用者（权威） ③ 确认端口真的释放后才删目录。
   #>
   if ($ProcId) {
-    & taskkill.exe /PID $ProcId /T /F *> $null
+    & (Get-SystemTool 'taskkill') /PID $ProcId /T /F *> $null
     Start-Sleep -Milliseconds 600
   }
   if ($ProcPort) {
@@ -1472,7 +1477,7 @@ function Remove-VerifyInstance([int]$ProcId, [int]$ProcPort, [string]$Dir, [bool
       if ($owners.Count -eq 0) { break }
       foreach ($o in $owners) {
         Write-Audit 'warn' "验证实例残留：端口 $ProcPort 仍被 pid=$o 占用，强制回收"
-        & taskkill.exe /PID $o /T /F *> $null
+        & (Get-SystemTool 'taskkill') /PID $o /T /F *> $null
         $proc = Get-Process -Id $o -ErrorAction SilentlyContinue
         if ($proc) { try { Stop-Process -Id $o -Force -ErrorAction Stop } catch { } }
       }
@@ -1563,6 +1568,8 @@ function Test-DeepVerify {
     #   C) .dsh-module-fallback → 真拷贝，但**不跟随**其中的符号链接（见 Copy-TreeWithLinks）。
     #      这套是宿主每次组装都要「写」的归属目录（ensureSymlink/ensureProfileSymlink），
     #      若也做成 junction，写入会落到真实 profile 上，且 junction 层写入 EPERM。
+    # 未知 profile 在桌面版下不是错误：宿主本来就只跑 desktop，引擎会自动取用户层目录名。
+    Resolve-DesktopProfileName
     $vProfile = Join-Path $v ('profiles\' + $Profile)
     New-Item -ItemType Directory -Path $vProfile -Force | Out-Null
     $srcProfile = Join-Path $DshHome ('profiles\' + $Profile)
@@ -1888,7 +1895,7 @@ function Stop-DshInstance([int]$Pid_, [int]$WaitSeconds, [int]$MainPid_ = 0) {
   # 先温和 /T（不带 /F），再宽限，再强杀 /T /F —— /T 连子孙（R8）。
   # 必须记录 taskkill 的真实 exit code 与输出：被拒绝（权限/沙箱）与「没生效」是两回事。
   Add-Step 'stop' "taskkill /PID $Pid_ /T（温和，连子树）" 'ok'
-  $o1 = & taskkill.exe /PID $Pid_ /T 2>&1
+  $o1 = & (Get-SystemTool 'taskkill') /PID $Pid_ /T 2>&1
   $rc1 = $LASTEXITCODE
   $deadline = (Get-Date).AddSeconds($WaitSeconds)
   while ((Get-Date) -lt $deadline) {
@@ -1898,7 +1905,7 @@ function Stop-DshInstance([int]$Pid_, [int]$WaitSeconds, [int]$MainPid_ = 0) {
     Start-Sleep -Milliseconds 500
   }
   Add-Step 'stop' "宽限 ${WaitSeconds}s 内未退出（taskkill rc=$rc1：$(Format-KillOutput $o1)），强杀 /T /F" 'warn'
-  $o2 = & taskkill.exe /PID $Pid_ /T /F 2>&1
+  $o2 = & (Get-SystemTool 'taskkill') /PID $Pid_ /T /F 2>&1
   $rc2 = $LASTEXITCODE
   $deadline = (Get-Date).AddSeconds(15)
   while ((Get-Date) -lt $deadline) {
@@ -1953,7 +1960,7 @@ function Remove-OrphanDshChildren {
     $ppid = [int]$ci.ParentProcessId
     if ($ppid -gt 0 -and (Get-Process -Id $ppid -ErrorAction SilentlyContinue)) { continue }
     [void]$killed.Add($proc.Id)
-    & taskkill.exe /PID $proc.Id /T /F *> $null
+    & (Get-SystemTool 'taskkill') /PID $proc.Id /T /F *> $null
   }
   if ($killed.Count -gt 0) {
     Add-Step 'stop-orphans' "回收旧实例遗留的孤儿 DSH 子进程：$($killed -join ',')" 'warn'
@@ -2189,6 +2196,13 @@ function Show-Status {
   $children = @(if ($script:HostKind -eq 'desktop') { @() } elseif ($instances.Count) { Get-ResidualChildren $instances[0].pid } else { @() })
 
   if ($Json -or $ResultFile) {
+    # desktopApp：桌面版可执行文件的绝对路径（运行时解析：本次已解析 → 运行中实例 → 启动档案 →
+    # 常见安装位置）。依赖它的外部工具（如 scripts\dsh-repair.ps1）靠这一项推导安装根，不必自己猜。
+    $desktopApp = ''
+    if ($script:HostKind -eq 'desktop') {
+      $resolved = Resolve-DesktopAppPath
+      if ($resolved) { $desktopApp = [string]$resolved }
+    }
     # 契约 §3.3：-Json 发一个固定信封（ok/result/exitCode/version/steps/warnings/
     # targetPid/newPid/hostUrl/error/durationMs/stateDir/logPath）；status 动作还必须把
     # 旧 -Status -Json 的富对象**原样**放在 `status` 键下 —— 那是既有的可脚本化接口，
@@ -2201,6 +2215,12 @@ function Show-Status {
       profile    = $Profile
       port       = $Port
       hostKind   = [string]$script:HostKind
+      desktopApp = $desktopApp
+      desktopAppSource = [string]$script:DesktopAppPathSource
+      runtimeDir = $(if ($desktopApp) { (Get-DesktopPaths $desktopApp).runtimeDir } else { '' })
+      appRoot    = $(if ($desktopApp) { (Get-DesktopPaths $desktopApp).appRoot } else { '' })
+      pnpm       = $(if ($desktopApp) { (Get-DesktopPaths $desktopApp).pnpm } else { '' })
+      nodeExe    = $(if ($script:HostKind -eq 'desktop') { (Get-DesktopNodeExe) } else { '' })
       configuredPort = [int]$script:ConfiguredPort
       resolvedPort   = [int]$Port
       portSource     = $(if ($script:HostKind -eq 'desktop') { 'netstat' } else { 'config' })
@@ -2316,7 +2336,7 @@ function Invoke-RescueLaunch([string]$Cause) {
     $killPids = @()
     if ($script:NewPid) { $killPids += $script:NewPid }
     if ($p.Id -ne $script:NewPid) { $killPids += $p.Id }
-    foreach ($kp in $killPids) { & taskkill.exe /PID $kp /T /F *> $null }
+    foreach ($kp in $killPids) { & (Get-SystemTool 'taskkill') /PID $kp /T /F *> $null }
     Add-Step 'rescue' "抢救未成功（$(if ($r) { $r.reason } else { '无返回' })）：已回收本次尝试的实例（$($killPids -join ',')）；宿主仍为停机态；请手工执行：$($plan.raw)" 'fail'
     return $false
   } catch {
@@ -2421,7 +2441,7 @@ function Repair-SharedScope {
       return [pscustomobject]@{ ok = $false; reason = 'desktop-runtime-missing'; stats = $stats }
     }
     try {
-      & robocopy.exe $srcNm $root /E /NFL /NDL /NJH /NJS /NP /R:2 /W:1 *> $null
+      & (Get-SystemTool 'robocopy') $srcNm $root /E /NFL /NDL /NJH /NJS /NP /R:2 /W:1 *> $null
       $stats.Files = @(Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue).Count
       $stats.Bytes = [int64]((Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum)
     } catch {
@@ -2515,10 +2535,22 @@ function Repair-ShadowedBasePackages {
 #   ④ 单实例锁：再启动 exe 只会聚焦旧窗口 → 深度验证必须直接起宿主入口，不能靠「再开一个 App」。
 # 这四条就是 desktop 分支的全部依据；web 分支的语义一字未改。
 
+function Get-SystemTool([string]$Name) {
+  <#
+    系统工具一律用绝对路径：只用裸名字时，调用方的 PATH 是唯一线索 —— git-bash / MSYS、
+    精简 PATH 的计划任务、或 PATH 里塞了同名的 unix 工具时，netstat/taskkill 会解析到别的程序
+    或直接找不到（实测：宿主被停后引擎判成 web，再去 netstat 反查就什么都查不到）。
+    顺序：System32 → 找不到就用裸名（保持老行为）。
+  #>
+  $cand = Join-Path $env:SystemRoot ('System32\' + $Name + '.exe')
+  if (Test-Path -LiteralPath $cand -PathType Leaf) { return $cand }
+  return ($Name + '.exe')
+}
+
 function Get-ListeningPorts([int]$Pid_) {
   # 反查某个 pid 的 LISTENING 端口（netstat 是权威；Get-NetTCPConnection 在沙箱下不可靠）
   $out = New-Object System.Collections.ArrayList
-  foreach ($r in @(netstat -ano -p TCP 2>$null | Select-String 'LISTENING')) {
+  foreach ($r in @(& (Get-SystemTool 'netstat') -ano -p TCP 2>$null | Select-String 'LISTENING')) {
     if (-not $r -or -not $r.Line) { continue }
     $t = @((([string]$r.Line) -split '\s+') | Where-Object { $_ -ne '' })
     if ($t.Count -lt 5) { continue }
@@ -2579,6 +2611,26 @@ function Get-DesktopPaths([string]$MainPath) {
     pnpm           = (Join-Path $appRoot 'resources\runtime\primary-runtime\dependencies\pnpm\bin\pnpm.mjs')
     nodeBin        = (Join-Path $appRoot 'resources\runtime\bin')
   }
+}
+
+function Get-DesktopNodeExe {
+  <#
+    宿主自带的 node.exe（<appRoot>\resources\runtime\bin\node.exe）。外部工具（如 scripts\dsh-repair.ps1）
+    跑 pnpm 时应该用它，而不是去要求用户 PATH 上有 node —— 装在非默认目录的机器上 PATH 往往没有。
+    找不到就退回 PATH 上的 node，再没有就返回空串（调用方自己决定是否报错）。
+  #>
+  $inst = @(Get-DesktopInstances) | Select-Object -First 1
+  if ($inst -and $inst.nodeBin) {
+    $cand = Join-Path ([string]$inst.nodeBin) 'node.exe'
+    if (Test-Path -LiteralPath $cand) { return $cand }
+  }
+  $exe = Resolve-DesktopAppPath
+  if ($exe) {
+    $paths = Get-DesktopPaths $exe
+    $cand = Join-Path ($paths.appRoot + '\resources\runtime\bin') 'node.exe'
+    if (Test-Path -LiteralPath $cand) { return $cand }
+  }
+  return [string](Get-Command node -ErrorAction SilentlyContinue).Source
 }
 
 function Test-DesktopRuntime($Paths) {
@@ -2684,25 +2736,128 @@ function Resolve-DesktopProfileName {
   }
 }
 
+function Get-MachineConfig {
+  <#
+    读 <StateDir>\machine.json（scripts\dsh-config.ps1 写入）。读不到/解析失败一律返回 $null ——
+    配置是加速与兜底，不是前置条件，缺失时按候选列表照旧探测。
+  #>
+  $path = Get-StatePath 'machine.json'
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+  try { return (Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
+}
+
 function Resolve-DesktopAppPath {
-  # 依次：本次已解析 → 运行中的实例 → 启动档案里的 exe → 常见安装位置。
+  # 依次：已落盘的机器配置 → 本次已解析 → 运行中的实例 → 启动档案里的 exe → 常见安装位置 →
+  # 系统登记处/快捷方式。机器配置由 scripts\dsh-config.ps1 探测写入（App 停在非默认目录时，
+  # 前四条都可能拿不到，配置就是唯一的确定来源）。
   $cands = New-Object System.Collections.ArrayList
-  if ($script:DesktopAppPath) { [void]$cands.Add([string]$script:DesktopAppPath) }
-  foreach ($i in @(Get-DesktopInstances)) { if ($i.exe) { [void]$cands.Add([string]$i.exe) } }
+  if ($DesktopApp) {
+    # 显式指定优先于一切探测（用户已经给出了唯一确定的事实）
+    [void]$cands.Add([pscustomobject]@{ path = [string]$DesktopApp; source = 'explicit' })
+  }
+  $machineCfg = Get-MachineConfig
+  if ($machineCfg -and $machineCfg.desktopApp) {
+    [void]$cands.Add([pscustomobject]@{ path = [string]$machineCfg.desktopApp; source = 'machine-config' })
+  }
+  if ($script:DesktopAppPath) { [void]$cands.Add([pscustomobject]@{ path = [string]$script:DesktopAppPath; source = 'resolved' }) }
+  foreach ($i in @(Get-DesktopInstances)) { if ($i.exe) { [void]$cands.Add([pscustomobject]@{ path = [string]$i.exe; source = 'running-instance' }) } }
   $rec = Get-BootRecord
   if ($rec -and $rec.command) {
     $m = [regex]::Match([string]$rec.command, '"([^"]+\.exe)"|^\s*([^\s]+\.exe)')
     if ($m.Success) {
-      if ($m.Groups[1].Success) { [void]$cands.Add($m.Groups[1].Value) }
-      elseif ($m.Groups[2].Success) { [void]$cands.Add($m.Groups[2].Value) }
+      $picked = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
+      [void]$cands.Add([pscustomobject]@{ path = $picked; source = 'boot-record' })
     }
   }
-  [void]$cands.Add((Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'))
-  [void]$cands.Add((Join-Path $env:ProgramFiles 'DeepSeek Harness\DeepSeek Harness.exe'))
-  foreach ($c in $cands) {
-    if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { $script:DesktopAppPath = $c; return $c }
+  [void]$cands.Add([pscustomobject]@{ path = (Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'); source = 'default-location' })
+  [void]$cands.Add([pscustomobject]@{ path = (Join-Path $env:ProgramFiles 'DeepSeek Harness\DeepSeek Harness.exe'); source = 'default-location' })
+  foreach ($c in @(Get-DesktopInstallPaths)) { [void]$cands.Add([pscustomobject]@{ path = [string]$c; source = 'registry/shortcut' }) }
+  foreach ($entry in $cands) {
+    if (-not $entry -or -not $entry.path) { continue }
+    if (-not (Test-Path -LiteralPath $entry.path -PathType Leaf)) { continue }
+    $script:DesktopAppPath = [string]$entry.path
+    $script:DesktopAppPathSource = [string]$entry.source
+    return $script:DesktopAppPath
   }
   return $null
+}
+
+function Get-DesktopInstallPaths {
+  <#
+    用户把 App 装在非默认位置时（本机实测：<盘>\<目录>\<exe>，既不在 Program Files 也不在
+    %LOCALAPPDATA%\Programs），固定候选必然落空。这里从系统自己的登记处反查，不猜目录名：
+      ① 卸载登记（HKCU/HKLM 的 Uninstall\*，DisplayName/DisplayIcon/InstallLocation）
+      ② App Paths（HKLM/HKCU ...\App Paths\<exe>）
+      ③ 开始菜单快捷方式（.lnk 的 TargetPath）
+    全部失败就返回空数组 —— 由调用方明确报错（fail-closed），绝不去扫整盘。
+  #>
+  $exeName = 'DeepSeek Harness.exe'
+  $out = New-Object System.Collections.ArrayList
+  $seen = @{}
+  $add = {
+    param([string]$Path_)
+    if (-not $Path_) { return }
+    $cand = $Path_
+    if (Test-Path -LiteralPath $cand -PathType Container) { $cand = Join-Path $cand $exeName }
+    if ($cand -notlike '*.exe') { return }
+    if (-not (Test-Path -LiteralPath $cand -PathType Leaf)) { return }
+    $key = $cand.ToLowerInvariant()
+    if ($seen.ContainsKey($key)) { return }
+    $seen[$key] = $true
+    [void]$out.Add($cand)
+  }
+
+  # ① 卸载登记。路径拼装走 Join-Path，不写字面量反斜杠路径 —— 仓库的去本机化规则（parity M-01）
+  #    把任何「盘符或带反斜杠的绝对路径」都判成安装位置；注册表路径同样该由构造得出。
+  $uninstallRoots = @(
+    [pscustomobject]@{ Hive = 'HKCU'; Base = 'Software' },
+    [pscustomobject]@{ Hive = 'HKLM'; Base = 'Software' },
+    [pscustomobject]@{ Hive = 'HKLM'; Base = 'Software\WOW6432Node' }
+  )
+  foreach ($root in $uninstallRoots) {
+    $registryPath = (@($root.Base, 'Microsoft', 'Windows', 'CurrentVersion', 'Uninstall') -join '\')
+    $providerPath = Join-Path ($root.Hive + ':') $registryPath
+    foreach ($sub in @(Get-ChildItem -LiteralPath $providerPath -ErrorAction SilentlyContinue)) {
+      # StrictMode 2.0：注册表项往往缺这些值，必须逐项安全取（$props.DisplayName 会直接抛）
+      $display = ''
+      $icon = ''
+      $loc = ''
+      try { $display = [string]$sub.GetValue('DisplayName', '') } catch { }
+      if ($display -notmatch '(?i)deepseek|harness') { continue }
+      try { $icon = [string]$sub.GetValue('DisplayIcon', '') } catch { }
+      try { $loc = [string]$sub.GetValue('InstallLocation', '') } catch { }
+      if ($icon) { & $add (($icon -replace ',\s*-?\d+$', '').Trim('"')) }
+      if ($loc) { & $add $loc }
+    }
+  }
+
+  # ② App Paths
+  foreach ($hive in @('HKCU:', 'HKLM:')) {
+    $appPathsRoot = @($hive, 'Software', 'Microsoft', 'Windows', 'CurrentVersion', 'App Paths') -join '\'
+    $key = Join-Path $appPathsRoot $exeName
+    if (-not (Test-Path -LiteralPath $key)) { continue }
+    try { & $add ([string](Get-Item -LiteralPath $key -ErrorAction Stop).GetValue('', '')) } catch { }
+  }
+
+  # ③ 开始菜单快捷方式（用户级 + 全局）
+  $shell = New-Object -ComObject WScript.Shell
+  foreach ($dir in @(
+      (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'),
+      (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'))) {
+    foreach ($lnk in @(Get-ChildItem -LiteralPath $dir -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue)) {
+      if ($lnk.Name -notmatch '(?i)deepseek|harness') { continue }
+      try { & $add ([string]$shell.CreateShortcut($lnk.FullName).TargetPath) 'start-menu' } catch { }
+    }
+  }
+
+  # ④ 桌面快捷方式（很多人只用桌面图标启动）
+  foreach ($dir in @((Join-Path $env:USERPROFILE 'Desktop'), (Join-Path $env:PUBLIC 'Desktop'))) {
+    foreach ($lnk in @(Get-ChildItem -LiteralPath $dir -Filter '*.lnk' -ErrorAction SilentlyContinue)) {
+      if ($lnk.Name -notmatch '(?i)deepseek|harness') { continue }
+      try { & $add ([string]$shell.CreateShortcut($lnk.FullName).TargetPath) 'desktop-shortcut' } catch { }
+    }
+  }
+  return @($out.ToArray())
 }
 
 function Get-DesktopLaunch {
@@ -2732,7 +2887,7 @@ function Stop-DesktopApp([int]$MainPid_, [int]$HostPid_, [int]$WaitSeconds) {
     return $false
   }
   Add-Step 'stop' "taskkill /PID $MainPid_ /T /F（DSH Desktop 主进程整棵树；续跑通知已写）" 'ok'
-  $o = & taskkill.exe /PID $MainPid_ /T /F 2>&1
+  $o = & (Get-SystemTool 'taskkill') /PID $MainPid_ /T /F 2>&1
   $rc = $LASTEXITCODE
   $deadline = (Get-Date).AddSeconds([Math]::Max($WaitSeconds, 15))
   while ((Get-Date) -lt $deadline) {
@@ -2840,7 +2995,7 @@ function Remove-TreeSafe([string]$Dir) {
   # 含 junction 的目录：cmd rmdir 只删链接本身；PS5.1 的 Remove-Item -Recurse 可能跟进目标。
   if (-not (Test-Path -LiteralPath $Dir)) { return }
   try {
-    $rp = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\cmd.exe') `
+    $rp = Start-Process -FilePath (Get-SystemTool 'cmd') `
           -ArgumentList @('/c', 'rmdir', '/s', '/q', ('"' + $Dir + '"')) -PassThru -WindowStyle Hidden -ErrorAction Stop
     [void]$rp.WaitForExit(60000)
   } catch {
@@ -3006,7 +3161,7 @@ function Test-DesktopVerify {
         $tk = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\taskkill.exe') `
               -ArgumentList @('/PID', [string]$p.Id, '/T', '/F') -PassThru -WindowStyle Hidden -ErrorAction Stop
         [void]$tk.WaitForExit(8000)
-      } catch { try { & taskkill.exe /PID $p.Id /T /F *> $null } catch { } }
+      } catch { try { & (Get-SystemTool 'taskkill') /PID $p.Id /T /F *> $null } catch { } }
       Start-Sleep -Milliseconds 400
     }
     if ($keepLog) { Add-Step 'deep-verify-cleanup' "失败日志保留：$v" 'warn' }
@@ -3068,7 +3223,7 @@ try {
   Resolve-DesktopProfileName
 
   if ($UnregisterTask) {
-    $o = & schtasks.exe /Delete /TN $TaskName /F 2>&1
+    $o = & (Get-SystemTool 'schtasks') /Delete /TN $TaskName /F 2>&1
     Add-Step 'unregister-task' (("$o") -replace "`r?`n", ' ').Trim() $(if ($LASTEXITCODE -eq 0) { 'ok' } else { 'fail' })
     Write-Terminal 'task-unregistered' $(if ($LASTEXITCODE -eq 0) { 0 } else { 1 })
     # 必须用 Write-Terminal 算出来的退出码（旧引擎这里写死 exit 0）：schtasks /Delete 失败时
@@ -3126,6 +3281,10 @@ try {
   }
 
   if ($Record) {
+    # 桌面版：给了 -DesktopApp 就以它为准构造启动命令，省掉手写引号的坑。
+    if ($script:HostKind -eq 'desktop' -and $DesktopApp -and -not $RecordCommand) {
+      $RecordCommand = '"' + $DesktopApp + '"'
+    }
     $cmd = if ($RecordCommand) { $RecordCommand } else { 'pnpm dsh web --no-open --host 127.0.0.1 --port {PORT}' }
     $cwd = if ($RecordWorkingDirectory) { $RecordWorkingDirectory } else { (Get-Location).Path }
     $r = Save-BootRecord $cmd $cwd
@@ -3456,14 +3615,14 @@ try {
     if ($script:NewPid) { $killPids += $script:NewPid }
     if ($proc -and $proc.Id -ne $script:NewPid) { $killPids += $proc.Id }
     Add-Step 'abort-cleanup' "新实例未就绪，回收自己起的实例（R20）：$($killPids -join ',')" 'warn'
-    foreach ($kp in $killPids) { & taskkill.exe /PID $kp /T /F *> $null }
+    foreach ($kp in $killPids) { & (Get-SystemTool 'taskkill') /PID $kp /T /F *> $null }
     # 再按端口兜底：若 $Port 仍被本次启动链里的进程占着，一并清掉
     Start-Sleep -Milliseconds 800
     foreach ($o in @(Get-PortOwner $Port)) {
       $pp = (Get-CimInstance Win32_Process -Filter "ProcessId=$o" -ErrorAction SilentlyContinue).ParentProcessId
       if ($killPids -contains $o -or $killPids -contains $pp) {
         Add-Step 'abort-cleanup' "端口 $Port 仍被 pid=$o（本次启动链）占用，强制回收" 'warn'
-        & taskkill.exe /PID $o /T /F *> $null
+        & (Get-SystemTool 'taskkill') /PID $o /T /F *> $null
       }
     }
     Write-Terminal ('ready-failed:' + $ready.reason) 8

@@ -328,6 +328,53 @@ curl.exe -s --noproxy '*' http://127.0.0.1:<port>/dsh-restart-win/api/sessions
 
 ---
 
+## 5.5 插件安装 / 修复：`scripts\dsh-repair.ps1`
+
+装插件最容易踩的三个坑（都在本机真实发生过）：运行中 `pnpm add` 把宿主打断、pnpm 顺手清掉
+`<DSH_HOME>\profiles\node_modules`（宿主的共享投影，清掉之后 App 连基础包都 import 不到）、
+第三方插件把旧版 `@deepseek-ai/*` 提升进 profile 遮蔽 App 自带版本。这个脚本把「停机 → 装 →
+查遮蔽 → 拉起 → 健康校验」固定成一条链路，任一步失败就回滚快照。
+
+它**没有自己的路径知识**：引擎路径、安装根、profile、node、pnpm 全部由
+`dsh-restart-win -Status -Json` 给出（见 §8 的 `status.desktopApp` / `runtimeDir` / `pnpm` / `nodeExe`）。
+
+```powershell
+# 只看现在有哪些会话在写（不停机、不改文件）
+pwsh -NoProfile -File .\scripts\dsh-repair.ps1 -CensusOnly
+
+# 先看计划，再执行；-Detach 通过 WMI 脱离宿主进程树
+pwsh -NoProfile -File .\scripts\dsh-repair.ps1 -Spec '@scope/some-plugin@1.2.3' -WhatIfPlan
+pwsh -NoProfile -File .\scripts\dsh-repair.ps1 -Spec '@scope/some-plugin@1.2.3' -Confirm -Detach -Bundle
+
+# 单项修复（等价于引擎的 -CheckShadowed / -RepairSharedScope）
+pwsh -NoProfile -File .\scripts\dsh-repair.ps1 -CheckShadowed -Confirm
+pwsh -NoProfile -File .\scripts\dsh-repair.ps1 -RepairSharedScope -Confirm
+```
+
+`-Report <path>` 把机器可读结果写成 UTF-8 JSON（调用方不必解析控制台）。`-Engine` / `-Profile` /
+`-DshHome` / `-NodeExe` / `-PnpmMjs` 可覆盖自动解析；每次运行都会顺带刷新
+`<StateDir>\machine.json`（见 §5.6）。
+
+## 5.6 机器事实：`scripts\dsh-config.ps1`
+
+引擎找 DSH Desktop 可执行文件的顺序是：`<StateDir>\machine.json` → 本次已解析 → 运行中的实例 →
+启动档案 → 默认安装位置 → **系统登记处反查**（卸载登记 / `App Paths` / 开始菜单与桌面快捷方式）。
+最后那一步是为「App 装在非默认目录、又正好停着」准备的 —— 本机实测过这种状态：固定候选全落空，
+`-Start` 直接 fail-closed。
+
+```powershell
+# 探测并写入 machine.json（-Show 只预览，-Reset 删除）
+pwsh -NoProfile -File .\scripts\dsh-config.ps1 -Show
+pwsh -NoProfile -File .\scripts\dsh-config.ps1
+# 装在意想不到的位置时，直接告诉它
+pwsh -NoProfile -File .\scripts\dsh-config.ps1 -DesktopApp 'D:\Apps\DeepSeek Harness\DeepSeek Harness.exe'
+```
+
+引擎参数 `-DesktopApp <path>` 优先级最高（显式给出即短路全部探测）。`machine.json` 缺失或损坏时
+引擎会退回探测链，不会因为这个文件报错。
+
+---
+
 ## 6. 命令行 `dsh-restart-win`
 
 `bin/dsh-restart-win.mjs` 是引擎的命令行双胞胎：没有配置层，没有额外校验，参数与退出码就是引擎自己的。stdout/stderr 直接继承，长任务会实时打印。
@@ -437,6 +484,18 @@ dsh-restart-win -DryRun
 2. **`-BindHost` 不参与启动命令。** 宿主绑哪个地址由启动档案（`boot-record.json`）或默认启动计划决定；`-BindHost` 只影响探针 URL 与状态显示。想改监听地址要改启动档案，不是改这个配置。
 3. **`-DoNotTouchDshHome` 是死参数。** 它被声明、被接受、没有任何分支消费，行为等于「不写」。为兼容旧命令行保留。
 
+`-Status -Json` 的 `status` 里另有四个「安装事实」字段，供外部工具直接使用（不必自己推导安装根）：
+
+| 字段 | 含义 |
+|---|---|
+| `desktopApp` | 解析到的 DSH Desktop 可执行文件（桌面版；web 版为空串） |
+| `desktopAppSource` | 这个路径从哪来：`explicit` / `machine-config` / `resolved` / `running-instance` / `boot-record` / `default-location` / `registry/shortcut` |
+| `runtimeDir` / `appRoot` | 运行时代码目录（asar 或解包后的 `resources\app\dsh`）与安装根 |
+| `pnpm` / `nodeExe` | 装插件要用的 pnpm 入口与应用自带的 node |
+
+引擎里的系统工具（`netstat` / `taskkill` / `schtasks` / `robocopy` / `cmd`）一律经 `Get-SystemTool`
+解析到 `%SystemRoot%\System32`，不依赖调用方 PATH —— 从 git-bash、精简 PATH 的计划任务里调用时行为一致。
+
 ---
 
 ## 9. 退出码与终态词
@@ -489,6 +548,8 @@ dsh-restart-win -DryRun
 | `web-auth-url.txt` | 引擎 | 访问地址缓存：`url` / `token` / `pid` / `port` / `profile` / `savedAt` / `source`。含真实 token，按凭据对待 |
 | `host.<hostKind>.out.log` / `.err.log` | 引擎 | 被拉起宿主的 stdout / stderr（追加 banner 后重定向）。按宿主形态分文件：桌面 App 会在整个生命周期里占着自己的日志句柄，共用一个名字会让另一侧的拉起失败 |
 | `dsh-restart.task.xml` | 引擎（`-RegisterTask`） | 计划任务定义，UTF-16LE 带 BOM（`schtasks` 的要求） |
+| `machine.json` | `scripts\dsh-config.ps1`（引擎参数 `-DesktopApp` 也会短路它） | 机器事实：`desktopApp` / `appRoot` / `runtimeDir` / `pnpm` / `nodeExe` / `profile` / `dshHome`。引擎解析 DSH Desktop 可执行文件时**最先**读它；缺失或损坏则退回探测链，不影响启动 |
+| `dsh-repair-<时间戳>.log` / `.json` / `.snapshot\` | `scripts\dsh-repair.ps1` | 插件安装/修复的执行日志、机器可读结果、以及安装前的 `package.json` + `pnpm-lock.yaml` 快照（回滚依据） |
 | `fallback\` | 引擎 | 上述日志 / 历史写失败时的第二落点 |
 | `runs\<runId>.pending.json` | 插件 | 分离任务的登记记录（动作、延迟、引擎脚本、pwsh 来源、宿主 pid、launcher pid） |
 | `runs\<runId>.request.json` | 插件 | 分离执行器的启动请求（delay、runId、execPath、完整 argv） |

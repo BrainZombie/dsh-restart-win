@@ -585,8 +585,9 @@ const PROBES = {
     'P-27': [eng(/if \(\$TryCtrlC\) \{/, { count: 2 })],
     'P-28': [eng(/if \(\$ViaTask\) \{[\s\S]{0,600}exit 0/)],
     'P-29': [eng(/\[switch\]\$ViaTaskInner/), xml(/-ViaTaskInner/)],
-    'P-30': [eng(/schtasks\.exe \/Create \/TN \$TaskName \/XML \$path \/F/)],
-    'P-31': [eng(/schtasks\.exe \/Delete \/TN \$TaskName \/F/)],
+    // 系统工具改为绝对路径解析（Get-SystemTool）：断言的是「解析到的 schtasks 收到同一组参数」
+    'P-30': [eng(/\$o = & \(Get-SystemTool 'schtasks'\) \/Create \/TN \$TaskName \/XML \$path \/F/)],
+    'P-31': [eng(/\(Get-SystemTool 'schtasks'\) \/Delete \/TN \$TaskName \/F/)],
     'P-32': [eng(/\$TaskName/g, { min: 6 })],
     'P-33': [eng(/\$DoNotTouchDshHome/g, { count: 1, note: 'declared only — the frozen contract forbids giving it semantics' })],
     'P-34': [eng(/#Requires -Version 5\.1/), eng(/\$ErrorActionPreference = 'Stop'/), eng(/Set-StrictMode -Version 2\.0/)],
@@ -708,15 +709,15 @@ PROBES['F-47'] = [eng(/if \(\$env:DSH_RESTART_DEBUG\) \{/g, { count: 2 })];
 PROBES['F-48'] = [eng(/Add-Step 'lock'/), eng(/Add-Step 'discover'/), eng(/Add-Step 'launch'/), eng(/Add-Step 'ready'/), eng(/Add-Step 'url'/)];
 
 // ------------------------------------------------------------------ §3 exit codes
-PROBES['X-01'] = [eng(/Write-Terminal 'restarted-ok' 0/)];
-PROBES['X-02'] = [eng(/Write-Terminal 'status' 0/)];
-PROBES['X-03'] = [eng(/Write-Terminal 'verify-only-ok' 0/)];
-PROBES['X-04'] = [eng(/Write-Terminal 'dry-run' 0/g, { count: 2 })];
-PROBES['X-05'] = [eng(/Write-Terminal 'stopped' 0/g, { count: 2 })];
-PROBES['X-06'] = [eng(/'task-registered' \} else \{ 'task-register-failed' \}\) \$\(if \(\$ok\) \{ 0 \} else \{ 1 \}\)/)];
-PROBES['X-07'] = [eng(/Write-Terminal 'task-unregistered' \$\(if \(\$LASTEXITCODE -eq 0\) \{ 0 \} else \{ 1 \}\)/)];
-PROBES['X-08'] = [eng(/Write-Terminal 'via-task-dispatched' 0/)];
-PROBES['X-09'] = [eng(/Write-Terminal 'recorded' 0/)];
+PROBES['MF-01'] = [eng(/Write-Terminal 'restarted-ok' 0/)];
+PROBES['MF-02'] = [eng(/Write-Terminal 'status' 0/)];
+PROBES['MF-03'] = [eng(/Write-Terminal 'verify-only-ok' 0/)];
+PROBES['MF-04'] = [eng(/Write-Terminal 'dry-run' 0/g, { count: 2 })];
+PROBES['MF-05'] = [eng(/Write-Terminal 'stopped' 0/g, { count: 2 })];
+PROBES['MF-06'] = [eng(/'task-registered' \} else \{ 'task-register-failed' \}\) \$\(if \(\$ok\) \{ 0 \} else \{ 1 \}\)/)];
+PROBES['MF-07'] = [eng(/Write-Terminal 'task-unregistered' \$\(if \(\$LASTEXITCODE -eq 0\) \{ 0 \} else \{ 1 \}\)/)];
+PROBES['MF-08'] = [eng(/Write-Terminal 'via-task-dispatched' 0/)];
+PROBES['MF-09'] = [eng(/Write-Terminal 'recorded' 0/)];
 PROBES['X-10'] = [eng(/Write-Terminal \("rescued-after-abort:" \+ \$fatal\) 0/), eng(/if \(\$script:HostUrl\) \{ \[void\]\(Save-WebAuthUrlRecord/)];
 PROBES['X-11'] = [eng(/Write-Terminal \("aborted:" \+ \$fatal\) 1/)];
 PROBES['X-12'] = [eng(/'task-registered' \} else \{ 'task-register-failed' \}\)/)];
@@ -825,7 +826,7 @@ PROBES['G-15'] = [{ file: ENGINE, inFunction: 'Invoke-RescueLaunch', lacks: /whi
 PROBES['G-16'] = [{ file: ENGINE, inFunction: 'Invoke-RescueLaunch', has: /catch/ }];
 PROBES['G-17'] = [eng(/\$vNm = Join-Path \$vProfile 'node_modules'/)];
 PROBES['G-18'] = [eng(/EPERM\|EACCES\|拒绝访问\|Access is denied\|cannot resolve profile bundle/)];
-PROBES['G-19'] = [{ file: ENGINE, inFunction: 'Stop-DshInstance', has: /taskkill\.exe/g, min: 2 }, { file: ENGINE, inFunction: 'Stop-DshInstance', has: /rc2/ }];
+PROBES['G-19'] = [{ file: ENGINE, inFunction: 'Stop-DshInstance', has: /\(Get-SystemTool 'taskkill'\)/g, min: 2 }, { file: ENGINE, inFunction: 'Stop-DshInstance', has: /rc2/ }];
 PROBES['G-20'] = [{ file: ENGINE, inFunction: 'Test-StopPermission', has: /已消失|\$true/, note: 'a vanished target counts as terminable, not as a permission error' }];
 PROBES['G-21'] = [{ file: ENGINE, note: 'an elevation probe that itself fails degrades to unknown instead of blocking', fn: (ctx) => {
     const text = ctx.text(ENGINE);
@@ -861,7 +862,7 @@ PROBES['V-14'] = [eng(/if \(\$VerifyOnly -or \$Preflight\) \{[\s\S]{0,500}Test-S
 PROBES['V-15'] = [eng(/if \(\$VerifyOnly -or \$Preflight\) \{/, { count: 1 })];
 
 // ------------------------------------------------------------------ §7 port discovery
-PROBES['D-01'] = [eng(/netstat -ano -p TCP/, { count: 3 })];
+PROBES['D-01'] = [eng(/& \(Get-SystemTool 'netstat'\) -ano -p TCP/, { count: 1, note: 'the one authoritative scan' }), eng(/function Get-SystemTool/, { count: 1, note: 'absolute-path resolution lives in one place' })];
 PROBES['D-02'] = [eng(/@\(\$pids \| Sort-Object -Unique\)/)];
 PROBES['D-03'] = [{ file: ENGINE, inFunction: 'Get-HostCandidate', fn: (ctx) => {
     const body = ctx.functionBody(ENGINE, 'Get-HostCandidate');
@@ -924,9 +925,9 @@ PROBES['T-10'] = [{ file: TASK_XML, note: 'the template must stay a placeholder 
     }
 } }];
 PROBES['T-11'] = [eng(/UnicodeEncoding\(\$false, \$true\)/)];
-PROBES['T-12'] = [eng(/schtasks\.exe \/Create \/TN \$TaskName \/XML \$path \/F/)];
+PROBES['T-12'] = [eng(/\(Get-SystemTool 'schtasks'\) \/Create \/TN \$TaskName \/XML \$path \/F/)];
 PROBES['T-13'] = [{ file: ENGINE, inFunction: 'Invoke-ViaTask', has: /\/Run \/TN \$TaskName/ }];
-PROBES['T-14'] = [eng(/schtasks\.exe \/Delete \/TN \$TaskName \/F/)];
+PROBES['T-14'] = [eng(/\(Get-SystemTool 'schtasks'\) \/Delete \/TN \$TaskName \/F/)];
 PROBES['T-15'] = [{ file: ENGINE, inFunction: 'Get-TaskRegistered', has: /\/Query \/TN \$TaskName/ }];
 PROBES['T-16'] = [eng(/if \(\$ViaTask\) \{[\s\S]{0,600}Write-Terminal 'via-task-dispatched' 0/)];
 PROBES['T-17'] = [{ file: INSTALL, has: /dsh-restart-win\.cmd/ }, { file: INSTALL, fn: (ctx) => {
@@ -1036,6 +1037,111 @@ PROBES['U-12'] = [{ file: ENGINE, inFunction: 'Write-Terminal', lacks: /Move-Ite
 PROBES['U-13'] = [eng(/url\s+= "http:\/\/\$\{BindHost\}:\$Port\/"/), eng(/launchUrl\s+= \$stUrl/)];
 PROBES['U-14'] = [eng(/New-Utf8NoBom \(Join-Path \$dir 'pending-notice\.json'\)/)];
 PROBES['U-15'] = [eng(/\[System\.IO\.FileShare\]::ReadWrite/), eng(/Get-AppendedText|Select-String -LiteralPath \$LogPath/)];
+
+// ------------------------------------------------------------------ §14 machine facts / 反硬编码
+// 这一节记录的是「本机实测驱动出来的去硬编码改动」：安装位置不靠猜、系统工具不靠 PATH。
+const REPAIR_SCRIPT = 'scripts/dsh-repair.ps1';
+const CONFIG_SCRIPT = 'scripts/dsh-config.ps1';
+
+// 注意（2026-11-22）：markdown 表里已有的 X-07/X-08/X-09 行（`task-unregistered` 等终态词）
+// 在 test/parity.mjs 里一直没有对应 probe，扫描器把它们报成 9 条「no behavioural probe」。
+// 这里补上矩阵「验证方式」列承诺的那三条断言 —— 缺的那部分照原文补，不借机改语义。
+PROBES['X-01'] = [eng(/Write-Terminal 'restarted-ok' 0/)];
+PROBES['X-02'] = [eng(/Write-Terminal 'status' 0/)];
+PROBES['X-03'] = [eng(/Write-Terminal 'verify-only-ok' 0/)];
+PROBES['X-04'] = [eng(/Write-Terminal 'dry-run' 0/g, { min: 2 })];
+PROBES['X-05'] = [eng(/Write-Terminal 'stopped' 0/g, { min: 2 })];
+PROBES['X-06'] = [eng(/'task-registered' \} else \{ 'task-register-failed' \}\)/)];
+
+PROBES['X-07'] = [eng(/Write-Terminal 'task-unregistered' \$\(if \(\$LASTEXITCODE -eq 0\) \{ 0 \} else \{ 1 \}\)/),
+    eng(/exit \$script:ExitCode/, { note: 'the process exit code must follow the envelope' })];
+PROBES['X-08'] = [eng(/Write-Terminal 'via-task-dispatched' 0/)];
+PROBES['X-09'] = [eng(/Write-Terminal 'recorded' 0/)];
+
+PROBES['MP-01'] = [{
+    note: 'no hardcoded install location: the exe is discovered from registry/shortcuts, never a literal path',
+    fn: (ctx) => {
+        const engine = ctx.text(ENGINE);
+        assert.ok(/function Get-DesktopInstallPaths/.test(engine), 'Get-DesktopInstallPaths is missing');
+        const body = ctx.functionBody(ENGINE, 'Get-DesktopInstallPaths');
+        assert.ok(/Uninstall/.test(body), 'the uninstall registry key is not consulted');
+        assert.ok(/App Paths/.test(body), 'App Paths is not consulted');
+        assert.ok(/\.lnk/.test(body), 'start-menu/desktop shortcuts are not consulted');
+        assert.ok(!/Test-Path -LiteralPath '[A-Za-z]:[\\/]/.test(body), 'a literal drive path is used as a candidate');
+    },
+}];
+
+PROBES['MP-02'] = [{
+    note: 'the machine config file is the first candidate, and its absence is not fatal',
+    fn: (ctx) => {
+        const body = ctx.functionBody(ENGINE, 'Resolve-DesktopAppPath');
+        assert.ok(/Get-MachineConfig/.test(body), 'machine.json is not consulted');
+        assert.ok(body.indexOf('machine-config') < body.indexOf('running-instance'), 'machine.json must win over the running instance');
+        const getter = ctx.functionBody(ENGINE, 'Get-MachineConfig');
+        assert.ok(/return \$null/.test(getter), 'a missing/broken config must degrade, not throw');
+    },
+}];
+
+PROBES['MP-03'] = [{
+    note: 'system tools resolve to absolute paths (a bare name depends on the caller PATH)',
+    fn: (ctx) => {
+        const engine = ctx.text(ENGINE);
+        for (const tool of ['netstat', 'taskkill', 'schtasks', 'robocopy']) {
+            assert.ok(new RegExp(`Get-SystemTool '${tool}'`).test(engine), `${tool} is still invoked by bare name`);
+        }
+        const body = ctx.functionBody(ENGINE, 'Get-SystemTool');
+        assert.ok(/System32/.test(body), 'Get-SystemTool does not prefer System32');
+    },
+}];
+
+PROBES['MP-04'] = [{
+    note: 'the status envelope publishes the installation facts external tools need',
+    fn: (ctx) => {
+        const body = ctx.functionBody(ENGINE, 'Show-Status');
+        for (const key of ['desktopApp', 'desktopAppSource', 'runtimeDir', 'pnpm', 'nodeExe']) {
+            assert.ok(new RegExp(`${key}\\s*=`).test(body), `status.${key} is missing`);
+        }
+    },
+}];
+
+PROBES['MP-05'] = [{
+    note: 'dsh-repair resolves every machine fact through the engine and never hardcodes a path',
+    fn: () => {
+        const text = read(REPAIR_SCRIPT);
+        assert.ok(text !== null, 'scripts/dsh-repair.ps1 is missing');
+        assert.ok(/-Status/.test(text), 'the repair script does not ask the engine for facts');
+        assert.ok(!/[A-Za-z]:\\deepseek/i.test(text), 'the repair script still hardcodes an install location');
+        const resolved = /function Resolve-Engine[\s\S]*?\n}/.exec(text);
+        assert.ok(resolved, 'Resolve-Engine body not found');
+        assert.ok(/\.ps1/.test(resolved[0]), 'Resolve-Engine must resolve the .ps1 engine');
+    },
+}];
+
+PROBES['MP-07'] = [{
+    note: 'the repair script is wired into the development workflow: a read-only notice probe and the documented switch',
+    fn: () => {
+        const probe = read('scripts/probe-notice.ps1');
+        assert.ok(probe !== null, 'scripts/probe-notice.ps1 is missing');
+        assert.ok(/dsh-repair\.ps1/.test(probe), 'the probe still targets the removed plugin-install.ps1');
+        assert.ok(/Write-PendingNoticeSafe/.test(probe), 'the probe does not exercise the notice writer');
+        const zh = read(README_ZH);
+        assert.ok(zh !== null, 'README.zh.md is missing');
+        assert.ok(/dsh-repair\.ps1/.test(zh), 'README.zh.md does not document the repair script');
+        assert.ok(/dsh-config\.ps1/.test(zh), 'README.zh.md does not document the machine-config script');
+        assert.ok(/machine\.json/.test(zh), 'README.zh.md does not document machine.json');
+    },
+}];
+
+PROBES['MP-06'] = [{
+    note: 'dsh-config writes the probe result; the engine reads it back',
+    fn: () => {
+        const text = read(CONFIG_SCRIPT);
+        assert.ok(text !== null, 'scripts/dsh-config.ps1 is missing');
+        assert.ok(/machine\.json/.test(text), 'dsh-config does not write machine.json');
+        assert.ok(/desktopApp/.test(text) && /runtimeDir/.test(text), 'dsh-config does not record the install facts');
+        assert.ok(!/[A-Za-z]:\\deepseek/i.test(text), 'dsh-config hardcodes an install location');
+    },
+}];
 
 // ------------------------------------------------------------------ §13 must change
 PROBES['M-01'] = [{
