@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+﻿#Requires -Version 7.0
 <#
 .SYNOPSIS
   dsh-restart-win 的插件修复通道：装一个插件而不把宿主弄坏。
@@ -171,7 +171,10 @@ function Get-DshFacts {
   }
   # 宿主没在跑时 instances 为空：从 -Status 给出的 desktopApp / 解析到的 exe 推导安装根
   if (-not $facts.appRoot -and $facts.desktopApp) { $facts.appRoot = Split-Path -Path $facts.desktopApp -Parent }
+  # 优先用引擎给的「实际存在的那一个」：官方布局在 resources\runtime 下，解包后的桥把 pnpm
+  # 放到 resources\app\runtime 下，两个都试过再报错（2026-11-22 本机实测：直接拼官方路径会失败）。
   $facts.pnpm = $facts.pnpmFromHost
+  if (-not $facts.pnpm) { $facts.pnpm = [string](Get-Field $rich 'pnpmResolved' '') }
   if (-not $facts.pnpm -and $facts.appRoot) {
     $facts.pnpm = Join-Path $facts.appRoot 'resources\runtime\primary-runtime\dependencies\pnpm\bin\pnpm.mjs'
   }

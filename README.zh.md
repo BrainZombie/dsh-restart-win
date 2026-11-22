@@ -491,10 +491,32 @@ dsh-restart-win -DryRun
 | `desktopApp` | 解析到的 DSH Desktop 可执行文件（桌面版；web 版为空串） |
 | `desktopAppSource` | 这个路径从哪来：`explicit` / `machine-config` / `resolved` / `running-instance` / `boot-record` / `default-location` / `registry/shortcut` |
 | `runtimeDir` / `appRoot` | 运行时代码目录（asar 或解包后的 `resources\app\dsh`）与安装根 |
-| `pnpm` / `nodeExe` | 装插件要用的 pnpm 入口与应用自带的 node |
+| `pnpm` / `nodeExe` | 装插件要用的 pnpm 入口与应用自带的 node（`pnpm` 是按布局算出来的候选路径） |
+| `pnpmResolved` / `cliCmd` | 上面那个候选里**实际存在**的 pnpm.mjs，以及安装自带的 `dsh.cmd`（官方布局在 `resources\runtime` 下，解包后桥把 pnpm 放到 `resources\app\runtime` 下 —— 外部工具直接用这两个字段，不要自己拼） |
 
 引擎里的系统工具（`netstat` / `taskkill` / `schtasks` / `robocopy` / `cmd`）一律经 `Get-SystemTool`
 解析到 `%SystemRoot%\System32`，不依赖调用方 PATH —— 从 git-bash、精简 PATH 的计划任务里调用时行为一致。
+
+`-Json` / `-ResultFile` 的信封里还有一个 `phases` 键，记录这次调用各阶段花了多少毫秒
+（`prepare` / `pre-check` / `host-kind` / `probe:<端口>` / `instances` / `http-probe` / `auth-url` / `total`）。
+它只在机器接口下产生，人读模式零开销；14 个必选字段与层级不变，读不到 `phases` 的旧消费方不受影响。
+
+### 8.1 桌面宿主的多个监听端口，引擎挑了哪一个
+
+DSH Desktop 的宿主是 `--port 0` 起的，起来之后可能同时监听好几个面。本机实测的一次：
+
+| 端口 | 回应 | 是什么 |
+|---|---|---|
+| 3082 | `200` | 宿主给本机开的默认面（就是 `-Status` 的 `http`） |
+| 4173 | `200` | `dsh-browser` 的浏览器调试协议 —— 也是 200，但不是宿主的 HTTP 面 |
+| 48691 | `401` | 宿主自身的面板面（要 token，所以不带 token 就是 401） |
+| 48696 | `404` | 兜底路由还挂着的空壳 |
+
+引擎按 **200 > 401 > 303 > 其他** 的优先级逐个探，命中就停，结果写进 `instances[].probe`
+（每个端口的实测状态、毫秒、阶段）。`401` 排在第二是因为「端口绑好、认证层要 token」同样说明
+服务是活的；`4173` 这种同为 200 的调试面只能靠排位避开，不能靠猜端口号。等新一轮重启时，
+宿主会在随机端口上先回 `404`、隔一秒才变 `401`/`200`，所以只有「端口通了但给了状态码」的候选
+才会在 700ms 后重问一次 —— 连不上的端口不会翻倍等待。
 
 ---
 

@@ -434,6 +434,26 @@ Three things to know:
 2. **`-BindHost` is not part of the launch command.** Which address the host binds is decided by the launch record (`boot-record.json`) or the default launch plan; `-BindHost` only affects the probe URL and the status display. To change the listen address, change the launch record, not this setting.
 3. **`-DoNotTouchDshHome` is a dead parameter.** It is declared, accepted, and no branch consumes it, so it behaves as a no-op. It stays for command-line compatibility.
 
+With `-Json` / `-ResultFile` the envelope also carries a `phases` key with the milliseconds spent in
+each stage (`prepare`, `pre-check`, `host-kind`, `probe:<port>`, `instances`, `http-probe`, `auth-url`,
+`total`). It is only produced on the machine interface, costs nothing in human mode, and the fourteen
+required envelope fields and their levels are unchanged.
+
+### 8.1 When a desktop host listens on several ports, which one is picked
+
+The DSH Desktop host starts with `--port 0`, so it may end up listening on several faces at once. One
+measured example: `3082` → `200` (the default face, this is `-Status`'s `http`), `4173` → `200`
+(`dsh-browser`'s debugging protocol — also a 200, but not the host's HTTP face), `48691` → `401`
+(the token-gated panel face), `48696` → `404` (a fallback route with nothing behind it yet).
+
+The engine probes them in the order **200 > 401 > 303 > anything else**, stops at the first hit, and
+records every attempt in `instances[].probe` (status, milliseconds, stage). `401` ranks second because
+"port bound, auth layer asking for a token" also means the service is alive; a debugging face that also
+answers 200 can only be avoided by rank, never by guessing the port number. Right after a restart the
+host answers `404` on its random port for about a second before flipping to `401`/`200`, so a candidate
+that answered with a status code is asked once more 700 ms later — a port that refuses connections is
+never waited on twice.
+
 ---
 
 ## 9. Exit codes and terminal words

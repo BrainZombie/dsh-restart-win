@@ -203,6 +203,25 @@ $script:ErrorText     = $null
 $script:StartedAt     = Get-Date
 $script:ResultWritten = $false
 $script:Extra         = [ordered]@{}
+# 分阶段耗时：一次 -Status 里「解析参数/找宿主/探端口/拼信封」各占多少，出问题时不用再猜。
+# 记在 $script:Phases 里，由 -Json 信封的 phases 字段输出；读宿主的工具（脚本/repair）不必关心。
+$script:Phases        = [ordered]@{}
+function Add-Phase([string]$Name_) {
+  # 打点：每次记下「距上一个打点」的毫秒数。第一次调用只设基准（不记数）。
+  if (-not $script:PhasesOn) { return }
+  if (-not $script:PhaseT0) { $script:PhaseT0 = $script:StartedAt; return }
+  $now = Get-Date
+  $script:Phases[$Name_] = [int](($now - $script:PhaseT0).TotalMilliseconds)
+  $script:PhaseT0 = $now
+}
+$script:PhaseT0 = $null
+# 分阶段打点是否启用：只在 -Json / -ResultFile（机器接口）时记，人读模式不增加任何开销。
+$script:PhasesOn = [bool]($Json -or $ResultFile)
+# 进程内复用：一次调用里 netstat 与「全量进程表」各只需要一份（时间戳为 $null = 尚未取过）
+$script:NetstatRows = @()
+$script:NetstatStamp = $null
+$script:ProcIndex = $null
+$script:ProcStamp = $null
 $script:LogPath       = Join-Path $StateDir 'dsh-restart.log'
 
 # 宿主形态（desktop 分支的全部状态都在这里；web 分支不读这些变量）
@@ -320,6 +339,13 @@ function Get-ResultEnvelope {
     durationMs = [int]((Get-Date) - $script:StartedAt).TotalMilliseconds
     stateDir   = [string]$StateDir
     logPath    = [string]$script:LogPath
+    # 分阶段耗时（毫秒，距上一个打点）：机器接口里唯一新增的诊断字段。
+    # 消费方仍按 14 个必选字段解析，多出来的键不影响既有契约。
+    phases     = [ordered]@{}
+  }
+  if ($script:PhasesOn) {
+    $payload['phases']['total'] = [int]((Get-Date) - $script:StartedAt).TotalMilliseconds
+    foreach ($k in @($script:Phases.Keys)) { $payload['phases'][$k] = [int]$script:Phases[$k] }
   }
   foreach ($k in @($script:Extra.Keys)) { $payload[$k] = $script:Extra[$k] }
   return $payload
@@ -1059,21 +1085,19 @@ function Wait-NewHostToken([string]$LogPath, [int]$MaxWaitMs = 20000) {
 # ---------------------------------------------------------------- 环境探测
 
 function Test-PortListening([int]$p) {
-  # netstat 是权威（本机 Get-NetTCPConnection 在沙箱下不可靠）
-  $rows = netstat -ano -p TCP 2>$null | Select-String "LISTENING" | Select-String ":$p\s"
-  return [bool]$rows
+  # netstat 是权威（本机 Get-NetTCPConnection 在沙箱下不可靠）。
+  # 解析统一走 Get-NetstatListenerRows —— 全脚本只有那一处调 netstat，且 3s 内在不同调用点之间复用。
+  foreach ($row in @(Get-NetstatListenerRows)) { if ([int]$row.port -eq $p) { return $true } }
+  return $false
 }
 
 function Get-PortOwner([int]$p) {
-  $rows = netstat -ano -p TCP 2>$null | Select-String "LISTENING" | Select-String ":$p\s"
   $pids = @()
-  foreach ($r in $rows) {
+  foreach ($row in @(Get-NetstatListenerRows)) {
     # 【严格模式 2.0 陷阱 · 2026-09-12 真实事故】管道只产出一项时结果是**标量**，
-    # 标量没有 .Count（非严格模式下 PowerShell 才会给标量补 Count=1）→ 必须 @() 包成数组。
+    # 标量没有 .Count（非严格模式才会给标量补 Count=1）→ 这里一律 @() 包成数组。
     # 该次中止就发生在本行：restart-history.jsonl 18:15:03 aborted: 在此对象上找不到属性 Count
-    if (-not $r -or -not $r.Line) { continue }
-    $t = @(($r.Line -split '\s+') | Where-Object { $_ -ne '' })
-    if ($t.Count -ge 5) { $pids += [int]$t[-1] }
+    if ([int]$row.port -eq $p) { $pids += [int]$row.pid }
   }
   # 恒返回数组：单元素时 Sort-Object 会解包成标量，调用方忘了 @() 就会踩同一个坑
   return @($pids | Sort-Object -Unique)
@@ -1148,6 +1172,67 @@ function Get-HttpStatusCode([string]$Url, [int]$TimeoutSec = 6) {
   }
 }
 
+function Invoke-HttpProbe {
+  <#
+    带毫秒预算的单次 GET，只回答三件事：连上了吗、HTTP 状态码是多少、花了多久。
+    它**不**区分 200 和 401 —— 后者属于认证策略，调用方自己判断语义。
+
+    两处硬性约束（都是本机实测出来的）：
+      ① 必须能单独限制 DNS + 连接的时间。3082 端口实测整请求要 ~1.6-2s，用 HttpClient 的
+         Timeout 直接砍在 1.5s 会把一个活着的 200 探成 0（假阴性，切端口时踩过一次）。
+         所以先 TcpClient.ConnectAsync + Wait，连不上就到此为止，连上之后一律给足 5s；
+      ② 必须不走系统代理。宿主的 HTTP 面是本机回环，走 Clash 的 127.0.0.1:7897 只会绕远
+         而且会让并发探针互相排队 —— HttpWebRequest 显式 Proxy=$null；
+      ③ 一个端口最多问两次。实测宿主在启动早期会「先 404、稍后才 401」，而桌面宿主的
+         401 面第一次请求常要 1-4s（TLS 之外还有认证中间件冷启动）。等 700ms 再问一次能把
+         这种「读时机」的假阴性压掉，代价最多 700ms，而不是把整个请求超时翻倍。
+  #>
+  param([int]$Port, [string]$Host_ = $BindHost, [int]$ConnectTimeoutMs = 1500, [int]$RequestTimeoutMs = 5000)
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $tcp = New-Object System.Net.Sockets.TcpClient
+  try {
+    $iar = $tcp.BeginConnect($Host_, $Port, $null, $null)
+    if (-not $iar.AsyncWaitHandle.WaitOne([Math]::Max(200, $ConnectTimeoutMs))) {
+      $sw.Stop()
+      return [pscustomobject]@{ status = 0; code = 0; ms = [int]$sw.ElapsedMilliseconds; stage = 'connect-timeout' }
+    }
+    $tcp.EndConnect($iar)
+  } catch {
+    $sw.Stop()
+    return [pscustomobject]@{ status = 0; code = 0; ms = [int]$sw.ElapsedMilliseconds; stage = 'connect-failed' }
+  } finally {
+    try { $tcp.Close() } catch { }
+  }
+  $url = "http://${Host_}:$Port/"
+  $code = 0
+  $req = $null
+  try {
+    $req = [System.Net.HttpWebRequest]::Create($url)
+    $req.Method = 'GET'
+    $req.AllowAutoRedirect = $false
+    $req.Timeout = [Math]::Max(500, $RequestTimeoutMs)
+    $req.ReadWriteTimeout = [Math]::Max(500, $RequestTimeoutMs)
+    $req.Proxy = $null
+    $req.KeepAlive = $false
+    try {
+      $resp = $req.GetResponse()
+      try { $code = [int]$resp.StatusCode } finally { $resp.Close() }
+    } catch [System.Net.WebException] {
+      $errResp = $_.Exception.Response
+      if ($errResp) { $code = [int]$errResp.StatusCode } else { $code = 0 }
+    } catch { $code = 0 }
+  } catch {
+    $code = 0
+  }
+  $sw.Stop()
+  return [pscustomobject]@{
+    status = $code
+    code   = $code
+    ms     = [int]$sw.ElapsedMilliseconds
+    stage  = 'http'
+  }
+}
+
 function Test-HttpServing([string]$Url) {
   <#
     就绪判据（本机源码级实测）：
@@ -1213,8 +1298,9 @@ function Get-HostCandidate {
 }
 
 function Get-DshInstances {
-  # 全量实例视图（恒为数组）
-  if ($script:HostKind -eq 'desktop') { return @(Get-DesktopInstances) }
+  # 全量实例视图（恒为数组）。-Refresh 只对 desktop 分支有意义（web 分支本来就按端口现查）。
+  param([switch]$Refresh)
+  if ($script:HostKind -eq 'desktop') { return @(Get-DesktopInstances -Refresh:$Refresh) }
   return @(Get-HostCandidate)
 }
 
@@ -2183,11 +2269,13 @@ function Show-Status {
     if ($line) { try { $last = $line | ConvertFrom-Json } catch { } }
   }
   $probe = Test-HttpServing "http://${BindHost}:$Port/"
+  Add-Phase 'http-probe'
   # 访问地址优先读持久文件（url 步/上次 -Status 落盘），并校验 pid 与 token 是否属于当前实例：
   # 旧 boot 的地址一律不展示，宁可明确说「未知/过期」。
   $currentHostPids = @()
   foreach ($inst in $instances) { $currentHostPids += [int]$inst.pid }
   $auth = Resolve-WebAuthUrl $currentHostPids
+  Add-Phase 'auth-url'
   $script:HostUrl = $auth.Url
   $stUrl = $script:HostUrl
   # 注意：`$x = if (...) { @() } else { @() }` 里的**空数组会被解包成 $null**，
@@ -2220,6 +2308,10 @@ function Show-Status {
       runtimeDir = $(if ($desktopApp) { (Get-DesktopPaths $desktopApp).runtimeDir } else { '' })
       appRoot    = $(if ($desktopApp) { (Get-DesktopPaths $desktopApp).appRoot } else { '' })
       pnpm       = $(if ($desktopApp) { (Get-DesktopPaths $desktopApp).pnpm } else { '' })
+      # 实际存在的那个 pnpm.mjs：官方布局在 resources\runtime 下，解包后桥把 pnpm 放在
+      # resources\app\runtime 下 —— 两种都验一遍再报，外部工具直接用，不必自己拼分支。
+      pnpmResolved = $(if ($desktopApp) { $dp = Get-DesktopPaths $desktopApp; Resolve-FirstPath @($dp.pnpm, $dp.pnpmFallback) } else { '' })
+      cliCmd     = $(if ($desktopApp) { $dp2 = Get-DesktopPaths $desktopApp; Resolve-FirstPath @($dp2.cliCmd, $dp2.cliCmdFallback) } else { '' })
       nodeExe    = $(if ($script:HostKind -eq 'desktop') { (Get-DesktopNodeExe) } else { '' })
       configuredPort = [int]$script:ConfiguredPort
       resolvedPort   = [int]$Port
@@ -2305,7 +2397,7 @@ function Invoke-RescueLaunch([string]$Cause) {
   #>
   try {
     if ($script:HostKind -eq 'desktop') {
-      $live = @(Get-DesktopInstances)
+      $live = @(Get-DesktopInstances -Refresh)
       if ($live.Count -gt 0) {
         Add-Step 'rescue' "中止发生在停机之后，但机器上已有 DSH Desktop 宿主（main pid=$($live[0].mainPid) 端口=$($live[0].port)）→ 不再重复拉起" 'warn'
         return $true
@@ -2547,21 +2639,71 @@ function Get-SystemTool([string]$Name) {
   return ($Name + '.exe')
 }
 
-function Get-ListeningPorts([int]$Pid_) {
-  # 反查某个 pid 的 LISTENING 端口（netstat 是权威；Get-NetTCPConnection 在沙箱下不可靠）
-  $out = New-Object System.Collections.ArrayList
+function Get-NetstatListenerRows {
+  <#
+    一次 netstat 扫描，解析成 @{ port; pid; host } 行。整个进程只该在这里调 netstat：
+    以前 Get-ListeningPorts 每调一次就重扫整张表，一次 -Status 里要扫两三遍，
+    本机实测单次 ~200ms（408 行），端口候选一多，耗时全落在「等 netstat」上。
+    解析只看本地地址段的最后一个冒号，IPv6 的 [::]:port 同样成立。
+    进程内缓存 $MaxAgeMs（默认 3s）：一次 -Status 里 discovery / 探测 / 复检各要一份端口表，
+    原来每一处都重扫一遍，三次 netstat 就是三个 ~200ms。缓存过期或被显式 -Refresh 踩掉才重扫。
+  #>
+  param([int]$MaxAgeMs = 3000, [switch]$Refresh)
+  if (-not $Refresh -and $null -ne $script:NetstatRows -and @($script:NetstatRows).Count -ge 0 -and $script:NetstatStamp) {
+    if (((Get-Date) - $script:NetstatStamp).TotalMilliseconds -lt $MaxAgeMs) { return @($script:NetstatRows) }
+  }
+  $rows = New-Object System.Collections.ArrayList
   foreach ($r in @(& (Get-SystemTool 'netstat') -ano -p TCP 2>$null | Select-String 'LISTENING')) {
     if (-not $r -or -not $r.Line) { continue }
     $t = @((([string]$r.Line) -split '\s+') | Where-Object { $_ -ne '' })
     if ($t.Count -lt 5) { continue }
-    if ([int]$t[-1] -ne $Pid_) { continue }
     $local = [string]$t[1]
     $idx = $local.LastIndexOf(':')
     if ($idx -lt 1) { continue }
     $p = 0
-    if ([int]::TryParse($local.Substring($idx + 1), [ref]$p)) { [void]$out.Add($p) }
+    if (-not [int]::TryParse($local.Substring($idx + 1), [ref]$p)) { continue }
+    $owner = 0
+    if (-not [int]::TryParse([string]$t[-1], [ref]$owner)) { continue }
+    [void]$rows.Add([pscustomobject]@{
+      port = $p
+      pid  = $owner
+      host = $local.Substring(0, $idx)
+    })
+  }
+  $script:NetstatRows = @($rows.ToArray())
+  $script:NetstatStamp = Get-Date
+  return $script:NetstatRows
+}
+
+function Get-ListeningPorts([int]$Pid_, $Rows = $null) {
+  # 反查某个 pid 的 LISTENING 端口（netstat 是权威；Get-NetTCPConnection 在沙箱下不可靠）。
+  # $Rows 可传入 Get-NetstatListenerRows 的结果，避免在循环里反复扫描同一张表。
+  if ($null -eq $Rows) { $Rows = Get-NetstatListenerRows }
+  $out = New-Object System.Collections.ArrayList
+  foreach ($row in @($Rows)) {
+    if ([int]$row.pid -ne $Pid_) { continue }
+    [void]$out.Add([int]$row.port)
   }
   return @($out | Sort-Object -Unique)
+}
+
+function Get-ProcessIndex {
+  <#
+    一次 CIM 全表（~135ms）换成按 pid 查的字典。以前每个候选宿主都要单独
+    Get-CimInstance -Filter "ProcessId=…"（有的路径一轮查好几个），加起来就是秒级。
+    与端口表一样做进程内缓存（默认 3s），-Refresh 强制重取。
+  #>
+  param([int]$MaxAgeMs = 3000, [switch]$Refresh)
+  if (-not $Refresh -and $null -ne $script:ProcIndex -and $script:ProcStamp) {
+    if (((Get-Date) - $script:ProcStamp).TotalMilliseconds -lt $MaxAgeMs) { return $script:ProcIndex }
+  }
+  $map = @{}
+  foreach ($pr in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+    $map[[int]$pr.ProcessId] = $pr
+  }
+  $script:ProcIndex = $map
+  $script:ProcStamp = Get-Date
+  return $map
 }
 
 function Get-DesktopHostProcesses {
@@ -2609,8 +2751,24 @@ function Get-DesktopPaths([string]$MainPath) {
     layout         = $(if (Test-Path -LiteralPath $asar -PathType Leaf) { 'asar' } elseif (Test-Path -LiteralPath $unpacked -PathType Container) { 'unpacked' } else { 'unknown' })
     primaryRuntime = (Join-Path $appRoot 'resources\runtime\primary-runtime')
     pnpm           = (Join-Path $appRoot 'resources\runtime\primary-runtime\dependencies\pnpm\bin\pnpm.mjs')
+    pnpmFallback   = (Join-Path $appRoot 'resources\app\runtime\primary-runtime\dependencies\pnpm\bin\pnpm.mjs')
     nodeBin        = (Join-Path $appRoot 'resources\runtime\bin')
+    # 安装自带的 CLI 入口（解包布局下是 dsh-builtin-browser 的桥）。
+    # 为什么要有：解包之后官方自己的 `dsh plugin install` 会在多出来的 app\ 段上找 pnpm
+    # （resources\app\runtime\...\pnpm.mjs 不存在），装插件直接失败。走这个入口能把
+    # DSH_APP / ELECTRON_RUN_AS_NODE 交给 App 自己决定，是唯一不靠猜的绕法。
+    cliCmd         = (Join-Path $appRoot 'resources\runtime\cli\bin\dsh.cmd')
+    cliCmdFallback = (Join-Path $appRoot 'resources\cli\bin\dsh.cmd')
   }
+}
+
+function Resolve-FirstPath([string[]]$Candidates) {
+  # 返回第一个存在的候选路径；一个都没有时返回 $null（调用方自己决定怎么报错）
+  foreach ($c in @($Candidates)) {
+    if (-not $c) { continue }
+    if (Test-Path -LiteralPath $c) { return [string]$c }
+  }
+  return $null
 }
 
 function Get-DesktopNodeExe {
@@ -2641,8 +2799,63 @@ function Test-DesktopRuntime($Paths) {
   return $false
 }
 
-function Get-DesktopInstances {
+function Resolve-HostPort {
   <#
+    从某个 pid 的监听端口里挑出「这个宿主自己那根 HTTP 面」。返回 @{ port; status; order; probed }。
+    为什么不能「第一个回应的就是」：本机实测一个桌面宿主同时监听 4 个端口 ——
+      3082 = dsh web 面（200）、4173 = dsh-browser 的 CDP（也是 200，但它是浏览器调试协议）、
+      48xxx = 宿主自身的面板端口（401）、48xxx+5 = 兜底路由（404）。
+    旧逻辑按 netstat 顺序无脑逐个 GET，全部按 6s 超时，一次 -Status 要白等十几秒；
+    而且「第一个回应」会挑到 4173 —— 端口是随机的，那个顺序并不稳定。
+
+    判据（按优先级，全部来自实测）：
+      1. 200 是默认面：不带 token 直接 200 的，就是宿主给本机打开的那一面；
+      2. 401 说明端口已绑、认证层在要 token（隔离宿主里常见）——路由是挂上的，只是要先认证；
+      3. 303 是 token 重定向：带 token 的访问地址过这一面，同样是活的服务；
+      4. 404 / 连不上只能兜底，且明确不算「就绪」（404 = 端口绑了但路由还没挂完）。
+    同分时按 netstat 顺序，保持既有行为可预测。
+  #>
+  param([int[]]$Ports = @(), [string]$Host_ = $BindHost, [int]$ConnectTimeoutMs = 1500)
+  $order = New-Object System.Collections.ArrayList
+  $all = @($Ports | Where-Object { $_ -gt 0 })
+  if ($all.Count -eq 0) { return [pscustomobject]@{ port = 0; status = 0; order = @(); probed = 0 } }
+  $best = $null; $bestRank = 99; $bestStatus = 0; $fallback = $null
+  $probed = 0
+  foreach ($p in @($all | Sort-Object)) {
+    Add-Phase ("probe:" + $p)
+    $s = Invoke-HttpProbe -Port $p -Host_ $Host_ -ConnectTimeoutMs $ConnectTimeoutMs
+    $probed++
+    [void]$order.Add([pscustomobject]@{ port = $p; status = $s.status; ms = $s.ms; stage = $s.stage })
+    # 200 是宿主给本机开的默认面；401 是认证层在要 token —— 两者都说明「端口绑了、路由挂上了」。
+    # 顺序固定为 200 > 401 > 303 > 其他：主面偶尔读慢（实测先 404、隔一秒 401），若把 401 排末位，
+    # 那个稳定回 404 的兜底端口就会胜出，-Status 于是报一个并不存在的「就绪」面。
+    # 4173 那种浏览器调试端口也是 200，只能靠「排在后面」避开，不能靠猜端口号。
+    $rank = switch ($s.status) { 200 { 0 } 401 { 1 } 303 { 2 } default { 99 } }
+    # 只在「端口通了但给了状态码」时重问；连不上 / 连接超时不重问（那是在给一台死端口翻倍等待）
+    if ($rank -eq 99 -and $s.stage -eq 'http' -and $s.status -gt 0) {
+      # 端口是通的、只是「这一眼」还没挂上路由：等一下再问一次（宿主启动早期就是这个形状）
+      Start-Sleep -Milliseconds 700
+      $again = Invoke-HttpProbe -Port $p -Host_ $Host_ -ConnectTimeoutMs $ConnectTimeoutMs
+      $probed++
+      [void]$order.Add([pscustomobject]@{ port = $p; status = $again.status; ms = $again.ms; stage = $again.stage; retry = $true })
+      $s = $again
+      $rank = switch ($s.status) { 200 { 0 } 401 { 1 } 303 { 2 } default { 99 } }
+    }
+    if ($rank -lt $bestRank) { $bestRank = $rank; $best = $p; $bestStatus = $s.status }
+    if (-not $fallback -and $s.status -ne 0) { $fallback = $p }
+  }
+  if ($bestRank -lt 99) {
+    return [pscustomobject]@{ port = [int]$best; status = $bestStatus; order = @($order.ToArray()); probed = $probed }
+  }
+  $pick = $fallback
+  $status = 0
+  if ($pick) { $status = @($order.ToArray() | Where-Object { $_.port -eq $pick })[0].status }
+  return [pscustomobject]@{ port = [int]$pick; status = $status; order = @($order.ToArray()); probed = $probed }
+}
+
+function Get-DesktopInstances {
+  # 参数：-Refresh 强制重扫端口表与进程表（等待循环里用，每轮宿主集会变）。
+  param([switch]$Refresh)  <#
     桌面版实例 = 宿主子进程 + 它的 Electron 主进程 + 实测监听端口。
     身份四要素（缺一不可，防误杀）：
       a) 进程名 DeepSeek Harness.exe 且命令行含 dsh-desktop-host\lib\index.js；
@@ -2651,9 +2864,15 @@ function Get-DesktopInstances {
       d) 宿主命令行里包含由 (b) 推导出的 runtimeDir。
     端口：netstat 反查宿主 pid 的 LISTENING 端口，逐个 GET /，取 401/200 的那个。
   #>
+  Add-Phase 'host-kind'
   $list = New-Object System.Collections.ArrayList
+  # 一次 netstat + 一次 CIM 全表：以前每个候选都要重扫一遍端口表、每个父进程都要单独查一次
+  # Get-CimInstance（~135ms 一次），候选一多就变成秒级。
+  $rows = Get-NetstatListenerRows -Refresh:$Refresh
+  $procMap = Get-ProcessIndex -Refresh:$Refresh
   foreach ($h in @(Get-DesktopHostProcesses)) {
-    $main = Get-CimInstance Win32_Process -Filter "ProcessId=$($h.mainPid)" -ErrorAction SilentlyContinue
+    if (-not $procMap.ContainsKey([int]$h.mainPid)) { continue }
+  $main = $procMap[[int]$h.mainPid]
     if (-not $main) { continue }
     $mainPath = [string]$main.ExecutablePath
     if (-not $mainPath) { continue }
@@ -2663,19 +2882,15 @@ function Get-DesktopInstances {
     if ($h.commandLine -notlike ('*' + $paths.runtimeDir + '*')) { continue }
     $profileName = ''
     if ($h.commandLine -match '[\\/]profiles[\\/]([A-Za-z0-9][A-Za-z0-9._-]{0,63})') { $profileName = $Matches[1] }
-    $ports = @(Get-ListeningPorts $h.pid)
-    $chosen = 0
-    $httpStatus = 0
-    foreach ($p in $ports) {
-      $s = Test-HttpServing ("http://${BindHost}:$p/")
-      if ($s.ready) { $chosen = $p; $httpStatus = $s.status; break }
-    }
+    $ports = @(Get-ListeningPorts $h.pid $rows)
+    $pick = Resolve-HostPort $ports
     $proc = Get-Process -Id $h.pid -ErrorAction SilentlyContinue
     [void]$list.Add([pscustomobject]@{
       pid            = $h.pid
       name           = 'DeepSeek Harness'
-      port           = $chosen
+      port           = $pick.port
       ports          = @($ports)
+      probe          = $pick.order
       isNode         = $true
       kind           = 'desktop-host'
       mainPid        = $h.mainPid
@@ -2689,13 +2904,14 @@ function Get-DesktopInstances {
       primaryRuntime = $paths.primaryRuntime
       pnpm           = $paths.pnpm
       nodeBin        = $paths.nodeBin
-      http           = $httpStatus
+      http           = $pick.status
       start          = $(try { $proc.StartTime.ToString('o') } catch { '' })
       ws_mb          = $(if ($proc) { [math]::Round($proc.WorkingSet64 / 1MB, 1) } else { 0 })
       handles        = $(try { $proc.HandleCount } catch { -1 })
       source         = 'desktop-host'
     })
   }
+  Add-Phase 'instances'
   return @($list.ToArray())
 }
 
@@ -2957,9 +3173,13 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec) {
   if ($script:Desktop) { $oldHostPid = [int]$script:Desktop.pid }
   $deadline = (Get-Date).AddSeconds($MaxSec)
   $lastPorts = @()
+  # 端口表每轮只扫一次，交给本轮所有宿主候选复用（每次 netstat 实测 ~200ms，循环里每 700ms 一轮）
+  $script:NetstatRows = @()
+  $nextScan = (Get-Date).AddYears(-1)
   while ((Get-Date) -lt $deadline) {
+    if ((Get-Date) -ge $nextScan) { $script:NetstatRows = Get-NetstatListenerRows -Refresh; $nextScan = (Get-Date).AddSeconds(2) }
     if (-not (Get-Process -Id $MainPid_ -ErrorAction SilentlyContinue)) {
-      $live = @(Get-DesktopInstances)
+      $live = @(Get-DesktopInstances -Refresh)
       if ($live.Count -gt 0) {
         Add-Step 'ready' "新进程已退出，但机器上已有 DSH Desktop 宿主（main pid=$($live[0].mainPid)）→ 单实例锁把启动转成了聚焦旧窗口" 'fail'
         return [pscustomobject]@{ ok = $false; reason = 'desktop-single-instance' }
@@ -2971,17 +3191,15 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec) {
     foreach ($h in @(Get-DesktopHostProcesses)) {
       if ($h.mainPid -ne $MainPid_) { continue }
       if ($oldHostPid -gt 0 -and $h.pid -eq $oldHostPid) { continue }
-      $ports = @(Get-ListeningPorts $h.pid)
+      $ports = @(Get-ListeningPorts $h.pid $script:NetstatRows)
       if ($ports.Count -gt 0) { $lastPorts = $ports }
-      foreach ($p in $ports) {
-        $s = Test-HttpServing ("http://${BindHost}:$p/")
-        if ($s.ready) {
-          $script:NewPid = $h.pid
-          $script:NewMainPid = $MainPid_
-          $script:Port = $p
-          Add-Step 'ready' "新宿主 pid=$($h.pid)（父 pid=$MainPid_）端口 $p HTTP=$($s.status)" 'ok'
-          return [pscustomobject]@{ ok = $true; http = $s.status; authed = $s.authed; pid = $h.pid; mainPid = $MainPid_; port = $p }
-        }
+      $pick = Resolve-HostPort $ports
+      if ($pick.port -gt 0 -and ($pick.status -eq 401 -or $pick.status -eq 200)) {
+        $script:NewPid = $h.pid
+        $script:NewMainPid = $MainPid_
+        $script:Port = $pick.port
+        Add-Step 'ready' "新宿主 pid=$($h.pid)（父 pid=$MainPid_）端口 $($pick.port) HTTP=$($pick.status)（本次探测 $($pick.probed) 个端口）" 'ok'
+        return [pscustomobject]@{ ok = $true; http = $pick.status; authed = ($pick.status -eq 200); pid = $h.pid; mainPid = $MainPid_; port = $pick.port }
       }
     }
     Start-Sleep -Milliseconds 700
@@ -3107,7 +3325,10 @@ function Test-DesktopVerify {
     $lastHttp = 0
     $fatal = ''
     $lastScan = Get-Date
+    $script:NetstatRows = @()
+    $nextNetstat = (Get-Date).AddYears(-1)
     while ((Get-Date) -lt $deadline) {
+      if ((Get-Date) -ge $nextNetstat) { $script:NetstatRows = Get-NetstatListenerRows -Refresh; $nextNetstat = (Get-Date).AddSeconds(2) }
       if ($p.HasExited) { break }
       # 启动期致命错误要立刻收手：某些插件在隔离宿主里会挂住（例如 tailscale 入口冲突反复重试），
       # 干等预算只会让一次 -Preflight/重启看起来像卡死。
@@ -3123,14 +3344,14 @@ function Test-DesktopVerify {
         } catch { }
         if ($fatal) { break }
       }
-      $ports = @(Get-ListeningPorts $p.Id)
-      foreach ($port in $ports) {
-        $s = Test-HttpServing ("http://${BindHost}:$port/")
-        $lastHttp = $s.status
-        if ($s.ready) {
-          $vPort = $port
-          Add-Step 'deep-verify' ("桌面宿主隔离实例 $port 就绪 HTTP=$($s.status)（Electron Node 模式 + 临时 home）") 'ok'
-          return [pscustomobject]@{ ok = $true; port = $port; http = $s.status; logdir = $v }
+      $ports = @(Get-ListeningPorts $p.Id $script:NetstatRows)
+      if ($ports.Count -gt 0) {
+        $pick = Resolve-HostPort $ports
+        $lastHttp = $pick.status
+        if ($pick.port -gt 0 -and ($pick.status -eq 401 -or $pick.status -eq 200)) {
+          $vPort = $pick.port
+          Add-Step 'deep-verify' ("桌面宿主隔离实例 $($pick.port) 就绪 HTTP=$($pick.status)（Electron Node 模式 + 临时 home，探测 $($pick.probed) 个端口）") 'ok'
+          return [pscustomobject]@{ ok = $true; port = $pick.port; http = $pick.status; logdir = $v }
         }
       }
       Start-Sleep -Milliseconds 800
@@ -3182,6 +3403,7 @@ try {
     } catch { }
   }
 
+  Add-Phase 'prepare'
   # ---- 0. 分离执行支撑的入参（新增参数：只影响入参校验，不改任何既有退出码语义）
   #   -ResultFile 必须先证明写得进去再动手：否则一次重启成功后却拿不到结果文件，消费方
   #   只能靠超时判失败。写不进去属于「入参不可用」，按既有 invalid-args 语义退出 2。
@@ -3218,7 +3440,9 @@ try {
   }
 
   # ---- 0-host. 宿主形态（auto → web/desktop）：必须在取锁之前，互斥体名字依赖它
+  Add-Phase 'pre-check'
   Resolve-HostKind
+  Add-Phase 'host-kind'
   Add-Step 'host-kind' $(if ($script:HostKind -eq 'desktop') { 'desktop：DSH Desktop（Electron 主进程 + dsh-desktop-host 子进程，端口实测）' } else { 'web：dsh web 进程（按端口发现）' }) 'ok'
   Resolve-DesktopProfileName
 
