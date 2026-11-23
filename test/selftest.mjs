@@ -1947,6 +1947,36 @@ if (PLATFORM !== 'win32') {
 }
 
 // --------------------------------------------------------------------------
+// Engine contract: the things a restart-time probe must NOT assume
+// --------------------------------------------------------------------------
+
+test('Show-Status never calls the interactive port probe (Test-HttpServing)', () => {
+    /**
+     * 2026-11-24 事故形状：-Status 对 web 形态直接调 Test-HttpServing，那是一个
+     * Invoke-WebRequest 循环（带 6s 超时、多次重试）。宿主刚重启、端口已 LISTENING 但
+     * 还没应答时，一次 -Status 就卡住整轮（面板与工具一起变慢），而且拿到的只是
+     * 「暂时没应答」，不是「不服务」。只读动作一律走非交互探测：netstat 判 LISTENING、
+     * 单次短超时取状态码，拿不到就如实报 0。
+     */
+    const source = readFileSync(join(fileURLToPath(new URL('..', import.meta.url)), 'scripts', 'dsh-restart.ps1'), 'utf8');
+    const start = source.indexOf('function Show-Status');
+    assert.ok(start > 0, 'Show-Status must exist in the engine');
+    const end = source.indexOf('\nfunction ', start + 10);
+    const body = source.slice(start, end === -1 ? source.length : end);
+    assert.ok(body.length > 500, 'Show-Status body must be extracted, not empty');
+    // 注释里提到这个名字是许可的（说明为什么不用它）；只有**调用**才是违规。
+    const calls = body
+        .split('\n')
+        .filter((line) => !/^\s*#/.test(line))
+        .join('\n');
+    assert.equal(
+        /\bTest-HttpServing\b/.test(calls),
+        false,
+        'Show-Status must stay non-interactive: no Test-HttpServing call (it retries and blocks)',
+    );
+});
+
+// --------------------------------------------------------------------------
 // Syntax check
 // --------------------------------------------------------------------------
 

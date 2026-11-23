@@ -1121,9 +1121,21 @@ function Save-WebAuthUrlRecord([string]$Url, [int]$Pid_, [string]$Source) {
   return $rec
 }
 
+function Read-WebAuthUrlForPid([int]$Pid_) {
+  <#
+    读 `web-auth-url.txt` 里**属于指定 pid** 的地址；pid 对不上就返回 $null。
+    用途：桌面宿主的 boot token 行不保证出现在被重定向的 stdout 上（它把地址写进
+    自己的 `web-auth-url.txt` 才是可靠事实）。这里只做 pid 相等的严格匹配 ——
+    旧实例留下的文件绝不能被当成本次新实例的地址。
+  #>
+  if (-not $Pid_) { return $null }
+  $rec = Read-WebAuthUrlRecord
+  if ($rec -and [int]$rec.Pid -eq $Pid_ -and $rec.Url) { return [string]$rec.Url }
+  return $null
+}
+
 function Test-WebAuthUrl([string]$Url, [int]$Port_ = 0) {
   <#
-    token 是否被**当前运行实例**接受：带 token 请求根路径。
     本机实测：有效 token → 303（重定向到应用页）；缺失/伪造 token → 401。
     2xx/3xx = 有效；401/403 = 无效；0/404（进程未就绪/路由未注册） = 尚未证明。
     走 Get-HttpStatusCodeDetail（原始 TCP）：以前走 .NET 请求栈，一次校验 0.2-2s，
@@ -2627,7 +2639,10 @@ function Show-Status {
       authed  = ($iHttp -eq 200)
     }
   } else {
-    $probe = Test-HttpServing "http://${BindHost}:$Port/"
+    # 只读动作走非交互探针：Test-HttpServing 走 .NET 请求栈并可能重试，宿主刚绑端口
+    # 还没应答时会把一次 -Status 拖成数秒（面板每几秒轮询一次，直接叠成卡顿）。
+    # Read-HostServing 是同一套判据（0/404/401/200）的单次原始 TCP 版本。
+    $probe = Read-HostServing "http://${BindHost}:$Port/"
   }
   Add-Phase 'http-probe'
   # 访问地址优先读持久文件（url 步/上次 -Status 落盘），并校验 pid 与 token 是否属于当前实例：
@@ -4662,8 +4677,20 @@ try {
   #      真的接管了（比只核对端口 owner 多一层证明）；拿到就落盘，供 -Status/后续步骤读取。
   # -NoWait（分离模式）：收尾不停留 —— 只做一次非阻塞扫描，不再占着前台等这 20s。
   # 拿不到仍然只 WARN（退出码不变）；地址稍后由 `dsh-restart -Status` 校验并补写。
-  $tokenWaitMs = if ($NoWait) { 0 } else { 20000 }
+  # 等待预算：桌面宿主把地址写进自己的 `web-auth-url.txt`，stdout 上未必有那行 ——
+  # 所以「等日志」只给一个短窗口（5s），剩下的时间交给按 pid 认记录的兜底，
+  # 否则每次重启都要为一行可能永远不出现的内容额外付 20s。
+  $tokenWaitMs = if ($NoWait) { 0 } elseif ($script:HostKind -eq 'desktop') { 5000 } else { 20000 }
   $script:HostUrl = Wait-NewHostToken $script:HostOutPath $tokenWaitMs
+  # 兜底：桌面宿主把地址/令牌写进 `web-auth-url.txt`（那是它自己的落盘事实），
+  # 而 stdout 那行在桌面布局里不保证出现。token 等待空手而归时读文件 —— 但只认
+  # pid 等于本次新宿主的记录：旧实例的文件绝不能当成本次地址。
+  if (-not $script:HostUrl -and $script:NewPid) {
+    $script:HostUrl = Read-WebAuthUrlForPid ([int]$script:NewPid)
+    if ($script:HostUrl) {
+      Add-Step 'url' "stdout 未见新 boot token，但 $($script:NewPid) 的 boot 记录里有地址 → 采用（已核对 pid）" 'ok'
+    }
+  }
   if ($script:HostUrl) {
     [void](Save-WebAuthUrlRecord $script:HostUrl ([int]$script:NewPid) 'url 步（token 变化判据）')
     Add-Step 'url' "访问地址 $($script:HostUrl)（token 已变化 → 新实例接管；已落盘 $(Get-WebAuthUrlPath)）" 'ok'
