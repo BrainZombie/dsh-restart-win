@@ -66,6 +66,7 @@ param(
   [int]$VerifyReadySec  = 150,  # 深度验证实例就绪等待上限（2026-09-20：75s 偶发假失败，见 Invoke-DeepVerifyWithRetry）
   [int]$GraceSec        = 3,    # 优雅停机宽限（R21：实测 /T 温和路径从未成功，10s 纯浪费）
   [int]$PortFreeSec     = 30,   # 等端口释放上限
+  [int]$ProgressSec     = 5,    # 进度行间隔：等待中每 N 秒往 stderr 打一行「阶段 · 已等 · 剩余」
   [int]$WaitIdleSec     = 0,    # >0 则重启前等会话空闲，超时行为写日志（R11）
   [int]$IdleMaxSec      = 300,
 
@@ -283,6 +284,13 @@ $script:PhasesOn = [bool]($Json -or $ResultFile)
 $script:ActivityOn = $false
 $script:ActivityLastTick = $null
 $script:ActivityLastStep = ''
+# 进度行的节流时间：与台账分开计（台账 2s 一跳，进度行 5s 一跳，两者互不影响）。
+$script:ProgressLastTick = $null
+$script:ProgressStageStart = $null
+# 还没走完的那个阶段（配合 Add-Step 的「成功即结束」语义记录持续时间）。
+$script:StageOpen = $false
+$script:StageName = ''
+$script:StageStart = $null
 # 一次动作的预算（见 Set-ActionBudget）。只读动作保持 $null。
 $script:ActionDeadline = $null
 $script:ActionBudgetSec = 0
@@ -361,6 +369,14 @@ function Add-Step([string]$name, [string]$detail, [string]$state = 'ok') {
   # 每个阶段都落一次台账：这正是「还在跑」与「卡死」的分界线。落在这里而不是各个调用点，
   # 是为了让漏掉的调用点也能被覆盖（Add-Step 本身就是阶段的唯一出口）。
   Write-Activity $name $detail
+  # 进度行只给「成功走完」的阶段追加合计：失败/警告行本身已经是结论，再补一行合计只会更吵。
+  if ($state -eq 'ok' -and $script:StageOpen -and $script:StageName -eq $name -and $script:StageStart) {
+    $spent = [math]::Round(((Get-Date) - $script:StageStart).TotalSeconds, 1)
+    Write-Diag ('  .. ' + $name + ' · 完成 · 用时 ' + $spent + 's')
+  }
+  $script:StageOpen = $false
+  $script:StageName = ''
+  $script:StageStart = $null
   if (-not $Json) {
     $mark = switch ($state) { 'ok' { '  ok ' } 'warn' { ' WARN' } 'skip' { ' skip' } default { ' FAIL' } }
     # 人读模式下每行都带「已用秒数」：机主看到的是一条在往前走的进度，而不是一段静默。
@@ -2441,6 +2457,7 @@ function Wait-HostReady([int]$Pid_, [int]$P, [int]$MaxSec, [datetime]$Start_) {
     }
     Write-Activity 'ready' ("等待 web 宿主就绪 " + $url + "：第 " + $round + " 轮，HTTP " + $last.status +
       "，已等 " + [int]((Get-Date) - $waitStart).TotalSeconds + "s，剩余预算 " + $(if ($null -ne (Get-BudgetLeftSec)) { (Get-BudgetLeftSec).ToString() + 's' } else { '不限' }))
+    Write-ProgressLine 'ready' ("web 宿主 " + $url + "，第 " + $round + " 轮，HTTP " + $last.status)
     Start-Sleep -Milliseconds 900
   }
   $diag = if ($last.status -eq 404) { "端口已绑但 ${MaxSec}s 内路由未就绪（404）" } elseif ($last.status -eq 0) { "${MaxSec}s 内端口无响应" } else { "最后状态码 $($last.status)" }
@@ -2456,6 +2473,43 @@ function Wait-HostReady([int]$Pid_, [int]$P, [int]$MaxSec, [datetime]$Start_) {
 # 「一次动作一批时间」，且每个等待都引用同一个截止时刻，于是剩余时间可以被报出来。
 # 只读动作（-Status / -CheckShadowed / -RepairSharedScope / -Record）不设预算：它们本来就快，
 # 而且不能被一个不相关的截止时刻打断。
+# 进度行：给「正在等」的那一段在屏幕上留下会动的痕迹。
+# 为什么必须有（2026-11-23 实测）：整个动作的预算已经收敛成一份，但一个阶段内部（深验证 70-150s、
+# 就绪 60-140s）仍然一行字都不出；命令行看起来和卡死一模一样。这里每 ProgressSec 秒打一行
+# 「阶段 · 第几轮 · 已等 · 剩余」，写 stderr（-Json 下同样写到 stderr，stdout 只有一个 JSON）。
+# 只在阶段循环里被调用；阶段结束（Add-Step 成功）后由 Add-Step 追加一行「合计」。
+function Write-ProgressLine([string]$Stage, [string]$Detail) {
+    $now = Get-Date
+    # 单个阶段内的「已等」从这里算起；StageStart 只在阶段结束时被 Add-Step 用来算合计。
+    if (-not $script:ProgressStageStart -or $script:StageName -ne $Stage) {
+        $script:StageName = $Stage; $script:StageStart = $now; $script:ProgressStageStart = $now; $script:ProgressLastTick = $null
+    }
+    $script:StageOpen = $true
+    if ($script:ProgressLastTick -and ($now - $script:ProgressLastTick).TotalSeconds -lt [Math]::Max(1, $ProgressSec)) { return }
+    $script:ProgressLastTick = $now
+    $left = Get-BudgetLeftSec
+    $leftText = if ($null -ne $left) { '剩余 ' + $left + 's' } else { '不设上限' }
+    Write-Diag ('  .. ' + $Stage + ' · 已等 ' + [int]($now - $script:ProgressStageStart).TotalSeconds + 's · ' + $leftText + $(if ($Detail) { ' · ' + $Detail } else { '' }))
+}
+
+function Format-BudgetParts {
+    # 预算由哪几段组成 —— 说明与措辞共用一处，免得两处数字对不上（旧版就出现过「就绪 90s」
+    # 与预算里按 240s 算的两套说法）。
+    $verify = 0
+    if ($Preflight -or $VerifyOnly) { $verify = 2 * $VerifyReadySec }
+    elseif (-not $Start -and -not $Fast -and -not $Stop -and -not $DryRun -and $script:HostKind -ne 'desktop') { $verify = 2 * $VerifyReadySec }
+    $ready = $ReadySec
+    $free = if ($Stop) { [Math]::Max(30, $PortFreeSec) } else { $PortFreeSec }
+    $grace = if ($Stop) { 0 } else { $GraceSec }
+    $parts = @()
+    if ($verify -gt 0) { $parts += ('深度验证 ' + $verify + 's（' + $VerifyReadySec + 's × 2 次尝试）') } else { $parts += '深度验证 0s（本次跳过）' }
+    $parts += ('端口释放 ' + $free + 's')
+    if (-not $Stop) { $parts += ('就绪 ' + $ready + 's') }
+    if ($grace -gt 0) { $parts += ('收尾 ' + $grace + 's') }
+    $parts += '固定余量 60s'
+    return ($parts -join ' + ')
+}
+
 function Set-ActionBudget {
     if ($Status -or $CheckShadowed -or $RepairSharedScope -or $Record) {
         $script:ActionDeadline = $null
@@ -3823,6 +3877,8 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec, [datetime]$MainStar
     Write-Activity 'ready' ("等待 DSH Desktop 宿主就绪：主进程 pid=" + $MainPid_ + "，第 " + $round + " 轮，端口 " +
       $(if (@($lastPorts).Count -gt 0) { $lastPorts -join ',' } else { '(尚未监听)' }) +
       "，已等 " + [int]((Get-Date) - $waitStart).TotalSeconds + "s，剩余预算 " + $(if ($null -ne (Get-BudgetLeftSec)) { (Get-BudgetLeftSec).ToString() + 's' } else { '不限' }))
+    Write-ProgressLine 'ready' ("宿主 pid=" + $MainPid_ + "，第 " + $round + " 轮，端口 " +
+      $(if (@($lastPorts).Count -gt 0) { $lastPorts -join ',' } else { '尚未监听' }))
     Start-Sleep -Milliseconds 900
   }
   $diag = if (@($lastPorts).Count -gt 0) { "端口 $($lastPorts -join ',') 已绑定但未就绪" } else { '未发现宿主子进程的监听端口' }
@@ -3960,6 +4016,8 @@ function Test-DesktopVerify {
         [int]((Get-Date) - $verifyStart).TotalSeconds + "s / 预算 " + $VerifyReadySec + "s" +
         $(if ($null -ne (Get-BudgetLeftSec)) { "（本次动作剩余 " + (Get-BudgetLeftSec) + "s）" } else { '' }) +
         $(if ($lastHttp -gt 0) { "，最后 HTTP=$lastHttp" } else { '' }))
+      Write-ProgressLine 'deep-verify' ("隔离桌面宿主，第 " + $verifyRound + " 轮" +
+        $(if ($lastHttp -gt 0) { "，HTTP " + $lastHttp } else { '，尚未监听' }))
       if ((Get-Date) -ge $nextNetstat) { $script:NetstatRows = Get-NetstatListenerRows -Refresh; $nextNetstat = (Get-Date).AddSeconds(2) }
       if ($p.HasExited) { break }
       # 启动期致命错误要立刻收手：某些插件在隔离宿主里会挂住（例如 tailscale 入口冲突反复重试），
@@ -4163,8 +4221,10 @@ try {
     $script:ActivityOn = $true
     Write-Activity 'lock' ("取得重启锁；本次动作预算 " + $script:ActionBudgetSec + "s")
     if ($script:ActionBudgetSec -gt 0) {
-      Add-Step 'budget' ("本次动作预算 " + $script:ActionBudgetSec + "s（深度验证 " + $(if ($Preflight -or $VerifyOnly) { 2 * $VerifyReadySec } elseif (-not $Start -and -not $Fast -and $script:HostKind -ne 'desktop') { 2 * $VerifyReadySec } else { 0 }) +
-        "s + 端口释放 " + $PortFreeSec + "s + 就绪 " + $ReadySec + "s + 收尾 " + $GraceSec + "s）；每层等待都引用这个截止时刻，超出即明确失败") 'ok'
+      Add-Step 'budget' ("本次动作预算 " + $script:ActionBudgetSec + "s = " + (Format-BudgetParts) +
+        "；每层等待都引用这个截止时刻，超出即明确失败") 'ok'
+      # 人读模式先打一行「怎么读这几行输出」，避免把进度行当成新的问题。
+      if (-not $Json) { Write-Diag ('      （等待中每 ' + $ProgressSec + 's 打一行「..」进度，人读模式写到控制台、-Json 写到 stderr）') }
     }
   } else {
     Add-Step 'lock' '只读状态：不取重启锁（不阻塞也不会被阻塞）' 'skip'
