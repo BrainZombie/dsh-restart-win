@@ -612,10 +612,11 @@ App 重启后 pid 变了，旧结论一律作废。`401` 面永不被当作附�
 | `boot-record.json` | 引擎（`-Record`） | 启动档案：`recordedAt` / `command` / `cwd` / `profile` / `port` / `host` / `dshHome` / `note`；重启时按它重放命令 |
 | `restart-history.jsonl` | 引擎 | 每次执行一条 JSON 审计记录（16 个字段：`ts` / `version` / `result` / `rc` / `profile` / `port` / `target_pid` / `new_pid` / `url` / `session` / `reason` / `host` / `user` / `steps` / `warnings` / `audit`）。**不轮转** |
 | `dsh-restart.log` | 引擎 | 每次执行一行人类可读终态 |
+| `activity.json` | 引擎（只要拿到重启锁就写） | **活动台账**：`pid` / `version` / `action` / `hostKind` / `profile` / `port` / `step` / `note` / `elapsedSec` / `updatedAt`。进程每推进一步就重写，等待循环里每 2 秒刷新心跳。它回答的是「现在有没有人在干活、在等什么、等了多久」—— 文件很旧或 `processAlive:false` 就等于没人在跑（不是卡死）。`-Status` 直接读它，`status.activity` 里也带同一份 |
 | `web-auth-url.txt` | 引擎 | 访问地址缓存：`url` / `token` / `pid` / `port` / `profile` / `savedAt` / `source`。含真实 token，按凭据对待 |
 | `host.<hostKind>.out.log` / `.err.log` | 引擎 | 被拉起宿主的 stdout / stderr（追加 banner 后重定向）。按宿主形态分文件：桌面 App 会在整个生命周期里占着自己的日志句柄，共用一个名字会让另一侧的拉起失败 |
 | `dsh-restart.task.xml` | 引擎（`-RegisterTask`） | 计划任务定义，UTF-16LE 带 BOM（`schtasks` 的要求） |
-| `machine.json` | `scripts\dsh-config.ps1`（引擎参数 `-DesktopApp` 也会短路它） | 机器事实：`desktopApp` / `appRoot` / `runtimeDir` / `pnpm` / `nodeExe` / `profile` / `dshHome`。引擎解析 DSH Desktop 可执行文件时**最先**读它；缺失或损坏则退回探测链，不影响启动 |
+| `machine.json` | `scripts\dsh-config.ps1`（引擎参数 `-DesktopApp` 也会短路它） | 机器事实：`desktopApp` / `appRoot` / `runtimeDir` / `pnpm` / `nodeExe` / `profile` / `hostKind` / `dshHome`。引擎解析 DSH Desktop 可执行文件时**最先**读它；判定宿主形态（`-HostKind auto`）时它是**比启动档案更权威**的落盘事实 —— 冷启动（DSH 还没起来）靠它才不会把一台桌面版机器误判成 `web`；缺失或损坏则退回探测链，不影响启动 |
 | `dsh-plugin-install-<时间戳>.log` / `.json` / `.snapshot\` | `scripts\dsh-plugin-install.ps1` | 插件安装/修复的执行日志、机器可读结果、以及安装前的 `package.json` + `pnpm-lock.yaml` 快照（回滚依据） |
 | `fallback\` | 引擎 | 上述日志 / 历史写失败时的第二落点 |
 | `runs\<runId>.pending.json` | 插件 | 分离任务的登记记录（动作、延迟、引擎脚本、pwsh 来源、宿主 pid、launcher pid） |
@@ -661,7 +662,18 @@ App 重启后 pid 变了，旧结论一律作废。`401` 面永不被当作附�
 
 ## 13. 故障排查
 
-先看三个地方：工具返回的 `error`（或 CLI 的 stderr）、`<stateDir>\dsh-restart.log` 的最后一行、`<stateDir>\restart-history.jsonl` 的最后一条。
+先看四个地方：工具返回的 `error`（或 CLI 的 stderr）、`<stateDir>\activity.json`（**有没有人在干活**）、`<stateDir>\dsh-restart.log` 的最后一行、`<stateDir>\restart-history.jsonl` 的最后一条。
+
+**「点了重启，命令行一动不动，好像没反应」。** 先读 `activity.json`：
+
+- `processAlive:true` 且 `ageSec` 很小 → 引擎在跑，正在 `step` 里说的那一步等（本工具最长的一段是 `deep-verify`：要复制 profile 再拉起一个一次性宿主，本机实测 70 s 起步；其次是 `ready`：等新宿主打好端口，约 40-60 s）。`-Status` 会把同一句打包成「当前动作」一行，人读模式带颜色。
+- `processAlive:false`（或文件根本不存在）→ 没有引擎在跑，它已经退出了。看 `dsh-restart.log` 最后一行拿终态词。
+
+CLI 直接跑（`dsh-restart-win -Start`）时每一行阶段输出都会实时打出来；`-Json` / 工具通道下人类可读文字走 **stderr**（stdout 只能有一个 JSON 对象），所以重定向到文件时看不到是正常的 —— 用 `activity.json` 和终态词判断进度。
+
+**冷启动（开机后 DSH 还没起来）时宿主形态判错。** `-HostKind auto` 的判据顺序是「运行中的宿主 → `machine.json` 的 `hostKind` → 启动档案 → web」。三种来源哪个生效会写在 `status.hostKindSource`（`running-instance` / `machine.json` / `boot-record` / `default` / `explicit`）。若这台机器其实是桌面版却报 `web`，跑一次 `scripts\dsh-config.ps1` 把机器事实写进 `machine.json`，或显式 `-HostKind desktop`。
+
+**一次动作最多等多久。** 引擎在拿锁之后算一个总预算（`-Json` 的 `steps` 里有一行 `budget`），所有等待层都引用同一个截止时刻：桌面版重启约 `portFreeSec + readySec + graceSec + 60` 秒，web 版再加两轮深度验证（`2 × verifyReadySec + 60`）。超出即明确失败，不会各层各自重新计时。
 
 **App 报「应用无法启动 / Web RPC failed」，但宿主其实在监听。** 装第三方插件时 pnpm 可能把旧版 `@deepseek-ai/dsh-settings`（或其它基础包）提升到 profile 的 `node_modules`，遮蔽 App 自带版本；`settings` 服务因此永远不注册，欢迎窗口的 RPC 失败。执行 `dsh-restart-win -CheckShadowed`（引擎在每次拉起前也会自动检查，把旧版本移进 `.stale-packages`）。
 
@@ -687,7 +699,7 @@ App 重启后 pid 变了，旧结论一律作废。`401` 面永不被当作附�
 | 0 `rescued-after-abort:` | 中止发生在停机之后，已尽力拉回 | 宿主已恢复，但请核对日志里的中止原因 |
 | 工具返回 `state=unknown` | `runId` 不存在或结果文件还没写 | `win_restart_result` 带 `waitMs` 再读，或确认 `stateDir` 一致 |
 
-深度验证长（默认预算 150 s × 最多两次尝试，加上隔离 home 的组装），`win_restart_preflight` 返回 `running` 是正常的：用 `win_restart_result` 轮询。
+深度验证长（默认预算 150 s × 最多两次尝试，加上隔离 home 的组装），`win_restart_preflight` 返回 `running` 是正常的：用 `win_restart_result` 轮询，或读 `activity.json` 的 `step` / `note` 看它走到哪一步（等待循环里每 2 秒刷新一次心跳）。
 
 ---
 

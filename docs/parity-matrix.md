@@ -492,6 +492,10 @@ Select-String .\scripts\dsh-restart.ps1 -Pattern 'restarted-ok|status|verify-onl
 | MP-06 | `scripts/dsh-config.ps1`：一次探测把 `machine.json` 落盘（`-Show` 预览 / `-Reset` 删除 / `-DesktopApp` 手工指定） | 无旧实现 | scripts/dsh-config.ps1 | 全部参数可选 | parity:MP-06 静态断言；本机实跑 `-Show` 与写入，`machine.json` 字段与实例实测一致 |
 | MP-07 | 回归入口：`scripts/probe-plugin-install.ps1` 只读验证续跑通知契约（AST 抽函数 → 临时目录跑三次 → 键序 / ISO-Z / attempts=0 / 无 BOM / 无 .tmp 残留 / 调用点仍在停机之前）；README 记录两条脚本 | 本机：原 `_probe-plugin-install.ps1`（指向已删除的 plugin-install.ps1） | scripts/probe-plugin-install.ps1；README.zh.md §5.5 / §5.6 | 无参数 | parity:MP-07 静态断言；本机实跑 `RESULT: ALL PASS` |
 
+| MP-08 | 活动台账 `activity.json`：拿到重启锁后每推进一个阶段写一次，等待循环里每 2 秒刷新心跳；`-Status` 直接读它报「现在有没有人在干活」 | 无旧实现（旧版只有终态一行，无法区分「在跑」与「卡死」） | scripts/dsh-restart.ps1（`Write-Activity` / `Get-ActivityPath` / `Show-Status`）；README.zh.md §10 / §13 | 只由引擎写；只读动作不写 | parity:MP-08 静态断言；本机实跑：`-VerifyOnly` 期间台账 2s 一跳（43 轮 / 59s），`-Status` 同屏显示「进行中：verify 的 deep-verify」 |
+| MP-09 | 冷启动宿主形态判定：`auto` 的判据顺序为「运行中宿主 → `machine.json` 的 hostKind → 启动档案 → web」，并把来源写进 `status.hostKindSource` | 无旧实现（旧版只有「有没有进程」+「启动档案里有没有 exe 字面量」，冷启动必然落到 web） | scripts/dsh-restart.ps1（`Resolve-HostKind` / `Resolve-DesktopProfileName` / `Show-Status`） | 只读，无副作用 | parity:MP-09 静态断言；本机实跑四个场景：无宿主+无档案+`machine.json=desktop` → `desktop`；`machine.json=web` 不被旧档案的 exe 口径推翻 → `web`；全无 → `web` |
+| MP-10 | 一次动作一个预算：拿锁后算总预算，就绪等待 / 桌面就绪等待 / 桌面深验证三层都受同一截止时刻封顶；HTTP 探测器不再把一个读超时翻倍 | 无旧实现（旧版每层各自计一个 90s/150s，一个失败的重启可以合法地静默耗掉 7 分钟以上） | scripts/dsh-restart.ps1（`Set-ActionBudget` / `Get-BudgetLeftSec` / 三个等待循环 / `Invoke-HttpProbe -Retries 1`） | 只读动作不设上限 | parity:MP-10 静态断言；本机实跑：accept-但不回的端口探测 10.19s → 5.18s；死端口 1.50s |
+
 > 说明：`-DesktopApp <path>` 也是引擎参数，显式给出时优先级最高（用户已给出唯一确定的事实），
 > 探测链整体短路。`scripts/dsh-plugin-install.ps1` 与 `scripts/dsh-config.ps1` 每次运行都会顺带刷新
 > `machine.json`，因此「配置过期」不是需要人工维护的状态。

@@ -1218,6 +1218,60 @@ PROBES['MP-07'] = [{
     },
 }];
 
+PROBES['MP-08'] = [{
+    note: 'the activity ledger is written only under the restart lock and refreshed inside the wait loops',
+    fn: (ctx) => {
+        const engine = read(ENGINE);
+        assert.ok(/function Write-Activity/.test(engine), 'Write-Activity is missing');
+        assert.ok(/activity\.json/.test(engine), 'the ledger filename is not activity.json');
+        // 只有拿到锁才写：-Status 这类只读动作不能假装有人在干活
+        assert.ok(/\$script:ActivityOn = \$false/.test(engine), 'the ledger is not opt-in per action');
+        const main = ctx.functionBody(ENGINE, 'Write-Activity');
+        assert.ok(/ActivityOn/.test(main), 'Write-Activity does not respect the opt-in switch');
+        // 每个阶段出口都落一次
+        const addStep = ctx.functionBody(ENGINE, 'Add-Step');
+        assert.ok(/Write-Activity/.test(addStep), 'Add-Step does not record the stage');
+        // 最长的一段静默（深度验证）必须有心跳
+        const dv = ctx.functionBody(ENGINE, 'Test-DesktopVerify');
+        assert.ok(/Write-Activity 'deep-verify'/.test(dv), 'the slow verify loop has no heartbeat');
+        // -Status 必须能读出「现在有没有人在干活」
+        const status = ctx.functionBody(ENGINE, 'Show-Status');
+        assert.ok(/activity/.test(status), '-Status does not report the ledger');
+    },
+}];
+
+PROBES['MP-09'] = [{
+    note: 'cold boot picks the host shape from machine facts, not only from a running process',
+    fn: (ctx) => {
+        const body = ctx.functionBody(ENGINE, 'Resolve-HostKind');
+        assert.ok(/Get-MachineConfig/.test(body), 'Resolve-HostKind ignores machine.json');
+        assert.ok(/machine\.json/.test(body) || /Get-MachineConfig/.test(body), 'machine.json source is not recorded');
+        assert.ok(/HostKindSource/.test(body), 'the source of the decision is not recorded');
+        // machine.json 存在时不能被一份旧启动档案推翻
+        assert.ok(/machineSaid/.test(body), 'a stale boot record can still override machine.json');
+        const status = ctx.functionBody(ENGINE, 'Show-Status');
+        assert.ok(/hostKindSource/.test(status), '-Status does not publish hostKindSource');
+    },
+}];
+
+PROBES['MP-10'] = [{
+    note: 'one action carries one budget: every wait layer is capped by the same deadline',
+    fn: (ctx) => {
+        const setup = ctx.functionBody(ENGINE, 'Set-ActionBudget');
+        assert.ok(/ActionDeadline/.test(setup), 'Set-ActionBudget does not set a deadline');
+        assert.ok(/Status -or \$CheckShadowed/.test(setup) || /\$Status/.test(setup), 'read-only actions must not be capped');
+        for (const fn of ['Wait-HostReady', 'Wait-DesktopHostReady', 'Test-DesktopVerify']) {
+            const body = ctx.functionBody(ENGINE, fn);
+            assert.ok(/ActionDeadline/.test(body), `${fn} does not honour the action deadline`);
+        }
+        const main = read(ENGINE);
+        assert.ok(/Set-ActionBudget/.test(main), 'the main flow never calls Set-ActionBudget');
+        // 探测器不能把一个读超时翻倍成两个
+        const probe = ctx.functionBody(ENGINE, 'Invoke-HttpProbe');
+        assert.ok(/-Retries 1/.test(probe), 'Invoke-HttpProbe still doubles its read timeout');
+    },
+}];
+
 PROBES['MP-06'] = [{
     note: 'dsh-config writes the probe result; the engine reads it back',
     fn: () => {

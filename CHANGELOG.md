@@ -1,5 +1,58 @@
 # 变更记录
 
+## 0.6.2 — 「点了没反应」：活动台账、冷启动判据、一次动作一个预算
+
+这一版修的是一类**看不见**的故障：引擎在做正确的事，但它在等，而外面没有任何证据说明它在等。
+2026-11-23 实测一次命令行重启静默 14 分钟（进程活着、CPU 停在 2.7s、stderr 一个字都没有），
+观察者无法区分「还在跑」「卡死」「根本没启动」。另外冷启动时宿主形态会被误判成 web，
+于是桌面版 exe 从来没被拉起。
+
+### 引擎（scripts/dsh-restart.ps1）
+
+- **新增活动台账 `activity.json`**（`Write-Activity` / `Get-ActivityPath`）：拿到重启锁就写，
+  每推进一个阶段重写一次；等循环里按 2 秒节流刷新心跳。进程一死就没人再写，所以
+  「文件很旧」= 没人在跑，不是卡死。只读动作（`-Status` / `-CheckShadowed` /
+  `-RepairSharedScope` / `-Record`）不写 —— 它们不能假装有人在干活。
+- **两处最长静默补上心跳**：`Test-DesktopVerify` 与 `Test-DeepVerify` 的等待循环、
+  `Wait-DesktopHostReady` 与 `Wait-HostReady` 的就绪循环，每轮都写「第几轮 / 已等 Ns /
+  剩余预算 / 最后 HTTP」。
+- **`-Status` 报「当前动作」**：人读输出新增两行 —— `当前动作`（进行中 / 进程还在但没推进 /
+  没人在跑）与 `宿主判据`（`hostKind` 是怎么判出来的）。`-Status -Json` 的 `status` 里
+  新增 `activity` 与 `hostKindSource`。
+- **一次动作一个预算**（`Set-ActionBudget` / `Get-BudgetLeftSec`）：拿锁之后按本次要跑的阶段
+  算总预算，就绪等待、桌面就绪等待、桌面深验证三层全部引用同一个截止时刻。旧版每层各自计
+  一个 90s / 150s，一个失败的重启可以合法地静默耗掉七分钟以上；而且每一层都会**重新**开始等。
+- **冷启动宿主形态判据**（`Resolve-HostKind`）：顺序改为「运行中的宿主 → `machine.json` 的
+  `hostKind` → 启动档案 → web」，并记录来源。旧版只看「有没有进程」和「启动档案里有没有 exe
+  字面量」—— 开机后 DSH 还没起来时两条都不成立，这台明确是桌面版的机器被判成 web，
+  接着去跑 `cmd /c dsh web --no-open ...`：既没有 exe 被拉起，也没有一行提示。
+  `machine.json` 存在时它的 `hostKind` 是这台机器的属性，一份旧启动档案不能推翻它。
+  `Resolve-DesktopProfileName` 同样补上 `machine.json` 这级来源。
+- **探测器不再把读超时翻倍**（`Invoke-HttpProbe`）：实测一个「accept 后永不响应」的端口
+  让一次探测花 10.19s（读超时 5s × 重发 2 次）。现在连不上立刻返回（1.51s），
+  连上了但不回只等一个读超时（5.25s），且不再用一个「重连」字样掩盖失败。
+- **每一步都落台账**：`Add-Step` 是阶段的唯一出口，台账写在那里，漏掉的调用点也被覆盖。
+- 顺带修掉 `Wait-HostReady` 超时文案里的 `$MaxSecs`（不存在的变量，StrictMode 下会抛）。
+
+### 文档与测试
+
+- README.zh.md：§10 状态文件表新增 `activity.json`，`machine.json` 一行补 `hostKind` 与
+  「比启动档案更权威」；§13 故障排查新增「点了重启一动不动」与「冷启动形态判错」两段，
+  并说明一次动作的预算怎么算。
+- `docs/parity-matrix.md`：§15 新增 MP-08 / MP-09 / MP-10 三行（台账、冷启动判据、单预算）。
+- `test/parity.mjs`：对应三条探针。**parity 258/258**；`npm test` 全绿（selftest 94 / integration 16）。
+
+### 本机实测
+
+| 项 | 0.6.1 | 0.6.2 |
+|---|---|---|
+| `-VerifyOnly` 期间的对外可见进度 | 只有「开始」和 70s 后的结果 | 台账 2s 一跳（实测 43 轮 / 59s），`-Status` 同屏显示当前步骤 |
+| 冷启动（无宿主 / 无档案 / `machine.json=desktop`） | 判成 `web`，exe 不被拉起 | 判成 `desktop`，来源 `machine.json` |
+| accept-但不回的端口探测 | 10.19s | 5.25s |
+| 死端口探测 | 3.0s（连接 1.5s + 重发 1.5s） | 1.51s |
+| 桌面版重启全程 | 60.0s（无中间进度） | 60.0s，逐阶段 + 台账可观察 |
+
+
 ## 0.6.0 — 安装通道改名 + `install_plugin` 工具
 
 这一版把「装插件不把宿主弄坏」那条链路真正接给模型用，并把它叫成它实际干的事。
