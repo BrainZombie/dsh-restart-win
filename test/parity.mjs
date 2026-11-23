@@ -1073,7 +1073,7 @@ PROBES['U-15'] = [eng(/\[System\.IO\.FileShare\]::ReadWrite/), eng(/Get-Appended
 
 // ------------------------------------------------------------------ §14 machine facts / 反硬编码
 // 这一节记录的是「本机实测驱动出来的去硬编码改动」：安装位置不靠猜、系统工具不靠 PATH。
-const REPAIR_SCRIPT = 'scripts/dsh-repair.ps1';
+const INSTALL_SCRIPT = 'scripts/dsh-plugin-install.ps1';
 const CONFIG_SCRIPT = 'scripts/dsh-config.ps1';
 
 // 注意（2026-11-22）：markdown 表里已有的 X-07/X-08/X-09 行（`task-unregistered` 等终态词）
@@ -1138,10 +1138,10 @@ PROBES['MP-04'] = [{
 }];
 
 PROBES['MP-05'] = [{
-    note: 'dsh-repair resolves every machine fact through the engine and never hardcodes a path',
+    note: 'the plugin-install script resolves every machine fact through the engine and never hardcodes a path',
     fn: () => {
-        const text = read(REPAIR_SCRIPT);
-        assert.ok(text !== null, 'scripts/dsh-repair.ps1 is missing');
+        const text = read(INSTALL_SCRIPT);
+        assert.ok(text !== null, 'scripts/dsh-plugin-install.ps1 is missing');
         assert.ok(/-Status/.test(text), 'the repair script does not ask the engine for facts');
         assert.ok(!/[A-Za-z]:\\deepseek/i.test(text), 'the repair script still hardcodes an install location');
         const resolved = /function Resolve-Engine[\s\S]*?\n}/.exec(text);
@@ -1153,13 +1153,13 @@ PROBES['MP-05'] = [{
 PROBES['MP-07'] = [{
     note: 'the repair script is wired into the development workflow: a read-only notice probe and the documented switch',
     fn: () => {
-        const probe = read('scripts/probe-notice.ps1');
-        assert.ok(probe !== null, 'scripts/probe-notice.ps1 is missing');
-        assert.ok(/dsh-repair\.ps1/.test(probe), 'the probe still targets the removed plugin-install.ps1');
+        const probe = read('scripts/probe-plugin-install.ps1');
+        assert.ok(probe !== null, 'scripts/probe-plugin-install.ps1 is missing');
+        assert.ok(/dsh-plugin-install\.ps1/.test(probe), 'the probe does not target the install script');
         assert.ok(/Write-PendingNoticeSafe/.test(probe), 'the probe does not exercise the notice writer');
         const zh = read(README_ZH);
         assert.ok(zh !== null, 'README.zh.md is missing');
-        assert.ok(/dsh-repair\.ps1/.test(zh), 'README.zh.md does not document the repair script');
+        assert.ok(/dsh-plugin-install\.ps1/.test(zh), 'README.zh.md does not document the install script');
         assert.ok(/dsh-config\.ps1/.test(zh), 'README.zh.md does not document the machine-config script');
         assert.ok(/machine\.json/.test(zh), 'README.zh.md does not document machine.json');
     },
