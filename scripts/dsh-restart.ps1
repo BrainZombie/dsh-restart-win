@@ -2469,7 +2469,7 @@ function Show-Status {
 
   if ($Json -or $ResultFile) {
     # desktopApp：桌面版可执行文件的绝对路径（运行时解析：本次已解析 → 运行中实例 → 启动档案 →
-    # 常见安装位置）。依赖它的外部工具（如 scripts\dsh-repair.ps1）靠这一项推导安装根，不必自己猜。
+    # 常见安装位置）。依赖它的外部工具（如 scripts\dsh-plugin-install.ps1）靠这一项推导安装根，不必自己猜。
     $desktopApp = ''
     if ($script:HostKind -eq 'desktop') {
       $resolved = Resolve-DesktopAppPath
@@ -3007,7 +3007,7 @@ function Resolve-FirstPath([string[]]$Candidates) {
 
 function Get-DesktopNodeExe {
   <#
-    宿主自带的 node.exe（<appRoot>\resources\runtime\bin\node.exe）。外部工具（如 scripts\dsh-repair.ps1）
+    宿主自带的 node.exe（<appRoot>\resources\runtime\bin\node.exe）。外部工具（如 scripts\dsh-plugin-install.ps1）
     跑 pnpm 时应该用它，而不是去要求用户 PATH 上有 node —— 装在非默认目录的机器上 PATH 往往没有。
     找不到就退回 PATH 上的 node，再没有就返回空串（调用方自己决定是否报错）。
   #>

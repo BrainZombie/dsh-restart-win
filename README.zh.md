@@ -328,7 +328,7 @@ curl.exe -s --noproxy '*' http://127.0.0.1:<port>/dsh-restart-win/api/sessions
 
 ---
 
-## 5.5 插件安装 / 修复：`scripts\dsh-repair.ps1`
+## 5.5 插件安装 / 修复：`scripts\dsh-plugin-install.ps1`
 
 装插件最容易踩的三个坑（都在本机真实发生过）：运行中 `pnpm add` 把宿主打断、pnpm 顺手清掉
 `<DSH_HOME>\profiles\node_modules`（宿主的共享投影，清掉之后 App 连基础包都 import 不到）、
@@ -340,15 +340,15 @@ curl.exe -s --noproxy '*' http://127.0.0.1:<port>/dsh-restart-win/api/sessions
 
 ```powershell
 # 只看现在有哪些会话在写（不停机、不改文件）
-pwsh -NoProfile -File .\scripts\dsh-repair.ps1 -CensusOnly
+pwsh -NoProfile -File .\scripts\dsh-plugin-install.ps1 -CensusOnly
 
 # 先看计划，再执行；-Detach 通过 WMI 脱离宿主进程树
-pwsh -NoProfile -File .\scripts\dsh-repair.ps1 -Spec '@scope/some-plugin@1.2.3' -WhatIfPlan
-pwsh -NoProfile -File .\scripts\dsh-repair.ps1 -Spec '@scope/some-plugin@1.2.3' -Confirm -Detach -Bundle
+pwsh -NoProfile -File .\scripts\dsh-plugin-install.ps1 -Spec '@scope/some-plugin@1.2.3' -WhatIfPlan
+pwsh -NoProfile -File .\scripts\dsh-plugin-install.ps1 -Spec '@scope/some-plugin@1.2.3' -Confirm -Detach -Bundle
 
 # 单项修复（等价于引擎的 -CheckShadowed / -RepairSharedScope）
-pwsh -NoProfile -File .\scripts\dsh-repair.ps1 -CheckShadowed -Confirm
-pwsh -NoProfile -File .\scripts\dsh-repair.ps1 -RepairSharedScope -Confirm
+pwsh -NoProfile -File .\scripts\dsh-plugin-install.ps1 -CheckShadowed -Confirm
+pwsh -NoProfile -File .\scripts\dsh-plugin-install.ps1 -RepairSharedScope -Confirm
 ```
 
 `-Report <path>` 把机器可读结果写成 UTF-8 JSON（调用方不必解析控制台）。`-Engine` / `-Profile` /
@@ -585,7 +585,7 @@ App 重启后 pid 变了，旧结论一律作废。`401` 面永不被当作附�
 | `host.<hostKind>.out.log` / `.err.log` | 引擎 | 被拉起宿主的 stdout / stderr（追加 banner 后重定向）。按宿主形态分文件：桌面 App 会在整个生命周期里占着自己的日志句柄，共用一个名字会让另一侧的拉起失败 |
 | `dsh-restart.task.xml` | 引擎（`-RegisterTask`） | 计划任务定义，UTF-16LE 带 BOM（`schtasks` 的要求） |
 | `machine.json` | `scripts\dsh-config.ps1`（引擎参数 `-DesktopApp` 也会短路它） | 机器事实：`desktopApp` / `appRoot` / `runtimeDir` / `pnpm` / `nodeExe` / `profile` / `dshHome`。引擎解析 DSH Desktop 可执行文件时**最先**读它；缺失或损坏则退回探测链，不影响启动 |
-| `dsh-repair-<时间戳>.log` / `.json` / `.snapshot\` | `scripts\dsh-repair.ps1` | 插件安装/修复的执行日志、机器可读结果、以及安装前的 `package.json` + `pnpm-lock.yaml` 快照（回滚依据） |
+| `dsh-plugin-install-<时间戳>.log` / `.json` / `.snapshot\` | `scripts\dsh-plugin-install.ps1` | 插件安装/修复的执行日志、机器可读结果、以及安装前的 `package.json` + `pnpm-lock.yaml` 快照（回滚依据） |
 | `fallback\` | 引擎 | 上述日志 / 历史写失败时的第二落点 |
 | `runs\<runId>.pending.json` | 插件 | 分离任务的登记记录（动作、延迟、引擎脚本、pwsh 来源、宿主 pid、launcher pid） |
 | `runs\<runId>.request.json` | 插件 | 分离执行器的启动请求（delay、runId、execPath、完整 argv） |

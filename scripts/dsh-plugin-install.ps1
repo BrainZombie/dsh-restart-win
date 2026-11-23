@@ -1,7 +1,8 @@
 ﻿#Requires -Version 7.0
 <#
 .SYNOPSIS
-  dsh-restart-win 的插件修复通道：装一个插件而不把宿主弄坏。
+  dsh-restart-win 的插件安装通道：装一个插件而不把宿主弄坏。
+  名字就叫安装，因为它主要干的就是安装/升级/移除；修复（重建共享投影、查遮蔽）是其中的单项开关。
 
 .DESCRIPTION
   为什么需要它（2026-11 本机实测过三次同族事故）：
@@ -20,15 +21,17 @@
   不接受任何一条写死的安装路径；解析失败就明确报错，不猜。
 
 .EXAMPLE
-  .\dsh-repair.ps1 -CensusOnly
+  .\dsh-plugin-install.ps1 -CensusOnly
 .EXAMPLE
-  .\dsh-repair.ps1 -Spec '@scope/some-plugin@1.2.3' -WhatIfPlan
+  .\dsh-plugin-install.ps1 -Spec '@scope/some-plugin@1.2.3' -WhatIfPlan
 .EXAMPLE
-  .\dsh-repair.ps1 -Spec '@scope/some-plugin@1.2.3' -Confirm -Detach
+  .\dsh-plugin-install.ps1 -Spec '@scope/some-plugin@1.2.3' -Confirm -Detach
 .EXAMPLE
-  .\dsh-repair.ps1 -RepairScope -Confirm      # 只重建共享投影
+  .\dsh-plugin-install.ps1 -RepairScope -Confirm      # 只重建共享投影
 .EXAMPLE
-  .\dsh-repair.ps1 -CheckShadowed             # 只查遮蔽
+  .\dsh-plugin-install.ps1 -CheckShadowed             # 只查遮蔽
+.EXAMPLE
+  .\dsh-plugin-install.ps1 -Spec './x.tgz' -OnDemand -Confirm   # 宿主由 agent 先停好，装完不拉起
 #>
 [CmdletBinding(DefaultParameterSetName = 'Install')]
 param(
@@ -48,6 +51,14 @@ param(
   [int]$QuietSec = 20,
   [int]$WaitQuietSec = 180,
   [switch]$Force,
+
+  # 宿主由调用方（agent 的 install_plugin 工具）负责停机与拉起：
+  #   - 不做会话空窗闸门（调用方已停宿主，不存在「会话还在跑」）；
+  #   - 不再 & engine -Stop / -Start（宿主要已经停了，-Stop 会失败退出）；
+  #   - 不写续跑通知（`-Detach` 默认要写，这里由调用方决定）。
+  # 健康校验仍照做：只读端口探测，宿主没起来就报 unhealthy，不当成功。
+  [Parameter(ParameterSetName = 'Install')]
+  [switch]$OnDemand,
 
   # 动作
   [switch]$CensusOnly,
@@ -94,7 +105,7 @@ function Invoke-EngineJson {
   # 引擎的机器接口：stdout 是单个 JSON（契约 §3.3），stderr 是给人看的诊断。
   param([string[]]$EngineArgs)
   $pwshExe = (Get-Process -Id $PID).Path
-  $tmp = Join-Path $env:TEMP ('dsh-repair-status-' + [guid]::NewGuid().ToString('N') + '.json')
+  $tmp = Join-Path $env:TEMP ('dsh-plugin-install-status-' + [guid]::NewGuid().ToString('N') + '.json')
   try {
     $line = (@('-NoProfile', '-NonInteractive', '-File', ('"' + $script:Engine + '"'), '-Json') +
       @($EngineArgs | ForEach-Object { '"' + $_ + '"' }) +
@@ -205,12 +216,12 @@ $dshHome = $F.dshHome
 $nodeExe = $F.nodeExe
 $pnpmMjs = $F.pnpm
 $stateDir = if ($StateDir) { $StateDir } elseif ($env:DSH_RESTART_HOME) { $env:DSH_RESTART_HOME } else { Join-Path $env:LOCALAPPDATA 'dsh-restart' }
-$logPath = Join-Path $stateDir "dsh-repair-$($script:Stamp).log"
-$resultPath = Join-Path $stateDir "dsh-repair-$($script:Stamp).json"
-$snapDir = Join-Path $stateDir "dsh-repair-$($script:Stamp).snapshot"
+$logPath = Join-Path $stateDir "dsh-plugin-install-$($script:Stamp).log"
+$resultPath = Join-Path $stateDir "dsh-plugin-install-$($script:Stamp).json"
+$snapDir = Join-Path $stateDir "dsh-plugin-install-$($script:Stamp).snapshot"
 $noticePath = Join-Path $dshHome '.smart-restart\pending-notice.json'
 
-if (-not $Reason) { $Reason = if ($Spec) { "installed $Spec" } else { 'dsh-repair' } }
+if (-not $Reason) { $Reason = if ($Spec) { "installed $Spec" } else { 'dsh-plugin-install' } }
 
 # 控制台编码：本机是中文 Windows，宿主/终端是 UTF-8，而控制台默认 OEM 代码页（GBK），
 # 中文会以乱码落到日志里；-Report 再把机器可读结果写成 UTF-8 文件。
@@ -555,14 +566,20 @@ if ($WhatIfPlan) {
   Write-Host "  0) 会话空窗闸门：quiet=${QuietSec}s，最多等 ${WaitQuietSec}s（超时中止，什么都不碰）"
   Write-Host "  1) 快照 package.json + pnpm-lock.yaml → $snapDir"
   Write-Host "  1b) 写续跑通知 $noticePath（停机前原子写：sessionId/reason/when/attempts=0/extra{package,resultPath,logPath}）"
-  Write-Host "  2) & '$script:Engine' -Stop -Profile $($F.profile)"
+  if ($OnDemand) {
+    Write-Host '  2) （-OnDemand）跳过：宿主由调用方停好'
+  }
+  else {
+    Write-Host "  2) & '$script:Engine' -Stop -Profile $($F.profile)"
+  }
   Write-Host "  3) cd '$profileDir'; & '$nodeExe' '$pnpmMjs' add $Spec --prefer-offline"
   Write-Host "  3b) 失败 → 还原快照 + pnpm install --prod --frozen-lockfile"
   Write-Host "  4) 落盘检查 $pkgName（目录 + package.json.version）"
   $scopeArg = if ($RepairScope) { ' + -RepairSharedScope' } else { '' }
   Write-Host ("  5) & '{0}' -CheckShadowed{1}" -f $script:Engine, $scopeArg)
   if ($Bundle) { Write-Host "  5b) 把 $pkgName 挂进 dsh.profile.bundles（校验不过就还原）" }
-  Write-Host "  6) & '$script:Engine' -Start -Profile $($F.profile)，然后健康校验（先取 web-auth-url.txt 的 port，退回 -Status 的 resolvedPort，${HealthSec}s）；不健康 → 回滚再起"
+  if ($OnDemand) { Write-Host '  6) （-OnDemand）跳过拉起，只做健康探测' }
+  else { Write-Host "  6) & '$script:Engine' -Start -Profile $($F.profile)，然后健康校验（先取 web-auth-url.txt 的 port，退回 -Status 的 resolvedPort，${HealthSec}s）；不健康 → 回滚再起" }
   Write-Host "  7) 写结果 $resultPath"
   if ($Report) {
     (([ordered]@{
@@ -585,8 +602,8 @@ if (-not $Confirm) {
 if ($Detach) {
   $idArg = if ($SessionId) { ' -SessionId "{0}"' -f $SessionId } else { '' }
   $bundleArg = if ($Bundle) { ' -Bundle' } else { '' }
-  $outLog = Join-Path $stateDir "dsh-repair-$($script:Stamp).out.log"
-  $runner = Join-Path $stateDir "dsh-repair-$($script:Stamp).run.cmd"
+  $outLog = Join-Path $stateDir "dsh-plugin-install-$($script:Stamp).out.log"
+  $runner = Join-Path $stateDir "dsh-plugin-install-$($script:Stamp).run.cmd"
 
   # 用 .cmd 落地再执行，避免 cmd 的嵌套引号解析问题
   $body = @(
@@ -647,8 +664,12 @@ $startedAt = (Get-Date).ToString('o')
 try {
   Write-Log "spec = $Spec ／ pkg = $pkgName ／ profile = $($F.profile) ／ session = $(if ($SessionId) { $SessionId } else { '(未指定)' })"
 
-  # 0) 闸门
-  if (-not $Force) {
+  # 0) 闸门（-OnDemand：宿主已由调用方停掉，没有会话可等）
+  if ($OnDemand) {
+    Write-Log '跳过闸门（-OnDemand：调用方负责停机）'
+    $steps.Add([pscustomobject]@{ step = 'gate'; code = 0 })
+  }
+  elseif (-not $Force) {
     if (-not (Wait-InstallWindow)) {
       Write-Log '闸门未通过，中止（未停机、未改任何文件）'
       $steps.Add([pscustomobject]@{ step = 'gate'; code = 2 })
@@ -675,13 +696,16 @@ try {
 
   # 1b) 续跑通知必须在停机之前写：新宿主起来后由 waker 消费，把本轮会话唤醒。
   #     写在成功之后（旧做法）只会把通知留给下一次无关重启。
-  Write-PendingNoticeSafe
+  if (-not $OnDemand) { Write-PendingNoticeSafe }
 
-  # 2) 停机
-  Write-Log '停止宿主'
-  & $script:Engine -Stop -Profile $F.profile
-  $script:StopTime = Get-Date
-  $steps.Add([pscustomobject]@{ step = 'stop'; code = $LASTEXITCODE })
+  # 2) 停机（-OnDemand：调用方已经停过，这里不能重复 -Stop）
+  if (-not $OnDemand) {
+    Write-Log '停止宿主'
+    & $script:Engine -Stop -Profile $F.profile
+    $script:StopTime = Get-Date
+    $steps.Add([pscustomobject]@{ step = 'stop'; code = $LASTEXITCODE })
+  }
+  else { $script:StopTime = Get-Date }
 
   # 3) 安装
   Write-Log 'pnpm add（宿主已停；--prefer-offline 优先吃本地缓存）'
@@ -742,8 +766,13 @@ finally {
   }
 
   # 6) 拉起 + 健康校验（不健康则回滚再起一次）
-  Write-Log '拉起宿主'
-  try { & $script:Engine -Start -Profile $F.profile | Out-Null } catch { Write-Log ('拉起失败：' + $_.Exception.Message) }
+  #    -OnDemand：宿主由调用方拉起，这里只读地探一次端口。
+  $health = $null
+  if (-not $OnDemand) {
+    Write-Log '拉起宿主'
+    try { & $script:Engine -Start -Profile $F.profile | Out-Null } catch { Write-Log ('拉起失败：' + $_.Exception.Message) }
+  }
+  else { Write-Log '跳过拉起（-OnDemand：调用方负责）' }
   $health = Test-HostHealthy
   $portDesc = if ($script:HealthyPort) { [string]$script:HealthyPort } else { 'auth-url / 进程扫描 / -Status 的 resolvedPort' }
   Write-Log ("健康校验（{0}，{1}s）= {2}" -f $portDesc, $HealthSec, $health)
@@ -751,7 +780,9 @@ finally {
   if (-not $health -and $pnpmExit -eq 0) {
     Write-Log '拉起后不健康 —— 回滚到快照并重起'
     $rollbackOk = Restore-Snapshot
-    try { & $script:Engine -Start -Profile $F.profile | Out-Null } catch { Write-Log ('二次拉起失败：' + $_.Exception.Message) }
+    if (-not $OnDemand) {
+      try { & $script:Engine -Start -Profile $F.profile | Out-Null } catch { Write-Log ('二次拉起失败：' + $_.Exception.Message) }
+    }
     $health = Test-HostHealthy
     Write-Log ("回滚后健康 = {0}（端口 {1}）" -f $health, $script:HealthyPort)
   }
@@ -773,6 +804,7 @@ finally {
     profile    = $F.profile
     hostKind   = $F.hostKind
     appRoot    = $F.appRoot
+    onDemand   = [bool]$OnDemand
     sessionId  = $SessionId
     status     = $status
     pnpmExit   = $pnpmExit

@@ -1,5 +1,5 @@
-# probe-notice.ps1
-# 只读验证 dsh-repair.ps1 的续跑通知写入：
+﻿# probe-plugin-install.ps1
+# 只读验证 dsh-plugin-install.ps1 的续跑通知写入：
 #   1) 用 PowerShell 语言解析器解析整个脚本，要求 0 错误；
 #   2) 从 AST 抽出真实的 Write-PendingNoticeSafe / Get-SpecPackageName 函数体，
 #      在临时目录里用假参数跑两次（第二次覆盖已存在的 pending-notice.json），
@@ -9,7 +9,7 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
-$target = Join-Path $PSScriptRoot 'dsh-repair.ps1'
+$target = Join-Path $PSScriptRoot 'dsh-plugin-install.ps1'
 if (-not (Test-Path -LiteralPath $target)) { throw "找不到 $target" }
 
 # ---------------------------------------------------------------- 1) 解析
@@ -45,8 +45,8 @@ if (-not ($staticTmp -and $staticMove -and $staticUtf8)) { exit 1 }
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ('notice-probe-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $work -Force | Out-Null
 $noticePath = Join-Path $work 'pending-notice.json'
-$resultPath = Join-Path $work 'dsh-repair-probe.json'
-$logPath    = Join-Path $work 'dsh-repair-probe.log'
+$resultPath = Join-Path $work 'dsh-plugin-install-probe.json'
+$logPath    = Join-Path $work 'dsh-plugin-install-probe.log'
 
 function Write-Log { param([string]$Message) Write-Host ("      [log] {0}" -f $Message) }
 
