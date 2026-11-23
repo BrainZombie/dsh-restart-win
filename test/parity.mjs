@@ -735,6 +735,22 @@ PROBES['X-22'] = [
     eng(/reason = 'port-owner-mismatch'/),
     eng(/reason = 'exited'/),
     eng(/reason = 'timeout'/),
+    // 端到端：ready 失败必须先写终态再退出，两者相邻不可分。
+    // 2026-11-23 真机踩过：进程在写终态前被打断，留下「App 起来了、引擎无记录」，
+    // 那次 rc=127、run-out 里没有终态，-Status 只看得到半个状态。
+    eng(/Write-Terminal \('ready-failed:' \+ \$ready\.reason\) 8\s*exit 8/),
+    // 失败分支必须交代刚拉起的实例去了哪：要么回收，要么明说保留。
+    // 没有 abort-cleanup 就 exit 8，等于静默留孤儿。
+    {
+        note: 'the ready-failure branch accounts for the instance it just launched before it exits',
+        fn: (ctx) => {
+            const text = ctx.text(ENGINE);
+            const at = text.indexOf("Write-Terminal ('ready-failed:' + $ready.reason) 8");
+            assert.ok(at > 0, 'the ready-failed terminal is missing');
+            const window = text.slice(Math.max(0, at - 6000), at);
+            assert.ok(/Add-Step 'abort-cleanup'/.test(window), 'rc=8 must explain what happened to the launched instance');
+        },
+    },
 ];
 PROBES['X-23'] = [eng(/Write-Terminal 'via-task-failed' 9/)];
 PROBES['X-24'] = [eng(/Write-Terminal 'verify-required' 10/)];
