@@ -112,6 +112,7 @@ param(
   [switch]$NoWait,            # 收尾不停留：跳过等新 boot token 的 20s，只做一次非阻塞扫描
   [switch]$RepairSharedScope, # 只做一件事：从 app.asar 重建 <DSH_HOME>\profiles\node_modules 并退出
   [switch]$CheckShadowed,     # 只做一件事：移走 profile 里遮蔽基础包的旧版本 @deepseek-ai/* 并退出
+  [switch]$CleanupOrphans,    # 只做一件事：回收父进程已退出的残留桌面宿主（不动当前实例）并退出
   [string]$LaunchRecord = ''  # 内部：交接模式下引擎自报 pid（见 lib/delayed-spawn.mjs 的 handoff）
 )
 
@@ -3724,6 +3725,73 @@ function Get-DesktopLaunch {
   return [pscustomobject]@{ file = $exe; args = @(); cwd = $cwd; source = 'desktop-app'; raw = $exe }
 }
 
+function Get-OrphanDesktopHosts {
+  <#
+    找「父进程已经不在了」的桌面宿主：taskkill /T 只顺着 pid 树杀，而树关系在父进程死掉那一刻
+    就断了。2026-11-23 的现场：一次调试连做 11 次重启，每次都拉起新的 Electron 主进程，
+    taskkill 杀掉新的那棵树，前一次的主进程却先自行退出 → 它名下的宿主成了孤儿，一直活着，
+    最后 5 个孤儿共占 ~1.8GB、各自占两个端口、各自跑一份 profile 的后台任务。
+    判据用身份（命令行含本机 dsh-desktop-host 入口）而不是 pid 树，才收得到孤儿。
+    恒返回数组。
+  #>
+  param([switch]$Refresh)
+  $out = New-Object System.Collections.ArrayList
+  if (-not (Get-CimAvailable)) { return @() }
+  $alive = @{}
+  foreach ($r in @(Find-DesktopHostRows -Refresh:$Refresh)) { if ($r) { $alive[[int]$r.ProcessId] = $r } }
+  foreach ($h in @(Get-DesktopHostProcesses -Refresh:$Refresh)) {
+    if ($alive.ContainsKey($h.mainPid)) { continue }
+    [void]$out.Add([pscustomobject]@{
+      pid       = $h.pid
+      mainPid   = $h.mainPid
+      createdAt = $h.createdAt
+      name      = $h.name
+    })
+  }
+  return @($out.ToArray())
+}
+
+function Stop-OrphanDesktopHosts {
+  <#
+    收掉孤儿宿主（见 Get-OrphanDesktopHosts）。带 -DryRunOnly 时只报告不杀。
+    返回 @{ killed = @(pid...); skipped = @(pid...) }；绝不 throw —— 清扫失败不该把一次成功
+    的重启变成失败，调用方把它写成 warn 步。
+  #>
+  param([switch]$DryRunOnly)
+  $killed = New-Object System.Collections.ArrayList
+  $skipped = New-Object System.Collections.ArrayList
+  $orphans = @(Get-OrphanDesktopHosts -Refresh)
+  if ($orphans.Count -eq 0) { return [pscustomobject]@{ killed = @(); skipped = @() } }
+  foreach ($o in $orphans) {
+    if ($DryRunOnly) {
+      Add-Step 'orphan' ("残留宿主 pid=" + $o.pid + "（原主进程 " + $o.mainPid + " 已退出）→ -DryRun 下不回收") 'warn'
+      [void]$skipped.Add($o.pid)
+      continue
+    }
+    $proc = Get-Process -Id $o.pid -ErrorAction SilentlyContinue
+    if (-not $proc) { continue }
+    & (Get-SystemTool 'taskkill') /PID $o.pid /T /F *> $null
+    Start-Sleep -Milliseconds 300
+    if (Get-Process -Id $o.pid -ErrorAction SilentlyContinue) {
+      try { Stop-Process -Id $o.pid -Force -ErrorAction Stop } catch { }
+      Start-Sleep -Milliseconds 200
+    }
+    if (Get-Process -Id $o.pid -ErrorAction SilentlyContinue) {
+      [void]$skipped.Add($o.pid)
+    } else {
+      [void]$killed.Add($o.pid)
+    }
+  }
+  if ($killed.Count -gt 0) {
+    Add-Step 'orphan' ("已回收残留桌面宿主 " + $killed.Count + " 个（父进程已退出的孤儿，taskkill /T 顺树杀不到）：" +
+      ($killed -join '、')) 'ok'
+  }
+  if ($skipped.Count -gt 0) {
+    Add-Step 'orphan' ("还有残留宿主未回收：" + ($skipped -join '、') + "（权限或正在退出）") 'warn'
+  }
+  return [pscustomobject]@{ killed = @($killed.ToArray()); skipped = @($skipped.ToArray()) }
+}
+
 function Stop-DesktopApp([int]$MainPid_, [int]$HostPid_, [int]$WaitSeconds) {
   <#
     桌面版的停机 = 杀 Electron 主进程整棵树（taskkill /T /F）。
@@ -3748,6 +3816,9 @@ function Stop-DesktopApp([int]$MainPid_, [int]$HostPid_, [int]$WaitSeconds) {
   while ((Get-Date) -lt $deadline) {
     if (-not (Get-Process -Id $MainPid_ -ErrorAction SilentlyContinue)) {
       Add-Step 'stop' "DSH Desktop 已退出（taskkill rc=$rc）" 'ok'
+      # 主进程树杀完之后再按身份清扫一遍：前几轮调试遗留的孤儿宿主不在任何 pid 树上（见
+      # Get-OrphanDesktopHosts 的注释），不清掉它们会继续占端口、继续跑同一个 profile 的后台任务。
+      try { [void](Stop-OrphanDesktopHosts -DryRunOnly:$DryRun) } catch { Add-Step 'orphan' ('清扫残留宿主失败：' + $_.Exception.Message) 'warn' }
       return $true
     }
     Start-Sleep -Milliseconds 500
@@ -3792,16 +3863,21 @@ function Start-DesktopApp {
   }
   $script:HostOutPath = $webOut
   $script:HostErrPath = $webErr
-  # 桌面版**不能**重定向 stdin/stdout/stderr：
-  #   本机实测（2026-11-23）给 Electron 主进程做这三个重定向，进程起来约 10s 后自己退出
+  # 桌面版曾经**不能**重定向 stdin/stdout/stderr：
+  #   本机实测（2026-11-23 前后）给 Electron 主进程做这三个重定向，进程起来约 10s 后自己退出
   #   （日志停在 dsh-browser-bridge listening 那一行），单实例锁于是把启动转给还在跑的旧 App，
   #   引擎等的是一个永远不会出现的宿主 —— 表现就是「重启后永远等不到就绪」。
-  #   管道继承的问题由 Hide-StdHandleInheritance 解决（那是句柄层面，不换管道）。
-  #   GUI 控制台输出拿不到也无所谓：宿主自己写日志到 profile 目录，token 另有 Resolve-WebAuthUrl。
-  $p = Start-Process -FilePath $plan.file -WorkingDirectory $plan.cwd -PassThru
+  #   那次的真凶是管道继承，已由 Hide-StdHandleInheritance（句柄层面关继承）解决。
+  # 反过来完全不重定向也有代价（2026-11-23 现场）：Electron 继承的是启动者那一代控制台的管道，
+  # 启动者一退出管道读端就没了 —— 主进程 console.error 直接抛 write EPIPE，
+  # 表现就是「A JavaScript error occurred in the main process」弹窗 + 日志里 ECONNRESET 刷屏。
+  # 所以现在：stdout/stderr 给文件（有归属、可排查），stdin 保持不重定向（GUI 不需要，
+  # 也不给宿主一个指向死管道的输入句柄）。GUI 自己的窗口不受影响。
+  $p = Start-Process -FilePath $plan.file -WorkingDirectory $plan.cwd -PassThru `
+       -RedirectStandardOutput $webOut -RedirectStandardError $webErr
   $script:NewPid = $p.Id
   $script:NewMainPid = $p.Id
-  Add-Step 'launch' "已拉起 DSH Desktop pid=$($p.Id)（$($plan.file)），stdout→$webOut" 'ok'
+  Add-Step 'launch' "已拉起 DSH Desktop pid=$($p.Id)（$($plan.file)），stdout/stderr→$StateDir\host.desktop.*.log" 'ok'
   return $p
 }
 
@@ -4178,6 +4254,14 @@ try {
     }
     Write-Terminal 'shadowed-checked' 0
     exit 0
+  }
+
+  if ($CleanupOrphans) {
+    $res = Stop-OrphanDesktopHosts -DryRunOnly:$DryRun
+    $code = 0
+    if ($res.skipped.Count -gt 0 -and $res.killed.Count -eq 0 -and -not $DryRun) { $code = 1 }
+    Write-Terminal $(if ($res.killed.Count -gt 0) { 'orphans-cleaned' } elseif ($DryRun) { 'orphans-listed' } else { 'orphans-none' }) $code
+    exit $code
   }
 
   if ($RepairSharedScope) {
