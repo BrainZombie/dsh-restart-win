@@ -456,7 +456,7 @@ measured example: `3082` → `200` (the default face, this is `-Status`'s `http`
 (`dsh-browser`'s debugging protocol — also a 200, but not the host's HTTP face), `48691` → `401`
 (the token-gated panel face), `48696` → `404` (a fallback route with nothing behind it yet).
 
-The engine probes them in the order **200 > 401 > 303 > anything else**, stops at the first hit, and
+The engine probes them in the order **401 > 200 > 303 > anything else**, stops at the first hit, and
 records every attempt in `instances[].probe` (status, milliseconds, stage). `401` ranks second because
 "port bound, auth layer asking for a token" also means the service is alive; a debugging face that also
 answers 200 can only be avoided by rank, never by guessing the port number. Right after a restart the
