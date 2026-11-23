@@ -117,6 +117,56 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
+# ---------------------------------------------------------------------------
+# 活动台账（activity ledger）：引擎还在「做事」的活证据。
+#
+# 为什么必须有（2026-11-23 实测）：命令行调用一次重启，机主看到的是空白提示符 + 什么都不发生，
+# 持续 14 分钟。原因不是引擎崩了，而是它**正确地**在等深度验证的隔离宿主（预算 150s，最多重试
+# 一次），而这段时间 stderr 一行字都没有；进程 CPU 停在 2.7s 不动，`-Status` 也只报一行
+# `result=status`。观察者无法区分三种状态：还在跑 / 卡死 / 根本没启动。
+#
+# 台账做的事：进程活着的时候每推进一个阶段就重写一次带时间戳的文件；进程一死（任何原因，包括
+# 被 Force 干掉）就没人再写 —— 于是「文件很旧」本身就等于「没人在跑」。
+#   * 只有拿到重启锁的动作才写（-Status 是只读的，不能假装有人在干活）。
+#   * 写在拿锁之后、第一个可能耗时的步骤之前，早于任何一次网络/WMI 探测。
+#   * 任何写失败都吞掉：台账是诊断设施，不能成为新的失败点。
+# ---------------------------------------------------------------------------
+function Get-ActivityPath { return (Get-StatePath 'activity.json') }
+
+function Write-Activity([string]$Step, [string]$Note = '') {
+    if (-not $script:ActivityOn) { return }
+    # 每一步只写一次会漏掉「一步之内长时间等待」的形状（实测：深度验证一步内部要等 150s 的
+    # 隔离宿主，台账在这 150s 里一动不动，看起来和卡死完全一样）。所以按时间节流：
+    # 节流窗内同一阶段只更新一次，换个阶段立刻写。
+    $now = Get-Date
+    if ($script:ActivityLastTick -and $script:ActivityLastStep -eq $Step -and
+        ($now - $script:ActivityLastTick).TotalSeconds -lt 2) { return }
+    $script:ActivityLastTick = $now
+    $script:ActivityLastStep = $Step
+    $action = if ($Start) { 'start' } elseif ($Stop) { 'stop' } elseif ($DryRun) { 'dry-run' }
+              elseif ($Preflight -or $VerifyOnly) { 'verify' } else { 'restart' }
+    $rec = [ordered]@{
+        pid        = $PID
+        host       = $env:COMPUTERNAME
+        version    = $script:VERSION
+        action     = $action
+        hostKind   = [string]$script:HostKind
+        profile    = $Profile
+        port       = $Port
+        step       = $Step
+        note       = $Note
+        elapsedSec = [math]::Round($script:Clock.Elapsed.TotalSeconds, 1)
+        updatedAt  = (Get-Date).ToString('o')
+    }
+    try { New-Utf8NoBom (Get-ActivityPath) ($rec | ConvertTo-Json -Compress) } catch { }
+}
+
+# 一次动作的总预算（见 Set-ActionBudget）。$null = 不设上限（只读动作）。
+function Get-BudgetLeftSec {
+    if (-not $script:ActionDeadline) { return $null }
+    return [Math]::Max(0, [int](([datetime]$script:ActionDeadline - (Get-Date)).TotalSeconds))
+}
+
 # -Json：stdout 是机器接口（契约 §3.3 单个 JSON 对象）—— 这里把三条口子堵死：
 #   ① 人类可读诊断一律改走 Write-Diag（stderr），全脚本不再有裸 Write-Host；
 #   ② 抑制 PowerShell 自身的 warning 流：两个宿主实测都把 Write-Warning 写到进程
@@ -229,6 +279,16 @@ $script:PhaseT0 = $null
 $script:Clock = [System.Diagnostics.Stopwatch]::StartNew()
 # 分阶段打点是否启用：只在 -Json / -ResultFile（机器接口）时记，人读模式不增加任何开销。
 $script:PhasesOn = [bool]($Json -or $ResultFile)
+# 活动台账是否启用：只有会拿重启锁的动作才写（-Status / -CheckShadowed 这类只读动作不写）。
+$script:ActivityOn = $false
+$script:ActivityLastTick = $null
+$script:ActivityLastStep = ''
+# 一次动作的预算（见 Set-ActionBudget）。只读动作保持 $null。
+$script:ActionDeadline = $null
+$script:ActionBudgetSec = 0
+# hostKind 是怎么判出来的（machine.json / boot-record / running / default / explicit）：
+# 冷启动判错形态是最贵的一类错误，所以推理来源必须能被 -Status 看见。
+$script:HostKindSource = ''
 # 进程内复用：一次调用里 netstat 与「全量进程表」各只需要一份（时间戳为 $null = 尚未取过）
 $script:NetstatRows = @()
 $script:NetstatStamp = $null
@@ -298,8 +358,13 @@ $script:DEFAULT_LAUNCH['cwd']  = $env:USERPROFILE
 function Add-Step([string]$name, [string]$detail, [string]$state = 'ok') {
   [void]$script:Steps.Add([ordered]@{ step = $name; state = $state; detail = $detail })
   if ($state -eq 'warn') { [void]$script:Warn.Add("${name}: ${detail}") }
+  # 每个阶段都落一次台账：这正是「还在跑」与「卡死」的分界线。落在这里而不是各个调用点，
+  # 是为了让漏掉的调用点也能被覆盖（Add-Step 本身就是阶段的唯一出口）。
+  Write-Activity $name $detail
   if (-not $Json) {
     $mark = switch ($state) { 'ok' { '  ok ' } 'warn' { ' WARN' } 'skip' { ' skip' } default { ' FAIL' } }
+    # 人读模式下每行都带「已用秒数」：机主看到的是一条在往前走的进度，而不是一段静默。
+    # 以前这里只打内容，30s 的深度验证和「卡死」在屏幕上长得一模一样。
     Write-Diag ("[{0}] {1,-18} {2}" -f $mark.TrimEnd(), $name, $detail)
   }
 }
@@ -1269,21 +1334,31 @@ function Get-HttpStatusCodeDetail {
     服务器回 Connection: close / 不回内容长度时第一遍可能什么都读不到，所以要能重发一次。
       返回 @{ code; reconnecting }
   #>
-  param([int]$Port, [string]$Host_ = $BindHost, [int]$TimeoutMs = 5000, [string]$Path = '/')
+  param([int]$Port, [string]$Host_ = $BindHost, [int]$TimeoutMs = 5000, [string]$Path = '/', [int]$Retries = 2)
   # $Path 必须带查询串：带 token 的地址是 /?token=… —— token 不在请求行里时宿主按「没凭据」
   # 回 401，看起来像「token 失效」（实测踩过一次，一个完全有效的 token 被判成失效）。
   if (-not $Path) { $Path = '/' }
   if (-not $Path.StartsWith('/')) { $Path = '/' + $Path }
   $req = "GET $Path HTTP/1.1`r`nHost: ${Host_}:$Port`r`nUser-Agent: dsh-restart-probe`r`nAccept: */*`r`nConnection: close`r`n`r`n"
   $bytes = [System.Text.Encoding]::ASCII.GetBytes($req)
-  for ($attempt = 0; $attempt -lt 2; $attempt++) {
+  # 重发次数由调用方定：服务器回 Connection: close / 不回内容长度时第一遍可能什么都读不到，
+  # 值得再问一次；但「读超时」说明对端连话都不说，重发只会把这个超时翻倍。
+  $attempts = [Math]::Max(1, $Retries)
+  $connectFailed = $false
+  for ($attempt = 0; $attempt -lt $attempts; $attempt++) {
     $c = $null
     $n = 0
+    $connectFailed = $false
     $head = ''
     try {
       $c = [System.Net.Sockets.TcpClient]::new()
       $maxWait = [Math]::Max(200, [Math]::Min($TimeoutMs, 1500))
-      if (-not $c.ConnectAsync($Host_, [int]$Port).Wait($maxWait)) { $c = $null; continue }
+      if (-not $c.ConnectAsync($Host_, [int]$Port).Wait($maxWait)) {
+        # 连不上 = 端口没人听。这不是「重发一次可能变好」的情况（SYN 重试要 ~14s），
+        # 立刻返回，别让重发把这份等待翻倍。
+        $connectFailed = $true
+        continue
+      }
       $ns = $c.GetStream()
       $ns.WriteTimeout = [Math]::Max(500, $TimeoutMs)
       $ns.ReadTimeout = [Math]::Max(500, $TimeoutMs)
@@ -1303,6 +1378,9 @@ function Get-HttpStatusCodeDetail {
       if ($m.Success) { return [pscustomobject]@{ code = [int]$m.Groups[1].Value; reconnecting = ($attempt -eq 1) } }
     }
   }
+  # 区分两种失败，上游靠它决定要不要再等一次：连不上（端口没绑）vs 连上了但没回状态行
+  # （读超时 / 对端乱说话）。前者重发没有意义，后者才值得在「宿主启动早期」再问一遍。
+  if ($connectFailed -and $attempts -eq 1) { return [pscustomobject]@{ code = 0; reconnecting = $false } }
   return [pscustomobject]@{ code = 0; reconnecting = $true }
 }
 
@@ -1335,7 +1413,13 @@ function Invoke-HttpProbe {
   } finally {
     if ($c) { try { $c.Close() } catch { } }
   }
-  $r = Get-HttpStatusCodeDetail -Port $Port -Host_ $Host_ -TimeoutMs $RequestTimeoutMs
+  # 「连上了但一句话都不回」是唯一能把探测器拖满预算的形状（实测：accept 后永不响应的端口
+  # 让一次 Invoke-HttpProbe 花掉 10.19s = 读超时 5s × 重发 2 次）。所以：连接阶段已经超时的
+  # 端口不再进入读阶段（那里只会再等一次同样的超时）；真正读超时的也只在「重发一次可能有
+  # 不同结果」时才重发 —— 见下面 $Retries 的推导。
+  # 连接是通的（上面已经确认），才谈「重发一次」：这一步以前无论如何都发两次，一次读超时
+  # 就翻倍成 10s。现在按「本端口是否值得再问一遍」决定，默认不问。
+  $r = Get-HttpStatusCodeDetail -Port $Port -Host_ $Host_ -TimeoutMs $RequestTimeoutMs -Retries 1
   $sw.Stop()
   return [pscustomobject]@{
     status = $r.code
@@ -1852,8 +1936,17 @@ function Test-DeepVerify {
          -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
 
     $deadline = (Get-Date).AddSeconds($VerifyReadySec)
+    # 本次动作的总预算同样封顶深度验证：两层各计一个 150s 就是这台机器上「无声等待 5 分钟」的来历。
+    if ($script:ActionDeadline -and $script:ActionDeadline -lt $deadline) { $deadline = $script:ActionDeadline }
     $tokenSeen = $false
+    $verifyStart = Get-Date
+    $verifyRound = 0
     while ((Get-Date) -lt $deadline) {
+      $verifyRound++
+      # 这一步是整条链里最长的一段静默（隔离宿主起来要约 60-200s）：必须有心跳。
+      Write-Activity 'deep-verify' ("等待隔离宿主端口 " + $vPort + " 就绪：第 " + $verifyRound + " 轮，已等 " +
+        [int]((Get-Date) - $verifyStart).TotalSeconds + "s / 预算 " + $VerifyReadySec + "s" +
+        $(if ($null -ne (Get-BudgetLeftSec)) { "（本次动作剩余 " + (Get-BudgetLeftSec) + "s）" } else { '' }))
       if ($p.HasExited) { break }
       if (-not $tokenSeen) {
         foreach ($f in @($out, $err)) {
@@ -1866,7 +1959,7 @@ function Test-DeepVerify {
       $probe = Read-HostServing ("http://127.0.0.1:$vPort/")
       # 只认 401/200（404 = 路由还没注册完，不算就绪）
       if ($probe.ready) { break }
-      Start-Sleep -Milliseconds 800
+      Start-Sleep -Milliseconds 900
     }
 
     $final = Test-HttpServing ("http://127.0.0.1:$vPort/")
@@ -2297,9 +2390,15 @@ function Wait-HostReady([int]$Pid_, [int]$P, [int]$MaxSec, [datetime]$Start_) {
   if ($script:HostKind -eq 'desktop') { return (Wait-DesktopHostReady $Pid_ $MaxSec $Start_) }
   $url = "http://${BindHost}:$P/"
   $deadline = (Get-Date).AddSeconds($MaxSec)
+  # 本次动作的总预算封顶（深度验证已经花掉的部分要从这里扣）：超预算就明确报超时，
+  # 不在这里重新开始一个新的 90s。
+  if ($script:ActionDeadline -and $script:ActionDeadline -lt $deadline) { $deadline = $script:ActionDeadline }
   $last = [pscustomobject]@{ status = 0; serving = $false; authed = $false }
   $tokenSeen = $false
+  $round = 0
+  $waitStart = Get-Date
   while ((Get-Date) -lt $deadline) {
+    $round++
     $proc = Get-Process -Id $Pid_ -ErrorAction SilentlyContinue
     $last = Test-HttpServing $url
     if ($last.ready) {
@@ -2340,14 +2439,42 @@ function Wait-HostReady([int]$Pid_, [int]$P, [int]$MaxSec, [datetime]$Start_) {
       Show-LaunchFailure $script:HostOutPath $script:HostErrPath
       return [pscustomobject]@{ ok = $false; reason = 'exited' }
     }
-    Start-Sleep -Milliseconds 700
+    Write-Activity 'ready' ("等待 web 宿主就绪 " + $url + "：第 " + $round + " 轮，HTTP " + $last.status +
+      "，已等 " + [int]((Get-Date) - $waitStart).TotalSeconds + "s，剩余预算 " + $(if ($null -ne (Get-BudgetLeftSec)) { (Get-BudgetLeftSec).ToString() + 's' } else { '不限' }))
+    Start-Sleep -Milliseconds 900
   }
-  $diag = if ($last.status -eq 404) { '端口已绑但 $MaxSecs 内路由未就绪（404）' } elseif ($last.status -eq 0) { '$MaxSecs 内端口无响应' } else { "最后状态码 $($last.status)" }
+  $diag = if ($last.status -eq 404) { "端口已绑但 ${MaxSec}s 内路由未就绪（404）" } elseif ($last.status -eq 0) { "${MaxSec}s 内端口无响应" } else { "最后状态码 $($last.status)" }
   Add-Step 'ready' "等待就绪超时 ${MaxSec}s：$diag" 'fail'
   return [pscustomobject]@{ ok = $false; reason = 'timeout'; last = $last.status }
 }
 
 # ---------------------------------------------------------------- 锁（R11/R20：句柄不可被继承）
+
+# 一次动作的总预算。
+# 为什么需要：一个失败的重启可以合法地把 2×150s（深度验证 + 重试）+ 90s（就绪）+ 30s（端口释放）
+# 一路等完 —— 七分钟以上，而每一层各自计时要等，命令行里连一个字都不出。预算把它收敛成
+# 「一次动作一批时间」，且每个等待都引用同一个截止时刻，于是剩余时间可以被报出来。
+# 只读动作（-Status / -CheckShadowed / -RepairSharedScope / -Record）不设预算：它们本来就快，
+# 而且不能被一个不相关的截止时刻打断。
+function Set-ActionBudget {
+    if ($Status -or $CheckShadowed -or $RepairSharedScope -or $Record) {
+        $script:ActionDeadline = $null
+        $script:ActionBudgetSec = 0
+        return
+    }
+    $budget = 0
+    if ($DryRun) { $budget = [Math]::Max(30, $ReadySec) }
+    elseif ($Stop) { $budget = [Math]::Max(30, $PortFreeSec) + 30 }
+    elseif ($Preflight -or $VerifyOnly) { $budget = 2 * $VerifyReadySec + 60 }
+    else {
+        $verifyPart = 0
+        # 桌面版的组合校验走「隔离宿主深验证」那一路；-Fast 明确要求跳过。与 needsDeepVerify 同判据。
+        if (-not $Start -and -not $Fast -and $script:HostKind -ne 'desktop') { $verifyPart = 2 * $VerifyReadySec + 60 }
+        $budget = $verifyPart + $PortFreeSec + $ReadySec + $GraceSec + 60
+    }
+    $script:ActionBudgetSec = [int]$budget
+    $script:ActionDeadline = (Get-Date).AddSeconds([int]$budget)
+}
 
 function Get-MutexName {
   # 桌面版端口随机且发现前未知：按形态命名互斥体，避免不同端口的两套宿主互相放行
@@ -2488,6 +2615,22 @@ function Show-Status {
       profile    = $Profile
       port       = $Port
       hostKind   = [string]$script:HostKind
+      # 形态是怎么判出来的：冷启动判错是最贵的一类错误，必须能从 -Status 反查推理来源。
+      hostKindSource = [string]$script:HostKindSource
+      # 有没有引擎正在做事：活动台账。ageSec 很大或文件缺失 = 没人在跑（不是卡死）。
+      activity = $(try {
+          $ap = Get-ActivityPath
+          if (-not (Test-Path -LiteralPath $ap -PathType Leaf)) { $null } else {
+            $a = Get-Content -LiteralPath $ap -Raw -Encoding UTF8 | ConvertFrom-Json
+            $age = 0
+            try { $age = [int]((Get-Date) - [datetime]$a.updatedAt).TotalSeconds } catch { $age = -1 }
+            $alive = $false
+            try { $alive = [bool](Get-Process -Id ([int]$a.pid) -ErrorAction Stop) } catch { $alive = $false }
+            [ordered]@{ pid = [int]$a.pid; step = [string]$a.step; note = [string]$a.note;
+                        action = [string]$a.action; ageSec = $age; processAlive = $alive;
+                        elapsedSec = $a.elapsedSec; updatedAt = $a.updatedAt }
+          }
+        } catch { $null })
       desktopApp = $desktopApp
       desktopAppSource = [string]$script:DesktopAppPathSource
       runtimeDir = $(if ($desktopApp) { (Get-DesktopPaths $desktopApp).runtimeDir } else { '' })
@@ -2547,6 +2690,29 @@ function Show-Status {
     Write-Diag ("  node 子进程 : {0} 个，共 {1}MB" -f $children.Count, (($children | Measure-Object ws_mb -Sum).Sum))
   } else { Write-Diag "  node 子进程 : 无（或不可枚举）" }
   Write-Diag ("  启动档案    : {0}" -f $(if ($rec) { "$($rec.command)  (cwd=$($rec.cwd))" } else { '(未记录，将用内置 DEFAULT_LAUNCH)' }))
+  # 有没有人在跑：这是「点了没反应」和「正在干活」的唯一分界线，必须打在人读输出的最前面。
+  try {
+    $ap = Get-ActivityPath
+    if (Test-Path -LiteralPath $ap -PathType Leaf) {
+      $a = Get-Content -LiteralPath $ap -Raw -Encoding UTF8 | ConvertFrom-Json
+      $age = 0
+      try { $age = [int]((Get-Date) - [datetime]$a.updatedAt).TotalSeconds } catch { $age = -1 }
+      $alive = $false
+      try { $alive = [bool](Get-Process -Id ([int]$a.pid) -ErrorAction Stop) } catch { $alive = $false }
+      $stateText = if ($alive -and $age -ge 0 -and $age -le 90) {
+        "进行中：$($a.action) 的 $($a.step)，已跑 $($a.elapsedSec)s，$($age)s 前还在动（pid=$($a.pid)）"
+      } elseif ($alive) {
+        "进程 pid=$($a.pid) 还在，但 $($age)s 没推进（停在 $($a.step)）—— 多半是卡住了，可用 -Stop 或结束该 pid"
+      } else {
+        "没有正在进行的动作（上一次是 $($a.action) 的 $($a.step)，$($age)s 前，进程已退出）"
+      }
+      $color = if ($alive -and $age -le 90) { 'Green' } elseif ($alive) { 'Yellow' } else { 'Gray' }
+      Write-Diag ("  当前动作    : {0}" -f $stateText) -ForegroundColor $color
+    } else {
+      Write-Diag "  当前动作    : 无（没有引擎在跑）"
+    }
+  } catch { Write-Diag "  当前动作    : 读不到活动台账" }
+  Write-Diag ("  宿主判据    : {0}" -f $(if ($script:HostKindSource) { $script:HostKindSource } else { '(未记录)' }))
   Write-Diag ("  最近一次重启: {0}" -f $(if ($last) { "$($last.ts) result=$($last.result) rc=$($last.rc) 旧pid=$($last.target_pid) 新pid=$($last.new_pid)" } else { '(无记录)' }))
 
   # 托管形态判定（R13）
@@ -3284,15 +3450,55 @@ function Get-DesktopInstances {
 }
 
 function Resolve-HostKind {
-  # auto：先看有没有桌面版宿主进程；其次看启动档案是不是记录着 Desktop 的 exe。
-  # 两者都没有 → web（保持老行为，连“找不到 dsh web”的失败文案都不变）。
-  if ($script:HostKindRequested -ne 'auto') { $script:HostKind = $script:HostKindRequested; return }
-  if (@(Get-DesktopHostProcesses).Count -gt 0) { $script:HostKind = 'desktop'; return }
+  <#
+    auto 的判据顺序（先活的事实，再落盘的机器事实，最后才是默认值）：
+
+      ① 有桌面版宿主进程在跑                      → desktop（唯一不需要推断的证据）
+      ② <StateDir>\machine.json 说这台机器是 desktop → desktop
+      ③ 启动档案里的命令是 Desktop 的 exe          → desktop
+      ④ 桌面版 App 就装在本机、而 web 宿主不可启动  → desktop
+      ⑤ 以上都不成立                              → web（保持老行为，连“找不到 dsh web”的失败文案都不变）
+
+    为什么必须加 ②③ 的对称性（2026-11-23 冷启动实测）：旧版只看「有没有进程」和「启动档案里有没有
+    exe 字面量」。开机后 DSH 还没起来时两条都不成立，于是这台**明确是桌面版**的机器被判成 web，
+    接着去跑 `cmd /c dsh web --no-open ...`：那条命令在没装 dsh CLI 的机器上要等到 PATH 解析失败
+    才报错，中间既没有 exe 被拉起、也没有任何一行提示 —— 机主看到的就是「点了没反应」。
+    机器已经用 dsh-config / 安装器记录过 hostKind=desktop 时，没有理由把它推翻。
+  #>
+  if ($script:HostKindRequested -ne 'auto') {
+    $script:HostKind = $script:HostKindRequested
+    $script:HostKindSource = 'explicit'
+    return
+  }
+  if (@(Get-DesktopHostProcesses).Count -gt 0) {
+    $script:HostKind = 'desktop'
+    $script:HostKindSource = 'running-instance'
+    return
+  }
+  $mc = Get-MachineConfig
+  if ($mc -and [string]$mc.hostKind -eq 'desktop') {
+    $script:HostKind = 'desktop'
+    $script:HostKindSource = 'machine.json'
+    return
+  }
   $rec = Get-BootRecord
-  if ($rec -and $rec.command -and ([string]$rec.command -match '(?i)DeepSeek Harness\.exe')) {
-    $script:HostKind = 'desktop'; return
+  # machine.json 存在时它的 hostKind 就是这台机器的属性；启动档案只能补「它没说」的空。
+  # 否则一份旧的启动档案会把一台 web 机器永久钉在 desktop 上（反过来更糟：热启动时被忽视）。
+  $machineSaid = [bool]($mc -and $mc.hostKind)
+  if (-not $machineSaid -and $rec -and $rec.command -and ([string]$rec.command -match '(?i)DeepSeek Harness\.exe')) {
+    $script:HostKind = 'desktop'
+    $script:HostKindSource = 'boot-record'
+    return
+  }
+  # 启动档案只说了一条命令（任意 exe），它的 hostKind 字段来自「上一次是谁在跑」，
+  # 不是这台机器的属性 —— 不能拿它推翻 machine.json 明确声明的 web。
+  if (-not $machineSaid -and $rec -and [string]$rec.hostKind -eq 'desktop') {
+    $script:HostKind = 'desktop'
+    $script:HostKindSource = 'boot-record'
+    return
   }
   $script:HostKind = 'web'
+  $script:HostKindSource = 'default'
 }
 
 function Resolve-DesktopProfileName {
@@ -3317,6 +3523,13 @@ function Resolve-DesktopProfileName {
   if ($rec -and $rec.profile -and [string]$rec.profile -ne $Profile) {
     Add-Step 'profile' "profile 自动取自启动档案：$($rec.profile)" 'ok'
     $script:Profile = [string]$rec.profile
+    return
+  }
+  # 冷启动时既没有运行中的宿主、也没有启动档案：machine.json 是这台机器唯一的落盘事实。
+  $mc = Get-MachineConfig
+  if ($mc -and $mc.profile -and [string]$mc.profile -ne $Profile) {
+    Add-Step 'profile' "profile 自动取自 machine.json：$($mc.profile)" 'ok'
+    $script:Profile = [string]$mc.profile
   }
 }
 
@@ -3551,11 +3764,17 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec, [datetime]$MainStar
     try { $newMainStart = (Get-Process -Id $MainPid_ -ErrorAction Stop).StartTime } catch { $newMainStart = $null }
   }
   $deadline = (Get-Date).AddSeconds($MaxSec)
+  # 本次动作的总预算封顶：深度验证/停机/启动已经花掉的要从就绪等待里扣掉，不让每一层
+  # 各自重新计一个 90s（否则一次失败的重启可以合法地耗掉 7 分钟以上而全程无声）。
+  if ($script:ActionDeadline -and $script:ActionDeadline -lt $deadline) { $deadline = $script:ActionDeadline }
   $lastPorts = @()
-  # 端口表每轮只扫一次，交给本轮所有宿主候选复用（每次 netstat 实测 ~200ms，循环里每 700ms 一轮）
+  $round = 0
+  $waitStart = Get-Date
+  # 端口表每轮只扫一次，交给本轮所有宿主候选复用（每次 netstat 实测 ~200ms，循环里每 900ms 一轮）
   $script:NetstatRows = @()
   $nextScan = (Get-Date).AddYears(-1)
   while ((Get-Date) -lt $deadline) {
+    $round++
     if ((Get-Date) -ge $nextScan) { $script:NetstatRows = Get-NetstatListenerRows -Refresh; $nextScan = (Get-Date).AddSeconds(2) }
     $mainAlive = $false
     try {
@@ -3601,7 +3820,10 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec, [datetime]$MainStar
         return [pscustomobject]@{ ok = $true; http = $pick.status; authed = ($pick.status -eq 200); pid = $h.pid; mainPid = $MainPid_; port = $pick.port }
       }
     }
-    Start-Sleep -Milliseconds 700
+    Write-Activity 'ready' ("等待 DSH Desktop 宿主就绪：主进程 pid=" + $MainPid_ + "，第 " + $round + " 轮，端口 " +
+      $(if (@($lastPorts).Count -gt 0) { $lastPorts -join ',' } else { '(尚未监听)' }) +
+      "，已等 " + [int]((Get-Date) - $waitStart).TotalSeconds + "s，剩余预算 " + $(if ($null -ne (Get-BudgetLeftSec)) { (Get-BudgetLeftSec).ToString() + 's' } else { '不限' }))
+    Start-Sleep -Milliseconds 900
   }
   $diag = if (@($lastPorts).Count -gt 0) { "端口 $($lastPorts -join ',') 已绑定但未就绪" } else { '未发现宿主子进程的监听端口' }
   Add-Step 'ready' "等待 DSH Desktop 就绪超时 ${MaxSec}s：$diag" 'fail'
@@ -3721,12 +3943,23 @@ function Test-DesktopVerify {
          -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
 
     $deadline = (Get-Date).AddSeconds($VerifyReadySec)
+    # 动作总预算同样封顶（见 Set-ActionBudget）：桌面版深验证是整条链里最长的一段，
+    # 实测本机就要 70s+，机器慢或插件多时能顶到 150s。
+    if ($script:ActionDeadline -and $script:ActionDeadline -lt $deadline) { $deadline = $script:ActionDeadline }
     $lastHttp = 0
     $fatal = ''
     $lastScan = Get-Date
+    $verifyStart = Get-Date
+    $verifyRound = 0
     $script:NetstatRows = @()
     $nextNetstat = (Get-Date).AddYears(-1)
     while ((Get-Date) -lt $deadline) {
+      $verifyRound++
+      # 心跳：这一步在本机要 70s 起步，没有这行台账，命令行和「卡死」长得一模一样。
+      Write-Activity 'deep-verify' ("等待隔离桌面宿主就绪：第 " + $verifyRound + " 轮，已等 " +
+        [int]((Get-Date) - $verifyStart).TotalSeconds + "s / 预算 " + $VerifyReadySec + "s" +
+        $(if ($null -ne (Get-BudgetLeftSec)) { "（本次动作剩余 " + (Get-BudgetLeftSec) + "s）" } else { '' }) +
+        $(if ($lastHttp -gt 0) { "，最后 HTTP=$lastHttp" } else { '' }))
       if ((Get-Date) -ge $nextNetstat) { $script:NetstatRows = Get-NetstatListenerRows -Refresh; $nextNetstat = (Get-Date).AddSeconds(2) }
       if ($p.HasExited) { break }
       # 启动期致命错误要立刻收手：某些插件在隔离宿主里会挂住（例如 tailscale 入口冲突反复重试），
@@ -3924,6 +4157,15 @@ try {
       exit 2
     }
     Add-Step 'lock' ("已取得互斥体 " + (Get-MutexName) + "（句柄不继承）") 'ok'
+    # 从这一刻起「有人在干活」是可观察的了：先落一行台账，再算本次动作的预算。
+    # 顺序要紧 —— 台账必须在第一个可能耗时的步骤（幂等闸门里的进程/端口探测、深度验证）之前。
+    Set-ActionBudget
+    $script:ActivityOn = $true
+    Write-Activity 'lock' ("取得重启锁；本次动作预算 " + $script:ActionBudgetSec + "s")
+    if ($script:ActionBudgetSec -gt 0) {
+      Add-Step 'budget' ("本次动作预算 " + $script:ActionBudgetSec + "s（深度验证 " + $(if ($Preflight -or $VerifyOnly) { 2 * $VerifyReadySec } elseif (-not $Start -and -not $Fast -and $script:HostKind -ne 'desktop') { 2 * $VerifyReadySec } else { 0 }) +
+        "s + 端口释放 " + $PortFreeSec + "s + 就绪 " + $ReadySec + "s + 收尾 " + $GraceSec + "s）；每层等待都引用这个截止时刻，超出即明确失败") 'ok'
+    }
   } else {
     Add-Step 'lock' '只读状态：不取重启锁（不阻塞也不会被阻塞）' 'skip'
   }
@@ -3949,6 +4191,11 @@ try {
   if ($VerifyOnly -or $Preflight) {
     $symOk = Test-SymlinkPrivilege
     $script:VerifyTail = @()
+    # 这一步以前只有「开始」和「结果」两条记录，中间的 60-200s 完全静默 —— 命令行里看起来
+    # 就是没反应。先打一条预算，再让 Test-DeepVerify 的循环每 2s 更新台账心跳。
+    Add-Step 'deep-verify' ("开始隔离实例验证（上限 " + $VerifyReadySec + "s" +
+      $(if ($null -ne (Get-BudgetLeftSec)) { "，本次动作剩余预算 " + (Get-BudgetLeftSec) + "s" } else { '' }) +
+      "）：起步就要复制 profile 并拉起一个一次性的桌面宿主，这一段是本工具最长的等待") 'ok'
     $dv = Invoke-DeepVerifyWithRetry
     if ($dv -and $dv.ok) { Write-Terminal 'verify-only-ok' 0; exit 0 }
     # StrictMode 2.0：$dv 可能是 catch 路径返回的 { ok; error }（没有 tail 属性），
