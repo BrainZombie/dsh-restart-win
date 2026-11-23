@@ -132,7 +132,11 @@ Invoke-NoticeWrite -SessionId 'probe-session-0001' -Reason 'plugin-install' -pkg
 Assert-Notice -Label 'run3 无包名（package=null）' -ExpectPackage '' -PackageIsNull $true -ExpectReason 'plugin-install'
 
 # 静态确认：调用点仍在「停止宿主」之前
-$callLine = @(Select-String -LiteralPath $target -Pattern '^\s*Write-PendingNoticeSafe\s*$' | Select-Object -ExpandProperty LineNumber)
+# 调用点写在 `if (-not $OnDemand) { Write-PendingNoticeSafe }` 里（-OnDemand 由调用方自己停机、
+# 自己写通知），所以按「行内出现 Write-PendingNoticeSafe 但不是函数定义」来找，而不是只认独占一行。
+$callLine = @(Select-String -LiteralPath $target -Pattern '^\s*(if \(-not \$OnDemand\) \{ )?Write-PendingNoticeSafe' |
+  Where-Object { $_.Line -notmatch '^\s*function\s' } |
+  Select-Object -ExpandProperty LineNumber)
 $stopLine = @(Select-String -LiteralPath $target -Pattern '停止宿主' | Select-Object -ExpandProperty LineNumber)
 $orderOk = ($callLine.Count -ge 1 -and $stopLine.Count -ge 1 -and $callLine[0] -lt $stopLine[0])
 Write-Host ("[4] 调用顺序：Write-PendingNoticeSafe @line {0} < 停止宿主 @line {1}  {2}" -f ($callLine -join '/'), ($stopLine -join '/'), $(if ($orderOk) { 'PASS' } else { 'FAIL' }))

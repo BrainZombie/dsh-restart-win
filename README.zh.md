@@ -260,9 +260,9 @@ curl.exe -s --noproxy '*' http://127.0.0.1:<port>/dsh-restart-win/api/sessions
 
 有些补丁/bridge 工具会把 `resources\app.asar` 解成真实目录 `resources\app\dsh`。引擎两种都认：先看 asar 文件，没有再找 `resources\app\dsh`，发现、深度验证、共享投影重建都按实际存在的那一种走。`-Status` 在两种布局下都能报出实例；不会再因为「app.asar 不存在」就判定桌面运行时缺失。
 
-## 5. 四个工具
+## 5. 五个工具
 
-四个工具的输入都先过白名单校验再拼 argv 数组（从不拼 shell 字符串），非法值直接返回错误而不是回退到默认值。`tools` 配置可以逐个关掉。
+五个工具的输入都先过白名单校验再拼 argv 数组（从不拼 shell 字符串），非法值直接返回错误而不是回退到默认值。`tools` 配置可以逐个关掉（`restart` / `status` / `preflight` / `result` / `install`）。
 
 ### 5.1 `win_restart`
 
@@ -292,6 +292,16 @@ curl.exe -s --noproxy '*' http://127.0.0.1:<port>/dsh-restart-win/api/sessions
 | `verifyTempRoot` | string | `%TEMP%` | 隔离验证实例的临时根 |
 
 输出（`ok`、`action`、`started`、`state` ∈ `ok`/`failed`/`running`、`runId`、`resultFile`、`exitCode`、`summary`、`error`、`delayMs`、`detail`）。`state=running` 表示已排程，用 `win_restart_result` 取结论。
+
+### 5.1.1 `install_plugin`
+
+走安全安装通道（§5.5.1），是 `plugin_manager` 的替代品：后者直接对运行中的 profile 调 pnpm。参数：`action`（必填）、
+`spec`、`bundle`、`healthSec`、`reason`、`profile`、`dshHome`、`stateDir`、`pwshPath`。
+
+- `status` / `plan` / `repair_scope` / `check_shadowed`：只读或单步修复，随时可调。
+- `install`：**长调用、前台执行**——`-Status` 判断宿主是否在跑 → `-Stop` → 脚本 `-OnDemand -Confirm`（快照、pnpm、落盘检查、查遮蔽、失败回滚）→ `-Start`。宿主在中间会停一次，当前会话会断。
+
+输出：`ok`、`action`、`state` ∈ `ok`/`failed`、`runId`、`reportFile`、`exitCode`、`summary`、`error`、`detail`（`install` 时 `detail.steps` 逐阶段列出 stop / install / start 的结果，`detail.report` 是脚本的机器可读报告）。
 
 ### 5.2 `win_restart_status`
 
@@ -354,6 +364,27 @@ pwsh -NoProfile -File .\scripts\dsh-plugin-install.ps1 -RepairSharedScope -Confi
 `-Report <path>` 把机器可读结果写成 UTF-8 JSON（调用方不必解析控制台）。`-Engine` / `-Profile` /
 `-DshHome` / `-NodeExe` / `-PnpmMjs` 可覆盖自动解析；每次运行都会顺带刷新
 `<StateDir>\machine.json`（见 §5.6）。
+
+### 5.5.1 `install_plugin`：让 agent 走这条路，而不是 `plugin_manager`
+
+DSH 自带的 `plugin_manager` 工具（`dsh-plugin-manager/tools`）直接调 pnpm 打运行中的 profile，
+正是本节开头那三个坑的来源，而且它和 pnpm 之间没有任何可插入的钩子。所以本插件另外注册了一个
+**`install_plugin`** 工具，把同一条安全链路暴露给模型：
+
+| 动作 | 做什么 |
+| --- | --- |
+| `status` | 只读：机器事实 + 活跃会话（等价 `-CensusOnly`） |
+| `plan` | 只读：给定 spec 的完整步骤（等价 `-WhatIfPlan`） |
+| `install` | 停宿主 → `-OnDemand` 安装 → 拉起；`detail.steps` 逐阶段回报 |
+| `repair_scope` | 重建共享投影（等价引擎 `-RepairSharedScope`） |
+| `check_shadowed` | 移走遮蔽基础包（等价引擎 `-CheckShadowed`） |
+
+分工是刻意划开的：**工具负责停机与拉起**，脚本用 `-OnDemand` 只做快照、pnpm、落盘检查、查遮蔽与回滚，
+所以脚本不会对已经停掉的宿主再 `-Stop` 一次（那会以非零码退出）。`install` 是长调用，宿主会在中间停一次，
+当前会话会断；`status` / `plan` / `check_shadowed` 随时可调，不改任何东西。
+
+`plugin_manager` 保持原样不动——这一步只是给 agent 一条明确的替代路径，观察一轮后再决定是否重定向。
+想在某个 profile 关掉它：`tools.install: false`。
 
 ## 5.6 机器事实：`scripts\dsh-config.ps1`
 
