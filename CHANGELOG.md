@@ -1,5 +1,33 @@
 # 变更记录
 
+## 0.6.0 — 安装通道改名 + `install_plugin` 工具
+
+这一版把「装插件不把宿主弄坏」那条链路真正接给模型用，并把它叫成它实际干的事。
+
+### 脚本
+
+- `scripts/dsh-repair.ps1` → **`scripts/dsh-plugin-install.ps1`**。它主要干的是安装/升级/卸载，
+  修复（重建共享投影、查遮蔽）只是其中两个单项开关；按「修复」去猜名字的人永远找不到它。
+- `scripts/probe-notice.ps1` → **`scripts/probe-plugin-install.ps1`**（它的目标脚本改了名）。
+- 新增 **`-OnDemand`**（Install 参数组）：调用方（agent 工具）自己负责停机与拉起，脚本因此跳过会话空窗闸门、
+  不再对已停的宿主调 `-Stop`（那会以非零码退出）、也不写续跑通知。健康探测照做且只读，
+  宿主没起来就报 `unhealthy`，不当成功。
+- 状态文件名前缀改为 `dsh-plugin-install-*`。
+
+### 工具
+
+- 新增 **`install_plugin`**（`lib/install-tools.js`）：`status` / `plan` / `install` / `repair_scope` / `check_shadowed`。
+  `install` 的顺序是 工具 `-Status` → 工具 `-Stop` → 脚本 `-OnDemand -Confirm` → 工具 `-Start`，
+  `detail.steps` 逐阶段回报，安装在 files 已落盘后即使拉起失败也不掩盖安装结果。
+- `plugin_manager`（DSH 自带）保持原样不动：它和 pnpm 之间没有钩子，改写安装目录里的文件会被下次更新覆盖。
+  这一步只是给 agent 一条明确的替代路径，观察一轮后再考虑重定向。
+- 配置新增 `tools.install`（默认 true）与 `installTimeoutMs`（默认 900000）。
+
+### 文档与测试
+
+- parity 254/254、selftest 93、integration 16（+1 skipped）。
+- README 中英、`docs/parity-matrix.md`、`cordis.patch.yml` 同步改名与新增项。
+
 ## 0.5.0 — 宿主发现放到 WMI 服务端、探针换成原始 TCP
 
 这一版继续只改「读机器状态的代价」与几个实测踩到的正确性问题。行为语义（401/200 才算就绪、

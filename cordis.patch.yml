@@ -34,6 +34,7 @@
         # Foreground short actions / detached preflight verification budget.
         toolTimeoutMs: 30000
         verifyTimeoutMs: 600000
+        installTimeoutMs: 900000
         # Extra Host authorities the panel API accepts besides loopback, so the
         # dashboard keeps working when the GUI is reached through a reverse
         # proxy such as `tailscale serve` (Host: <tailnet-name>). Each entry is
@@ -51,3 +52,4 @@
           status: true
           preflight: true
           result: true
+          install: true

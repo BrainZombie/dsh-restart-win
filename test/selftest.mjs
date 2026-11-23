@@ -66,6 +66,7 @@ import {
     writeLaunchRequest,
 } from '../lib/runner.js';
 import { createToolDefinitions, TOOL_NAMES, pendingNoticePath, writePendingNotice } from '../lib/tools.js';
+import { createInstallToolDefinitions, INSTALL_ACTIONS } from '../lib/install-tools.js';
 import * as pluginEntry from '../lib/index.js';
 
 const ROOT = mkdtempSync(join(tmpdir(), 'dsh-restart-win-selftest-'));
@@ -169,11 +170,12 @@ test('defaults match CONTRACT §4 exactly', () => {
         restartDelayMs: 1500,
         toolTimeoutMs: 30000,
         verifyTimeoutMs: 600000,
+        installTimeoutMs: 900000,
         trustedHosts: [],
         injectHostEnv: true,
         tools: TOOL_FLAGS,
     });
-    assert.deepEqual(TOOL_FLAGS, { restart: true, status: true, preflight: true, result: true });
+    assert.deepEqual(TOOL_FLAGS, { restart: true, status: true, preflight: true, result: true, install: true });
     assert.ok(Object.isFrozen(DEFAULTS));
 });
 
@@ -1242,7 +1244,7 @@ test('host integration: the real defineTool compiles every tool definition', asy
     assertOutputShape(byName.get(TOOL_NAMES.result), await byName.get(TOOL_NAMES.result).execute({ runId: '20260101-000000-abcdef' }, {}));
 });
 
-test('host integration: apply registers four tools and disposes them on unload', async () => {
+test('host integration: apply registers the restart tools plus install_plugin and disposes them on unload', async () => {
     const registered = [];
     const disposed = [];
     let unload;
@@ -1268,10 +1270,11 @@ test('host integration: apply registers four tools and disposes them on unload',
         TOOL_NAMES.status,
         TOOL_NAMES.preflight,
         TOOL_NAMES.result,
+        'install_plugin',
     ]);
     assert.equal(typeof unload, 'function');
     unload();
-    assert.equal(disposed.length, 4);
+    assert.equal(disposed.length, 5);
 });
 
 test('host integration: a webServer mounts the panel API, a host without one still gets the tools', async () => {
@@ -1293,7 +1296,7 @@ test('host integration: a webServer mounts the panel API, a host without one sti
         if (/cannot resolve host package/.test(String(error?.message))) return 'skip';
         throw error;
     }
-    assert.equal(tools.length, 4, 'the four tools must register with a web server present');
+    assert.equal(tools.length, 5, 'the restart tools plus install_plugin must register with a web server present');
     assert.equal(routes.length, 1, 'the panel API must mount exactly once');
     assert.equal(routes[0].kind, 'prefix');
     assert.match(String(routes[0].path), /dsh-restart-win/);
@@ -1306,7 +1309,7 @@ test('host integration: a webServer mounts the panel API, a host without one sti
         effect() {},
     };
     await pluginEntry.apply(headless, { pwshPath: fakePwsh });
-    assert.equal(headlessTools.length, 4, 'a headless host must still get the four tools');
+    assert.equal(headlessTools.length, 5, 'a headless host must still get the restart tools and install_plugin');
 });
 
 test('host integration: the panel waits for webServer through ctx.inject', async () => {
@@ -1331,7 +1334,7 @@ test('host integration: the panel waits for webServer through ctx.inject', async
         if (/cannot resolve host package/.test(String(error?.message))) return 'skip';
         throw error;
     }
-    assert.equal(tools.length, 4, 'tools register before any web server exists');
+    assert.equal(tools.length, 5, 'tools register before any web server exists');
     assert.equal(routes.length, 0, 'nothing is mounted until the service appears');
     assert.equal(deferred.length, 1, 'exactly one deferred injection is requested');
     assert.deepEqual(deferred[0].deps, ['webServer']);
@@ -1358,6 +1361,86 @@ test('plugin entry: apply rejects invalid config before resolving the host', asy
     const ctx = { tools: { register: () => () => {} } };
     await assert.rejects(() => pluginEntry.apply(ctx, { port: 0 }), (error) => error instanceof ConfigError && error.field === 'port');
     await assert.rejects(() => pluginEntry.apply(ctx, { prot: 1 }), (error) => error instanceof ConfigError && error.message.includes('prot'));
+});
+
+// --------------------------------------------------------------------------
+// install_plugin (host-free)
+// --------------------------------------------------------------------------
+
+// `ROOT` above is a throw-away temp directory; the real package lives here.
+const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url));
+const INSTALL_SCRIPT_PATH = join(PACKAGE_ROOT, 'scripts', 'dsh-plugin-install.ps1');
+
+test('install_plugin: the safe channel is a first-class action set, not a passthrough', () => {
+    assert.deepEqual([...INSTALL_ACTIONS], ['status', 'plan', 'install', 'repair_scope', 'check_shadowed']);
+    const definitions = createInstallToolDefinitions({
+        defineTool: (definition) => definition,
+        config: normalizeConfig({ pwshPath: fakePwsh }),
+        paths: { installScript: INSTALL_SCRIPT_PATH },
+    });
+    assert.equal(definitions.length, 1);
+    const [tool] = definitions;
+    assert.equal(tool.name, 'install_plugin');
+    assert.deepEqual(tool.parameters.action.enum, [...INSTALL_ACTIONS]);
+    assert.equal(tool.parameters.action.required, true);
+    // The whole reason this tool exists must be in the text the model reads.
+    assert.match(tool.description, /plugin_manager/);
+    assert.match(tool.description, /pnpm/);
+    assert.match(tool.description, /-OnDemand|stop the host|stops/i);
+});
+
+test('install_plugin: refused without a spec, and a spec cannot look like a switch', async () => {
+    const definitions = createInstallToolDefinitions({
+        defineTool: (definition) => definition,
+        config: normalizeConfig({ pwshPath: fakePwsh }),
+        paths: { installScript: INSTALL_SCRIPT_PATH },
+    });
+    const [tool] = definitions;
+    const bare = await tool.execute({ action: 'install' }, {});
+    assert.equal(bare.ok, false);
+    assert.match(String(bare.error), /spec is required/);
+    const dashed = await tool.execute({ action: 'install', spec: '-RepairScope' }, {});
+    assert.equal(dashed.ok, false);
+    assert.match(String(dashed.error), /must not start with/);
+    const unknown = await tool.execute({ action: 'add' }, {});
+    assert.equal(unknown.ok, false);
+    assert.match(String(unknown.error), /unknown action/);
+    // Every refusal still satisfies the declared output shape.
+    for (const value of [bare, dashed, unknown]) {
+        assert.equal(value.state, 'failed');
+        assert.equal(value.action === undefined, false);
+    }
+});
+
+test('install_plugin: a missing script is reported, not thrown', async () => {
+    const definitions = createInstallToolDefinitions({
+        defineTool: (definition) => definition,
+        config: normalizeConfig({ pwshPath: fakePwsh }),
+        paths: { installScript: join(PACKAGE_ROOT, 'scripts', 'does-not-exist.ps1') },
+    });
+    const [tool] = definitions;
+    const result = await tool.execute({ action: 'status' }, {});
+    assert.equal(result.ok, false);
+    assert.match(String(result.error), /install script is missing/);
+});
+
+test('install_plugin: tools.install=false removes the tool entirely', () => {
+    const definitions = createInstallToolDefinitions({
+        defineTool: (definition) => definition,
+        config: normalizeConfig({ pwshPath: fakePwsh, tools: { install: false } }),
+        paths: { installScript: INSTALL_SCRIPT_PATH },
+    });
+    assert.deepEqual(definitions, []);
+});
+
+test('install_plugin: the script it drives exists and carries -OnDemand', () => {
+    const script = readFileSync(INSTALL_SCRIPT_PATH, 'utf8');
+    assert.match(script, /\[switch\]\$OnDemand/);
+    // -OnDemand must actually skip the gate and both engine calls; a switch that
+    // is declared but never read would silently do the unsafe thing.
+    assert.match(script, /if \(\$OnDemand\) \{[\s\S]{0,200}跳过闸门/);
+    assert.match(script, /if \(-not \$OnDemand\) \{[\s\S]{0,200}& \$script:Engine -Stop/);
+    assert.match(script, /if \(-not \$OnDemand\) \{[\s\S]{0,200}& \$script:Engine -Start/);
 });
 
 // --------------------------------------------------------------------------
