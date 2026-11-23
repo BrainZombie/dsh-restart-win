@@ -1590,6 +1590,7 @@ const FAKE_ENGINE = [
     '  [switch]$TryCtrlC,',
     '  [switch]$ViaTask,',
     '  [switch]$DoNotTouchDshHome,',
+    '  [switch]$CleanupOrphans,',
     '  [switch]$Json,',
     '  [switch]$NoWait',
     ')',

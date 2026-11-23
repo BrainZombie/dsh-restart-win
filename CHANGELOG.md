@@ -1,5 +1,37 @@
 # 变更记录
 
+## 0.6.4 — 桌面宿主的残留与死管道
+
+2026-11-23 23:45–23:56 连做 11 次重启调试，留下了两样东西：5 个**孤儿宿主**（父进程已退出、
+`taskkill /T` 顺树杀不到，共占 ~1.8GB、各自占两个端口、各自跑一份 profile 的后台任务），
+以及一个把 `console.error` 写到死管道上的主进程 —— 屏幕上就是两个弹窗。
+
+### 引擎（scripts/dsh-restart.ps1）
+
+- **孤儿宿主回收**（`Get-OrphanDesktopHosts` / `Stop-OrphanDesktopHosts`）：判据是**进程身份**
+  （命令行含本机 `dsh-desktop-host` 入口）加上「父 pid 已不在存活进程表里」，而不是 pid 树 ——
+  树关系在父进程死掉那一刻就断了，这正是孤儿收不到的原因。`Stop-DesktopApp` 在 `taskkill /T`
+  之后自动做一轮清扫；`-CleanupOrphans` 可单独只清扫（不动当前实例），`-DryRun` 只报告不杀。
+  清扫失败只记 warn，不把一次成功的重启变成失败。
+- **stdout/stderr 有归属**（`Start-DesktopApp`）：0.6.1 起桌面版刻意不重定向，结果是 Electron
+  继承启动者那一代控制台的管道；启动者一退出读端就没了，主进程 `console.error` 直接抛
+  `write EPIPE`（就是那个「A JavaScript error occurred in the main process」弹窗，日志里
+  `ECONNRESET` 刷屏）。现在 stdout/stderr 写 `host.desktop.*.log`，stdin 保持不重定向。
+  当年「重定向后 10s 自己退出」的真凶是句柄继承，已由 `Hide-StdHandleInheritance` 解决。
+- `cleanupOrphans` 进入 `CALL_KEYS`，工具侧可请求。
+
+### 测试
+
+`npm test` 全绿（selftest 94 / integration 16 / parity **259/259**）。
+
+### 本机实测
+
+| 项 | 之前 | 0.6.4 |
+|---|---|---|
+| 残留桌面宿主 | 5 个孤儿，~1.8GB，端口 55465/56390/56569/56696/57688… | 0，一次 `-CleanupOrphans` 回收 |
+| 当前实例 | 正常（端口 3082 / 4173，健康检查 ok） | 不受影响，`-CleanupOrphans` 不碰它 |
+| 主进程 stderr | 继承死管道 → `write EPIPE` 弹窗 | 写入 `host.desktop.err.log` |
+
 ## 0.6.3 — 等待有进度、预算说法只有一个来源
 
 台账（0.6.2）解决了「用另一个窗口看它是不是还活着」，但**命令行本身**仍然是一段静默：

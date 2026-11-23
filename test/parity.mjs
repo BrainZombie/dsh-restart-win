@@ -948,10 +948,24 @@ PROBES['D-16'] = [
         },
     },
     {
-        note: 'the desktop launch does not redirect stdin/stdout/stderr (an Electron main process exits when it does)',
+        // 2026-11-23 反过来定了：不给 stdout/stderr 归属，Electron 主进程会继承启动者那一代控制台
+        // 的管道，启动者一退出管道读端就没了 —— console.error 直接抛 write EPIPE 弹窗。
+        // （那次「重定向后自己退出」的真凶是句柄继承，已由 Hide-StdHandleInheritance 解决。）
+        note: 'the desktop launch gives stdout/stderr an owner and leaves stdin alone',
         fn: (ctx) => {
             const body = ctx.functionBody(ENGINE, 'Start-DesktopApp');
-            assert.ok(!/RedirectStandard/.test(body), 'redirecting a desktop launch makes the app exit on its own');
+            assert.ok(/RedirectStandardOutput \$webOut/.test(body), 'a GUI without an owned stdout writes to a dead console pipe (write EPIPE)');
+            assert.ok(/RedirectStandardError \$webErr/.test(body), 'stderr needs the same owner as stdout');
+            assert.ok(!/RedirectStandardInput/.test(body), 'the host must not inherit a dead stdin handle');
+        },
+    },
+    {
+        note: 'stopping a desktop app also sweeps orphan hosts whose parent is gone',
+        fn: (ctx) => {
+            const stop = ctx.functionBody(ENGINE, 'Stop-DesktopApp');
+            assert.ok(/Stop-OrphanDesktopHosts/.test(stop), 'taskkill /T cannot reach a host whose main process already exited');
+            const orphans = ctx.functionBody(ENGINE, 'Get-OrphanDesktopHosts');
+            assert.ok(/containsKey/i.test(orphans), 'orphan detection is by identity: the parent pid must be absent from the live process table');
         },
     },
     {
@@ -962,6 +976,11 @@ PROBES['D-16'] = [
             assert.ok(/createdAt -lt \$newMainStart/.test(body), 'the old-generation check must consult the creation time');
         },
     },
+];
+PROBES['D-17'] = [
+    { file: ENGINE, inFunction: 'Get-OrphanDesktopHosts', has: /Get-DesktopHostProcesses -Refresh/, note: 'orphans come from the live host table, not from a pid tree' },
+    { file: ENGINE, inFunction: 'Stop-OrphanDesktopHosts', has: /taskkill/, note: 'an orphan is killed by identity' },
+    { file: ENGINE, inFunction: 'Stop-OrphanDesktopHosts', has: /DryRunOnly/, note: '-DryRun only reports' },
 ];
 PROBES['D-10'] = [{ file: ENGINE, inFunction: 'Get-ResidualChildren', has: /Get-Process -Name node/ }];
 PROBES['D-11'] = [{ file: ENGINE, inFunction: 'Remove-OrphanDshChildren', has: /deepseek-ai\|codegraph/ }, { file: ENGINE, inFunction: 'Remove-OrphanDshChildren', has: /if \(\$ppid -gt 0 -and \(Get-Process -Id \$ppid/ }];
