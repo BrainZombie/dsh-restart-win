@@ -898,7 +898,10 @@ PROBES['D-13'] = [
     { file: ENGINE, inFunction: 'Get-DesktopInstances', has: /ContainsKey/, note: 'missing pid is skipped instead of iterating a hashtable as an object' },
 ];
 PROBES['D-14'] = [
-    { file: ENGINE, inFunction: 'Resolve-HostPort', has: /200 \{ 0 \} 401 \{ 1 \} 303 \{ 2 \}/, note: '200 > 401 > 303 > other' },
+    // The rank table lives in Get-HostFaceRank now, and 401 outranks 200: this
+    // machine's host answers 401 on its own face while 4173 (the browser CDP
+    // port) answers 200 forever, so "200 first" picked the debugger.
+    { file: ENGINE, inFunction: 'Get-HostFaceRank', has: /switch \(\$Status\) \{ 401 \{ 0 \} 200 \{ 1 \} 303 \{ 2 \}/, note: '401 then 200 then 303: the host face authenticates, the CDP side port never does' },
     { file: ENGINE, inFunction: 'Resolve-HostPort', has: /status -gt 0/, note: 'retry only when the port answered with a status code' },
     { file: ENGINE, inFunction: 'Resolve-HostPort', has: /stage = 'skipped'/, note: 'a known auxiliary port is not probed' },
     { file: ENGINE, inFunction: 'Resolve-HostPort', has: /stage = 'unprobed'/, note: 'an unobserved port is not reported as observed' },
@@ -911,6 +914,38 @@ PROBES['D-14'] = [
 PROBES['D-15'] = [
     { file: ENGINE, inFunction: 'Add-Phase', has: /\$script:PhasesOn/, note: 'no timing overhead outside -Json/-ResultFile' },
     { file: ENGINE, inFunction: 'Get-ResultEnvelope', has: /phases/, note: 'the envelope carries the phases key' },
+];
+PROBES['D-16'] = [
+    // 2026-11-23 真机连踩的三个缺陷，每一条都让「重启后永远等不到就绪」，全在就绪等待这一段：
+    {
+        note: 'the ready loop re-reads the host process table instead of reusing the pre-launch snapshot',
+        fn: (ctx) => {
+            const body = ctx.functionBody(ENGINE, 'Wait-DesktopHostReady');
+            assert.ok(/Get-DesktopHostProcesses -Refresh/.test(body), 'the loop would never see a host born after the launch');
+        },
+    },
+    {
+        note: 'the launched pid is not used to filter host children (it is the Electron main pid)',
+        fn: (ctx) => {
+            const body = ctx.functionBody(ENGINE, 'Wait-DesktopHostReady');
+            assert.ok(!/\$script:NewPid -gt 0 -and \$h\.pid -ne/.test(body), 'NewPid holds the main pid; comparing it to the host pid never matches');
+        },
+    },
+    {
+        note: 'the desktop launch does not redirect stdin/stdout/stderr (an Electron main process exits when it does)',
+        fn: (ctx) => {
+            const body = ctx.functionBody(ENGINE, 'Start-DesktopApp');
+            assert.ok(!/RedirectStandard/.test(body), 'redirecting a desktop launch makes the app exit on its own');
+        },
+    },
+    {
+        note: 'readiness accepts a host whose pid was reused by this launch',
+        fn: (ctx) => {
+            const body = ctx.functionBody(ENGINE, 'Wait-DesktopHostReady');
+            assert.ok(/isOldGen/.test(body), 'the old-generation check must also compare creation time, not pid alone');
+            assert.ok(/createdAt -lt \$newMainStart/.test(body), 'the old-generation check must consult the creation time');
+        },
+    },
 ];
 PROBES['D-10'] = [{ file: ENGINE, inFunction: 'Get-ResidualChildren', has: /Get-Process -Name node/ }];
 PROBES['D-11'] = [{ file: ENGINE, inFunction: 'Remove-OrphanDshChildren', has: /deepseek-ai\|codegraph/ }, { file: ENGINE, inFunction: 'Remove-OrphanDshChildren', has: /if \(\$ppid -gt 0 -and \(Get-Process -Id \$ppid/ }];
@@ -1105,11 +1140,13 @@ PROBES['MP-01'] = [{
 }];
 
 PROBES['MP-02'] = [{
-    note: 'the machine config file is the first candidate, and its absence is not fatal',
+    note: 'the running instance outranks the machine config, and its absence is not fatal',
     fn: (ctx) => {
         const body = ctx.functionBody(ENGINE, 'Resolve-DesktopAppPath');
         assert.ok(/Get-MachineConfig/.test(body), 'machine.json is not consulted');
-        assert.ok(body.indexOf('machine-config') < body.indexOf('running-instance'), 'machine.json must win over the running instance');
+        // 机器配置是「探测时以为装在哪」，运行中的实例是可执行文件位置的定义性事实：
+        // App 挪过位置后 machine.json 就是错的（真机实测报错过 desktopAppSource）。
+        assert.ok(body.indexOf('running-instance') < body.indexOf('machine-config'), 'the running instance must win over the stale machine.json');
         const getter = ctx.functionBody(ENGINE, 'Get-MachineConfig');
         assert.ok(/return \$null/.test(getter), 'a missing/broken config must degrade, not throw');
     },

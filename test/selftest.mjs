@@ -1412,6 +1412,24 @@ test('install_plugin: refused without a spec, and a spec cannot look like a swit
     }
 });
 
+test('install_plugin: an unnamed profile falls back instead of becoming the string "undefined"', async () => {
+    // Regression: `String(config.profile)` on an unset profile produced the
+    // literal "undefined", so the engine looked for `<DSH_HOME>/profiles/undefined`
+    // and the call failed on a path that cannot exist. A default must be a name.
+    const definitions = createInstallToolDefinitions({
+        defineTool: (definition) => definition,
+        config: normalizeConfig({ pwshPath: fakePwsh }),
+        paths: { installScript: INSTALL_SCRIPT_PATH },
+    });
+    const [tool] = definitions;
+    // A profile that is not a directory name is refused before anything runs.
+    const invalid = await tool.execute({ action: 'status', profile: '../evil' }, {});
+    assert.equal(invalid.ok, false);
+    assert.match(String(invalid.error), /invalid profile/);
+    const empty = await tool.execute({ action: 'status', profile: '' }, {});
+    assert.equal(empty.ok, false);
+});
+
 test('install_plugin: a missing script is reported, not thrown', async () => {
     const definitions = createInstallToolDefinitions({
         defineTool: (definition) => definition,

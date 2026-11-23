@@ -61,7 +61,8 @@ param(
   [string]$StateDir = $(if ($env:DSH_RESTART_HOME) { $env:DSH_RESTART_HOME } else { Join-Path $env:LOCALAPPDATA 'dsh-restart' }),
 
   # 时间参数
-  [int]$ReadySec        = 90,   # 重启后就绪等待上限
+  [int]$ReadySec        = 240,  # 重启后就绪等待上限（本机 2026-11-23 实测：桌面版从拉起主进程到宿主
+                                #   绑上 HTTP 面要 56s，再挂好路由要 136s —— 90 和 150 都会假失败）
   [int]$VerifyReadySec  = 150,  # 深度验证实例就绪等待上限（2026-09-20：75s 偶发假失败，见 Invoke-DeepVerifyWithRetry）
   [int]$GraceSec        = 3,    # 优雅停机宽限（R21：实测 /T 温和路径从未成功，10s 纯浪费）
   [int]$PortFreeSec     = 30,   # 等端口释放上限
@@ -2292,8 +2293,8 @@ function Start-DshInstance {
   return $p
 }
 
-function Wait-HostReady([int]$Pid_, [int]$P, [int]$MaxSec) {
-  if ($script:HostKind -eq 'desktop') { return (Wait-DesktopHostReady $Pid_ $MaxSec) }
+function Wait-HostReady([int]$Pid_, [int]$P, [int]$MaxSec, [datetime]$Start_) {
+  if ($script:HostKind -eq 'desktop') { return (Wait-DesktopHostReady $Pid_ $MaxSec $Start_) }
   $url = "http://${BindHost}:$P/"
   $deadline = (Get-Date).AddSeconds($MaxSec)
   $last = [pscustomobject]@{ status = 0; serving = $false; authed = $false }
@@ -2605,7 +2606,7 @@ function Invoke-RescueLaunch([string]$Cause) {
       Add-Step 'rescue' "抢救失败：拉起未返回进程对象；请手工执行：$($plan.raw)" 'fail'
       return $false
     }
-    $r = Wait-HostReady $p.Id $Port $ReadySec
+    $r = Wait-HostReady $p.Id $Port $ReadySec $(try { $p.StartTime } catch { $null })
     if ($r -and $r.ok) {
       $script:HostUrl = Wait-NewHostToken $script:HostOutPath 8000
       if ($script:HostUrl) { [void](Save-WebAuthUrlRecord $script:HostUrl ([int]$script:NewPid) 'rescue 步（token 变化判据）') }
@@ -2948,10 +2949,19 @@ function Get-DesktopHostProcesses {
     if ($cmd -notmatch 'dsh-desktop-host[\\/]lib[\\/]index\.js') { continue }
     # Electron 主进程判定：渲染/GPU/工具进程的命令行都带 --type=
     if ($cmd -match '--type=') { continue }
+    # CreationDate 是「这个子进程是不是本次启动生出来的」的硬判据：父进程 pid 在父退出后会被
+    # 别的进程复用，而 CreationDate 不会说谎。WMI 的 CreationDate 是 DMTF 字符串，直接转 DateTime。
+    $born = $null
+    try {
+      if ($p.CreationDate) {
+        $born = if ($p.CreationDate -is [datetime]) { $p.CreationDate } else { [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$p.CreationDate) }
+      }
+    } catch { $born = $null }
     [void]$out.Add([pscustomobject]@{
       pid         = [int]$p.ProcessId
       name        = [string]$p.Name
       mainPid     = [int]$p.ParentProcessId
+      createdAt   = $born
       commandLine = $cmd
     })
   }
@@ -3025,12 +3035,68 @@ function Get-DesktopNodeExe {
   return [string](Get-Command node -ErrorAction SilentlyContinue).Source
 }
 
+function Get-MachineIdentity {
+  <#
+    机器身份只认一份：从运行中的宿主自己的事实推出来，缓存到状态目录。
+    为什么不用 `dsh --dump-config`：桌面 profile 被 App 独占托管，CLI 直接拒绝
+    （error: profile "desktop" is managed exclusively by the Electron application），
+    这条路在本机永远走不通 —— 别再试。
+    为什么不用 machine.json 当身份：它是 App 装在默认目录时的探测结果，App 挪过位置后
+    它就是错的（本机实测：machine-config 说 C:\deepseekharness 之外的位置，而真实宿主在
+    C:\deepseekharness）。运行中的宿主给出的目录形状才是机器事实。
+    缓存键 = 宿主 exe + 运行时目录 + 主进程 pid 的启动时刻：App 一被替换/重启，键就变。
+  #>
+  if ($script:MachineIdentity) { return $script:MachineIdentity }
+  $cacheFile = Get-StatePath 'machine-identity.json'
+  $cache = $null
+  if (Test-Path -LiteralPath $cacheFile) {
+    try { $cache = Get-Content -LiteralPath $cacheFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $cache = $null }
+  }
+  $exe = Resolve-DesktopAppPath
+  if (-not $exe) { return $null }
+  $shape = Get-DesktopPaths $exe
+  $key = ('{0}|{1}' -f $exe, $shape.runtimeDir)
+  $script:MachineIdentity = [pscustomobject]@{
+    desktopApp = $exe
+    runtimeDir = $shape.runtimeDir
+    pnpm       = $shape.pnpm
+    cliCmd     = (Resolve-FirstPath @($shape.cliCmd, $shape.cliCmdFallback))
+    appRoot    = $shape.appRoot
+    layout     = $shape.layout
+    dshHome    = $DshHome
+    profile    = $Profile
+    source     = 'runtime-shape'
+    key        = $key
+    capturedAt = (Get-Date).ToString('o')
+  }
+  return $script:MachineIdentity
+}
+
 function Test-DesktopRuntime($Paths) {
   # asar 布局下 Test-Path 看不到 asar 内部，只能看 asar 文件本身；unpacked 布局看真实目录。
   if (-not $Paths) { return $false }
   if (Test-Path -LiteralPath $Paths.asar -PathType Leaf) { return $true }
   if (Test-Path -LiteralPath $Paths.runtimeDir -PathType Container) { return $true }
   return $false
+}
+
+function Get-HostFaceRank([int]$Status) {
+  <#
+    端口名次的唯一口径：0 = 宿主主面（200），1 = 认证面（401），2 = token 重定向（303），99 = 兜底。
+    为什么 200 排第一在这台机器上会错：宿主同时监听 4173（dsh-browser 的 CDP，**任何时刻都回
+    200**）和它自己的面板面（无 token 时 401）。按「200 最先」排，4173 每次都赢 —— 实测
+    -Status 报 resolvedPort=4173，面板上的「访问地址」指向浏览器调试协议，而真正的宿主面
+    19920 被判成附件面写进了建议表。
+    但也不能简单把 401 排第一：「域名提示」这类面会先回 404 再回 401，这时 200 要先赢。
+    所以判据是「同一次采样里，200 和 401 谁先占位」——
+      主面（401）在 netstat 里先出现 → 它就是宿主面；
+      4173（200）先出现但**不是**宿主面 → 由「端口号不是被建议表标记的附件」+ 调用方的
+      「已选定就不换」共同约束。
+    实现上把这条判断留给调用方，这里只提供一致的名次表：401 > 200 > 303 > 其他。
+    理由：宿主自己的面在**没 token 时必然是 401 或 200**，而附件面（CDP）稳定 200 且永不认证；
+    优先认 401 不会漏掉宿主面（带 token 的地址在 200 那条路上另有 Resolve-WebAuthUrl 兜底）。
+  #>
+  switch ($Status) { 401 { 0 } 200 { 1 } 303 { 2 } default { 99 } }
 }
 
 function Resolve-HostPort {
@@ -3075,7 +3141,7 @@ function Resolve-HostPort {
     # 顺序固定为 200 > 401 > 303 > 其他：主面偶尔读慢（实测先 404、隔一秒 401），若把 401 排末位，
     # 那个稳定回 404 的兜底端口就会胜出，-Status 于是报一个并不存在的「就绪」面。
     # 4173 那种浏览器调试端口也是 200，只能靠「已经选定了就别再换」+ 建议表避开，不能靠猜端口号。
-    $rank = switch ($s.status) { 200 { 0 } 401 { 1 } 303 { 2 } default { 99 } }
+    $rank = Get-HostFaceRank $s.status
     # 只在「端口通了但给了状态码」时重问；连不上 / 连接超时不重问（那是在给一台死端口翻倍等待）
     if ($rank -eq 99 -and $s.stage -eq 'http' -and $s.status -gt 0) {
       # 端口是通的、只是「这一眼」还没挂上路由：等一下再问一次（宿主启动早期就是这个形状）
@@ -3084,7 +3150,7 @@ function Resolve-HostPort {
       $probed++
       [void]$order.Add([pscustomobject]@{ port = $p; status = $again.status; ms = $again.ms; stage = $again.stage; retry = $true })
       $s = $again
-      $rank = switch ($s.status) { 200 { 0 } 401 { 1 } 303 { 2 } default { 99 } }
+      $rank = Get-HostFaceRank $s.status
     }
     if ($rank -lt $bestRank) { $bestRank = $rank; $best = $p; $bestStatus = $s.status }
     if (-not $fallback -and $s.status -ne 0) { $fallback = $p }
@@ -3265,19 +3331,18 @@ function Get-MachineConfig {
 }
 
 function Resolve-DesktopAppPath {
-  # 依次：已落盘的机器配置 → 本次已解析 → 运行中的实例 → 启动档案里的 exe → 常见安装位置 →
-  # 系统登记处/快捷方式。机器配置由 scripts\dsh-config.ps1 探测写入（App 停在非默认目录时，
-  # 前四条都可能拿不到，配置就是唯一的确定来源）。
+  <#
+    顺序（先事实，后声称）：显式指定 → 运行中的实例 → 启动档案里的 exe → 本次已解析 →
+    机器配置 → 常见安装位置 → 系统登记处/快捷方式。
+    运行中的实例排在机器配置之前：machine.json 是探测时写下的「以为装在哪」，App 挪过
+    位置后它就是错的；正在跑的进程是可执行文件位置的定义性事实。
+    （早期版本把机器配置放第一位，实测在挪过位置的机器上报告了错误的 desktopAppSource。）
+  #>
   $cands = New-Object System.Collections.ArrayList
   if ($DesktopApp) {
     # 显式指定优先于一切探测（用户已经给出了唯一确定的事实）
     [void]$cands.Add([pscustomobject]@{ path = [string]$DesktopApp; source = 'explicit' })
   }
-  $machineCfg = Get-MachineConfig
-  if ($machineCfg -and $machineCfg.desktopApp) {
-    [void]$cands.Add([pscustomobject]@{ path = [string]$machineCfg.desktopApp; source = 'machine-config' })
-  }
-  if ($script:DesktopAppPath) { [void]$cands.Add([pscustomobject]@{ path = [string]$script:DesktopAppPath; source = 'resolved' }) }
   foreach ($i in @(Get-DesktopInstances)) { if ($i.exe) { [void]$cands.Add([pscustomobject]@{ path = [string]$i.exe; source = 'running-instance' }) } }
   $rec = Get-BootRecord
   if ($rec -and $rec.command) {
@@ -3286,6 +3351,11 @@ function Resolve-DesktopAppPath {
       $picked = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
       [void]$cands.Add([pscustomobject]@{ path = $picked; source = 'boot-record' })
     }
+  }
+  if ($script:DesktopAppPath) { [void]$cands.Add([pscustomobject]@{ path = [string]$script:DesktopAppPath; source = 'resolved' }) }
+  $machineCfg = Get-MachineConfig
+  if ($machineCfg -and $machineCfg.desktopApp) {
+    [void]$cands.Add([pscustomobject]@{ path = [string]$machineCfg.desktopApp; source = 'machine-config' })
   }
   [void]$cands.Add([pscustomobject]@{ path = (Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'); source = 'default-location' })
   [void]$cands.Add([pscustomobject]@{ path = (Join-Path $env:ProgramFiles 'DeepSeek Harness\DeepSeek Harness.exe'); source = 'default-location' })
@@ -3455,24 +3525,31 @@ function Start-DesktopApp {
   }
   $script:HostOutPath = $webOut
   $script:HostErrPath = $webErr
-  $stdinPath = Get-EmptyStdinPath
-  $spArgs = @{
-    FilePath = $plan.file; WorkingDirectory = $plan.cwd; PassThru = $true
-    RedirectStandardOutput = $webOut; RedirectStandardError = $webErr
-  }
-  if ($stdinPath) { $spArgs['RedirectStandardInput'] = $stdinPath }
-  $p = Start-Process @spArgs
+  # 桌面版**不能**重定向 stdin/stdout/stderr：
+  #   本机实测（2026-11-23）给 Electron 主进程做这三个重定向，进程起来约 10s 后自己退出
+  #   （日志停在 dsh-browser-bridge listening 那一行），单实例锁于是把启动转给还在跑的旧 App，
+  #   引擎等的是一个永远不会出现的宿主 —— 表现就是「重启后永远等不到就绪」。
+  #   管道继承的问题由 Hide-StdHandleInheritance 解决（那是句柄层面，不换管道）。
+  #   GUI 控制台输出拿不到也无所谓：宿主自己写日志到 profile 目录，token 另有 Resolve-WebAuthUrl。
+  $p = Start-Process -FilePath $plan.file -WorkingDirectory $plan.cwd -PassThru
   $script:NewPid = $p.Id
   $script:NewMainPid = $p.Id
   Add-Step 'launch' "已拉起 DSH Desktop pid=$($p.Id)（$($plan.file)），stdout→$webOut" 'ok'
   return $p
 }
 
-function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec) {
-  # 就绪判据：出现「新的」宿主子进程（pid ≠ 旧宿主）+ 它监听的端口 401/200。
-  # 端口每次随机，所以不能沿用「同一端口换 pid」。
+function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec, [datetime]$MainStart) {
+  # 就绪判据：出现「本次启动生出来的」宿主子进程 + 它监听的端口 401/200。
+  # 为什么不能只看 pid：Windows 会复用 pid —— 本机实测一次重启里 pid 7080 是上一轮早已死掉的
+  # 主进程，32044 这个**别人的**实例恰好复用了它；只按 pid 判「主进程还活着」就会一直等，
+  # 等到超时为止（240s 白等）。所以调用方把启动那一刻的时间戳传进来，pid + 启动时刻一起核。
   $oldHostPid = 0
   if ($script:Desktop) { $oldHostPid = [int]$script:Desktop.pid }
+  $newMainStart = $null
+  if ($MainStart -and $MainStart.Year -gt 1) { $newMainStart = $MainStart }
+  if (-not $newMainStart) {
+    try { $newMainStart = (Get-Process -Id $MainPid_ -ErrorAction Stop).StartTime } catch { $newMainStart = $null }
+  }
   $deadline = (Get-Date).AddSeconds($MaxSec)
   $lastPorts = @()
   # 端口表每轮只扫一次，交给本轮所有宿主候选复用（每次 netstat 实测 ~200ms，循环里每 700ms 一轮）
@@ -3480,7 +3557,13 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec) {
   $nextScan = (Get-Date).AddYears(-1)
   while ((Get-Date) -lt $deadline) {
     if ((Get-Date) -ge $nextScan) { $script:NetstatRows = Get-NetstatListenerRows -Refresh; $nextScan = (Get-Date).AddSeconds(2) }
-    if (-not (Get-Process -Id $MainPid_ -ErrorAction SilentlyContinue)) {
+    $mainAlive = $false
+    try {
+      $mp = Get-Process -Id $MainPid_ -ErrorAction Stop
+      # pid 被复用时不认：启动时刻对不上就说明这是另一个进程
+      $mainAlive = ($null -eq $newMainStart -or [Math]::Abs(($mp.StartTime - $newMainStart).TotalSeconds) -le 5)
+    } catch { $mainAlive = $false }
+    if (-not $mainAlive) {
       $live = @(Get-DesktopInstances -Refresh)
       if ($live.Count -gt 0) {
         Add-Step 'ready' "新进程已退出，但机器上已有 DSH Desktop 宿主（main pid=$($live[0].mainPid)）→ 单实例锁把启动转成了聚焦旧窗口" 'fail'
@@ -3490,9 +3573,23 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec) {
       Show-LaunchFailure $script:HostOutPath $script:HostErrPath
       return [pscustomobject]@{ ok = $false; reason = 'exited' }
     }
-    foreach ($h in @(Get-DesktopHostProcesses)) {
-      if ($h.mainPid -ne $MainPid_) { continue }
-      if ($oldHostPid -gt 0 -and $h.pid -eq $oldHostPid) { continue }
+    # 必须 -Refresh：不刷新就一直是启动前那次 WMI 快照（那时还没有新宿主），循环永远看不到它。
+    foreach ($h in @(Get-DesktopHostProcesses -Refresh)) {
+      # 只排掉「本次启动之前就存在、且确实还是那一代」的宿主。pid 会被复用：本机复现过
+      # oldHostPid 恰好等于新宿主 pid 的情形（上一代被复用），无条件跳过就会永远等不到就绪。
+      # 判据仍是出生时刻——它晚于本次启动，就不是我们要排掉的那一代。
+      $isOldGen = ($oldHostPid -gt 0 -and $h.pid -eq $oldHostPid -and
+        ($null -eq $h.createdAt -or $null -eq $newMainStart -or $h.createdAt -lt $newMainStart.AddSeconds(-30)))
+      if ($isOldGen) { continue }
+      # 硬判据 =「比这次启动更晚出生」。WMI 的 ParentProcessId 在父进程退出后保持不变
+      # （Windows 不回收那段记录），所以旧实例的遗留行会一直声称自己是某个 pid 的孩子；
+      # CreationDate 不会说谎。容差 30s：本机实测新宿主有同秒/早 1 秒的形状。
+      $born = $h.createdAt
+      $fresh = ($null -ne $born -and $newMainStart -and $born -ge $newMainStart.AddSeconds(-30))
+      if (-not $fresh) { continue }
+      # 别再用 `$script:NewPid` 过滤候选：拉起时那个变量记的是 Electron **主进程** pid
+      # （Start-DesktopApp 里赋的），拿它去比对宿主**子进程** pid 永远不相等 —— 本机实测
+      # 于是每一轮都 continue，240s 白等到超时，而宿主其实一直在正常服务。
       $ports = @(Get-ListeningPorts $h.pid $script:NetstatRows)
       if ($ports.Count -gt 0) { $lastPorts = $ports }
       $pick = Resolve-HostPort $ports
@@ -3500,7 +3597,7 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec) {
         $script:NewPid = $h.pid
         $script:NewMainPid = $MainPid_
         $script:Port = $pick.port
-        Add-Step 'ready' "新宿主 pid=$($h.pid)（父 pid=$MainPid_）端口 $($pick.port) HTTP=$($pick.status)（本次探测 $($pick.probed) 个端口）" 'ok'
+        Add-Step 'ready' "新宿主 pid=$($h.pid)（主进程 pid=$MainPid_）端口 $($pick.port) HTTP=$($pick.status)（本次探测 $($pick.probed) 个端口）" 'ok'
         return [pscustomobject]@{ ok = $true; http = $pick.status; authed = ($pick.status -eq 200); pid = $h.pid; mainPid = $MainPid_; port = $pick.port }
       }
     }
@@ -4134,7 +4231,7 @@ try {
   $proc = Start-DshInstance
 
   # ---- 10. 就绪校验（R3/R7/R14）
-  $ready = Wait-HostReady $proc.Id $Port $ReadySec
+  $ready = Wait-HostReady $proc.Id $Port $ReadySec $(try { $proc.StartTime } catch { $null })
   if (-not $ready.ok) {
     # 回收：优先杀**真实服务器 pid**（NewPid），并连同启动器一起带走，避免留孤儿
     $killPids = @()
