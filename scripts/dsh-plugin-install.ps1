@@ -210,11 +210,11 @@ function Get-DshFacts {
 
 $script:Engine = if ($Engine) { $Engine } else { Resolve-Engine }
 if (-not (Test-Path -LiteralPath $script:Engine)) { throw ('引擎脚本不存在：' + $script:Engine) }
-$F = [pscustomobject](Get-DshFacts)
-$profileDir = $F.profileDir
-$dshHome = $F.dshHome
-$nodeExe = $F.nodeExe
-$pnpmMjs = $F.pnpm
+$Facts = [pscustomobject](Get-DshFacts)
+$profileDir = $Facts.profileDir
+$dshHome = $Facts.dshHome
+$nodeExe = $Facts.nodeExe
+$pnpmMjs = $Facts.pnpm
 $stateDir = if ($StateDir) { $StateDir } elseif ($env:DSH_RESTART_HOME) { $env:DSH_RESTART_HOME } else { Join-Path $env:LOCALAPPDATA 'dsh-restart' }
 $logPath = Join-Path $stateDir "dsh-plugin-install-$($script:Stamp).log"
 $resultPath = Join-Path $stateDir "dsh-plugin-install-$($script:Stamp).json"
@@ -233,7 +233,7 @@ try {
 function Get-Fact {
   # 机器事实对象的取值器：缺字段时给默认值，而不是在 StrictMode 下抛异常。
   param([string]$Name, $Default = '')
-  return [string](Get-Field $F $Name $Default)
+  return [string](Get-Field $Facts $Name $Default)
 }
 
 function Write-Log {
@@ -313,7 +313,7 @@ function Set-BundleEntry([string]$Pkg) {
   $bundles = @($json.dsh.profile.bundles)
   if ($bundles -contains $Pkg) { return 'already' }
 
-  $backupRoot = Join-Path $env:USERPROFILE ('.dsh\profile-backups\' + $F.profile + '-' + $script:Stamp)
+  $backupRoot = Join-Path $env:USERPROFILE ('.dsh\profile-backups\' + $Facts.profile + '-' + $script:Stamp)
   New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
   Copy-Item -LiteralPath $pjPath -Destination (Join-Path $backupRoot 'package.json') -Force
 
@@ -424,7 +424,7 @@ function Get-DshListenPorts {
       if (-not $p) { continue }
       $exe = ''
       try { $exe = [string]$p.Path } catch { }
-      $underRoot = ($F.appRoot -and $exe -and $exe.StartsWith($F.appRoot, [System.StringComparison]::OrdinalIgnoreCase))
+      $underRoot = ($Facts.appRoot -and $exe -and $exe.StartsWith($Facts.appRoot, [System.StringComparison]::OrdinalIgnoreCase))
       if ($underRoot -or $p.ProcessName -like 'dsh*' -or $p.ProcessName -like 'DeepSeek*') {
         $found.Add([int]$c.LocalPort)
       }
@@ -450,7 +450,7 @@ function Test-HostHealthy {
     $authPort = Get-AuthUrlPort
     if ($authPort) { $cand.Add($authPort) }
     foreach ($p in (Get-DshListenPorts)) { if (-not $cand.Contains($p)) { $cand.Add($p) } }
-    if ($F.resolvedPort -and -not $cand.Contains([int]$F.resolvedPort)) { $cand.Add([int]$F.resolvedPort) }
+    if ($Facts.resolvedPort -and -not $cand.Contains([int]$Facts.resolvedPort)) { $cand.Add([int]$Facts.resolvedPort) }
 
     foreach ($p in $cand) {
       $listen = $null
@@ -521,15 +521,15 @@ function Write-PendingNoticeSafe {
 
 $pkgName = if ($Spec) { Get-SpecPackageName $Spec } else { $null }
 
-Write-Host ("机器事实：hostKind={0}  profile={1}  home={2}" -f $F.hostKind, $F.profile, $dshHome)
+Write-Host ("机器事实：hostKind={0}  profile={1}  home={2}" -f $Facts.hostKind, $Facts.profile, $dshHome)
 Write-Host ("  engine={0}" -f $script:Engine)
 Write-Host ("  profileDir={0}" -f $profileDir)
 Write-Host ("  node={0}" -f $nodeExe)
 Write-Host ("  pnpm={0}" -f $pnpmMjs)
-if ($F.appRoot) { Write-Host ("  appRoot={0}" -f $F.appRoot) }
+if ($Facts.appRoot) { Write-Host ("  appRoot={0}" -f $Facts.appRoot) }
 
 # dsh-config：把探测到的机器事实落盘（引擎的 Resolve-DesktopAppPath 优先读它）。可选、失败不阻塞。
-Set-MachineConfig -Facts $F
+Set-MachineConfig -Facts $Facts
 
 # ---------------------------------------------------------------- 只读/单项模式
 
@@ -570,7 +570,7 @@ if ($WhatIfPlan) {
     Write-Host '  2) （-OnDemand）跳过：宿主由调用方停好'
   }
   else {
-    Write-Host "  2) & '$script:Engine' -Stop -Profile $($F.profile)"
+    Write-Host "  2) & '$script:Engine' -Stop -Profile $($Facts.profile)"
   }
   Write-Host "  3) cd '$profileDir'; & '$nodeExe' '$pnpmMjs' add $Spec --prefer-offline"
   Write-Host "  3b) 失败 → 还原快照 + pnpm install --prod --frozen-lockfile"
@@ -579,13 +579,13 @@ if ($WhatIfPlan) {
   Write-Host ("  5) & '{0}' -CheckShadowed{1}" -f $script:Engine, $scopeArg)
   if ($Bundle) { Write-Host "  5b) 把 $pkgName 挂进 dsh.profile.bundles（校验不过就还原）" }
   if ($OnDemand) { Write-Host '  6) （-OnDemand）跳过拉起，只做健康探测' }
-  else { Write-Host "  6) & '$script:Engine' -Start -Profile $($F.profile)，然后健康校验（先取 web-auth-url.txt 的 port，退回 -Status 的 resolvedPort，${HealthSec}s）；不健康 → 回滚再起" }
+  else { Write-Host "  6) & '$script:Engine' -Start -Profile $($Facts.profile)，然后健康校验（先取 web-auth-url.txt 的 port，退回 -Status 的 resolvedPort，${HealthSec}s）；不健康 → 回滚再起" }
   Write-Host "  7) 写结果 $resultPath"
   if ($Report) {
     (([ordered]@{
-        mode = 'plan'; spec = $Spec; package = $pkgName; profile = $F.profile; hostKind = $F.hostKind
+        mode = 'plan'; spec = $Spec; package = $pkgName; profile = $Facts.profile; hostKind = $Facts.hostKind
         dshHome = $dshHome; profileDir = $profileDir; engine = $script:Engine; nodeExe = $nodeExe; pnpm = $pnpmMjs
-        appRoot = $F.appRoot; snapshot = $snapDir; result = $resultPath; log = $logPath
+        appRoot = $Facts.appRoot; snapshot = $snapDir; result = $resultPath; log = $logPath
         quietSec = $QuietSec; waitQuietSec = $WaitQuietSec; healthSec = $HealthSec; bundle = [bool]$Bundle
         steps = @('gate', 'snapshot', 'notice', 'stop', 'pnpm-add', 'landed', 'check-shadowed', 'start', 'health')
       } | ConvertTo-Json -Depth 5) + "`n") | Set-Content -LiteralPath $Report -Encoding utf8
@@ -609,7 +609,7 @@ if ($Detach) {
   $body = @(
     '@echo off',
     ('pwsh -NoProfile -ExecutionPolicy Bypass -File "{0}" -Spec "{1}" -Confirm -Reason "{2}" -Profile "{3}" -HealthSec {4}{5}{6} > "{7}" 2>&1' -f `
-      $PSCommandPath, $Spec, $Reason, $F.profile, $HealthSec, $idArg, $bundleArg, $outLog)
+      $PSCommandPath, $Spec, $Reason, $Facts.profile, $HealthSec, $idArg, $bundleArg, $outLog)
   ) -join "`r`n"
   [System.IO.File]::WriteAllBytes($runner, (New-Object System.Text.ASCIIEncoding).GetBytes($body + "`r`n"))
 
@@ -628,7 +628,7 @@ if ($Detach) {
     try {
       $pwshExe = (Get-Process -Id $PID).Path
       $argLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Spec "{1}" -Confirm -Reason "{2}" -TaskName "{3}" -Profile "{4}" -HealthSec {5}{6}{7}' -f `
-        $PSCommandPath, $Spec, $Reason, $TaskName, $F.profile, $HealthSec, $idArg, $bundleArg
+        $PSCommandPath, $Spec, $Reason, $TaskName, $Facts.profile, $HealthSec, $idArg, $bundleArg
       Register-ScheduledTask -TaskName $TaskName -Action (New-ScheduledTaskAction -Execute $pwshExe -Argument $argLine) `
         -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddYears(1)) -Force | Out-Null
       Start-ScheduledTask -TaskName $TaskName
@@ -662,7 +662,7 @@ $script:StopTime = $null
 $startedAt = (Get-Date).ToString('o')
 
 try {
-  Write-Log "spec = $Spec ／ pkg = $pkgName ／ profile = $($F.profile) ／ session = $(if ($SessionId) { $SessionId } else { '(未指定)' })"
+  Write-Log "spec = $Spec ／ pkg = $pkgName ／ profile = $($Facts.profile) ／ session = $(if ($SessionId) { $SessionId } else { '(未指定)' })"
 
   # 0) 闸门（-OnDemand：宿主已由调用方停掉，没有会话可等）
   if ($OnDemand) {
@@ -688,10 +688,10 @@ try {
   # 1) 快照
   Write-Log "快照 → $snapDir"
   New-Item -ItemType Directory -Path $snapDir -Force | Out-Null
-  foreach ($f in @('package.json', 'pnpm-lock.yaml')) {
-    $src = Join-Path $profileDir $f
-    if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination (Join-Path $snapDir $f) -Force }
-    else { Write-Log "  缺少 $f（回滚会跳过它）" }
+  foreach ($snapName in @('package.json', 'pnpm-lock.yaml')) {
+    $src = Join-Path $profileDir $snapName
+    if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination (Join-Path $snapDir $snapName) -Force }
+    else { Write-Log "  缺少 $snapName（回滚会跳过它）" }
   }
 
   # 1b) 续跑通知必须在停机之前写：新宿主起来后由 waker 消费，把本轮会话唤醒。
@@ -701,7 +701,7 @@ try {
   # 2) 停机（-OnDemand：调用方已经停过，这里不能重复 -Stop）
   if (-not $OnDemand) {
     Write-Log '停止宿主'
-    & $script:Engine -Stop -Profile $F.profile
+    & $script:Engine -Stop -Profile $Facts.profile
     $script:StopTime = Get-Date
     $steps.Add([pscustomobject]@{ step = 'stop'; code = $LASTEXITCODE })
   }
@@ -759,10 +759,10 @@ catch {
 finally {
   # 5) 查遮蔽（每次安装后都查：pnpm 很容易把旧版基础包提升进 profile）
   Write-Log '查遮蔽'
-  try { & $script:Engine -CheckShadowed -Profile $F.profile | Out-Null } catch { Write-Log ('CheckShadowed 失败：' + $_.Exception.Message) }
+  try { & $script:Engine -CheckShadowed -Profile $Facts.profile | Out-Null } catch { Write-Log ('CheckShadowed 失败：' + $_.Exception.Message) }
   if ($RepairScope) {
     Write-Log '重建共享投影'
-    try { & $script:Engine -RepairSharedScope -Profile $F.profile | Out-Null } catch { Write-Log ('RepairSharedScope 失败：' + $_.Exception.Message) }
+    try { & $script:Engine -RepairSharedScope -Profile $Facts.profile | Out-Null } catch { Write-Log ('RepairSharedScope 失败：' + $_.Exception.Message) }
   }
 
   # 6) 拉起 + 健康校验（不健康则回滚再起一次）
@@ -770,7 +770,7 @@ finally {
   $health = $null
   if (-not $OnDemand) {
     Write-Log '拉起宿主'
-    try { & $script:Engine -Start -Profile $F.profile | Out-Null } catch { Write-Log ('拉起失败：' + $_.Exception.Message) }
+    try { & $script:Engine -Start -Profile $Facts.profile | Out-Null } catch { Write-Log ('拉起失败：' + $_.Exception.Message) }
   }
   else { Write-Log '跳过拉起（-OnDemand：调用方负责）' }
   $health = Test-HostHealthy
@@ -781,7 +781,7 @@ finally {
     Write-Log '拉起后不健康 —— 回滚到快照并重起'
     $rollbackOk = Restore-Snapshot
     if (-not $OnDemand) {
-      try { & $script:Engine -Start -Profile $F.profile | Out-Null } catch { Write-Log ('二次拉起失败：' + $_.Exception.Message) }
+      try { & $script:Engine -Start -Profile $Facts.profile | Out-Null } catch { Write-Log ('二次拉起失败：' + $_.Exception.Message) }
     }
     $health = Test-HostHealthy
     Write-Log ("回滚后健康 = {0}（端口 {1}）" -f $health, $script:HealthyPort)
@@ -801,9 +801,9 @@ finally {
   $result = [pscustomobject]@{
     spec       = $Spec
     package    = $pkgName
-    profile    = $F.profile
-    hostKind   = $F.hostKind
-    appRoot    = $F.appRoot
+    profile    = $Facts.profile
+    hostKind   = $Facts.hostKind
+    appRoot    = $Facts.appRoot
     onDemand   = [bool]$OnDemand
     sessionId  = $SessionId
     status     = $status
