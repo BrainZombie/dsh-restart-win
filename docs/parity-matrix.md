@@ -25,7 +25,7 @@
 4. **「验证方式」必须是可执行证据**，不是叙述。`parity:<ID>` 指 `test/parity.mjs` 中该 ID 的断言项
    （断言符号存在 + 行为契约，二者都要）；`本机:` 前缀表示需要本机实跑并贴输出的项。
 5. 行 ID 分区：`P`=参数/开关、`F`=主流程与函数、`X`=退出码/终态、`S`=状态文件、`G`=fail-closed 判定、
-   `V`=深度验证配方、`D`=进程发现、`T`=计划任务、`N`=续跑通知、`ST`=状态视图、`B`=开发工装、`U`=未文档化/偏差、`M`=必须改变。
+   `V`=深度验证配方、`D`=进程发现、`T`=计划任务、`N`=续跑通知、`ST`=状态视图、`B`=开发工装、`U`=未文档化/偏差、`M`=必须改变、`WS`=工作区存储预检。
 
 ---
 
@@ -500,3 +500,15 @@ Select-String .\scripts\dsh-restart.ps1 -Pattern 'restarted-ok|status|verify-onl
 > 说明：`-DesktopApp <path>` 也是引擎参数，显式给出时优先级最高（用户已给出唯一确定的事实），
 > 探测链整体短路。`scripts/dsh-plugin-install.ps1` 与 `scripts/dsh-config.ps1` 每次运行都会顺带刷新
 > `machine.json`，因此「配置过期」不是需要人工维护的状态。
+
+---
+
+## 16. 工作区存储预检（WS 组，2026-11-24 新增）
+
+| 能力ID | 能力（参数/开关/步骤） | 旧实现位置(旧仓库 file:line) | 插件目标位置 | 可配置化处理 | 验证方式 |
+|---|---|---|---|---|---|
+| WS-01 | 存储预检：解析 `<DshHome>\storages\*.json`，并把 `workspace.json` 按 workspace 域 schema 逐条校验（ISO-8601 字符串、重复会话、`workspaceIds` 与表一致） | 无旧实现（旧版没有存储闸门；一条记录不合规就让整个 workspace 域 FAILED） | scripts/dsh-restart.ps1::Test-StoragePreflight | 不变（只读判定） | parity:WS-01 静态断言；本机实跑：正常 workspace.json → `ok=true, 1 file, 0 errors`；伪造 fixture（数字 epoch + 非法 ISO + 重复会话）→ 3 个错误全部命中；`-Status` 的 `storage` 块 29ms |
+| WS-02 | fail-closed 闸门：重启/验证在停机前跑预检，失败 `exit 3 storage-invalid`；`-DryRun` 只报告；`-ForceStorage` 显式豁免 | 无旧实现（坏存储只能等宿主启动失败才暴露） | scripts/dsh-restart.ps1::Test-StorageGate；scripts/dsh-restart.ps1@param | param（`-ForceStorage`） | parity:WS-02 静态断言；本机实跑：`-Preflight -DshHome <坏 fixture>` → rc=3、1.4s、未拉起任何实例；`-DryRun` 同 fixture → storage step=fail + warn 但不中止 |
+| WS-03 | 花名册重建：只保留 cwd 匹配且非子代理的会话，补回磁盘上未登记的主会话，ISO 写回，落盘前 schema 复验 + 固定备份 | 无旧实现（2026-11-24 的外部重建脚本写数字 epoch，把整个 workspace 域打挂） | scripts/workspace-store-doctor.mjs | param（`--reconcile [--apply]`） | parity:WS-03 静态断言；本机实跑 dry-run：default 266→245、tools 82→50、Mnemon 289→1，attached 0 |
+
+> 说明：WS-01/WS-02 跑在**停机之前**；损坏时旧实例保持不动，修复走 `scripts/workspace-store-doctor.mjs`（宿主退出后 `--fix --apply` 或 `--reconcile --apply`）。

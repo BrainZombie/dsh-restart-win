@@ -1,5 +1,56 @@
 # 变更记录
 
+## 0.6.5 — 工作区存储预检、花名册重建与会话列表修复
+
+2026-11-24。侧栏 `tools` 工作区变空的那次事故有三层，这一版把能落在本仓库的两层修掉，
+第三层（宿主侧会话列表）落在本机的 `@local/dsh-local-repair` 里，见文末。
+
+### 引擎（scripts/dsh-restart.ps1）
+
+- **存储预检 `Test-StoragePreflight` / `Test-StorageGate`**：解析 `<DSH_HOME>\storages\*.json`，
+  对 `workspace.json` 按 workspace 域 schema 逐条校验（ISO-8601 时间戳、`workspaceIds` 与表一致、
+  同一会话不能挂在两个工作区）。`-Preflight` 和真实重启都会在**停机之前** fail-closed：
+  坏存储 → `exit 3 storage-invalid`，旧实例不动；`-DryRun` 只报告；新增 `-ForceStorage` 显式豁免。
+  `-Status -Json` 增加 `storage` 块。
+- 为什么值得一个闸门：workspace.json 是**整份** zod 校验，一条记录的 `createdAt` 被外部脚本写成
+  `Date.now()` 毫秒数，整个 workspace 域就 FAILED，侧栏「工作区」变空，十个依赖插件 PENDING —
+  而错误只出现在宿主日志的一行 `state=FAILED` 里。
+- 矩阵新增 WS 组（WS-01..WS-03），parity 262/262。
+
+### 工具（scripts/workspace-store-doctor.mjs）
+
+- 新增 `--reconcile`：按磁盘事实重建工作区花名册——只保留 `cwd` 匹配且 `delegationDepth === 0`
+  的会话，把磁盘上未登记的主会话按 mtime 补回，ISO 写回，落盘前用 `--check` 的同一套 schema 复验，
+  固定备份 `workspace.json.bak-doctor-reconcile-<stamp>`；宿主运行时默认**拒绝写盘**（exit 2）。
+- 这是「写入方」的推荐路径：之前那次外部脚本直接拼 JSON，把数字 epoch 写了进去。
+
+### 本机实测（2026-11-24）
+
+| 项 | 之前 | 0.6.5 |
+|---|---|---|
+| 正常 `workspace.json` 预检 | 无此能力 | `ok=true`，4 个文件 / 0 错误 / 0 警告 |
+| 伪造坏存储（数字 epoch + 非法 ISO + 重复会话） | 宿主启动后才炸 | 3 个错误全部命中；`-Preflight` rc=3、1.4s、未拉起任何实例 |
+| `-Status` 的 `storage` 阶段 | — | 29ms（只查 workspace.json） |
+| `tools` 花名册 | 82 条（32 条子代理 + 50 主会话） | reconcile 后 50 条，全部是主会话 |
+| `Mnemon · Skills` 花名册 | 289 条（288 条子代理） | 1 条（真正属于该目录的） |
+| 默认工作区 | 266 条（21 条子代理） | 245 条 |
+| reconcile 写盘 | — | 备份 + schema 复验通过；宿主运行时 `--apply` 被拒（rc=2，文件哈希不变） |
+
+### 宿主侧（@local/dsh-local-repair，不在本仓库）
+
+会话列表这条链路上有三处本机修复，改的是 `dsh-session-persistence-jsonl` 的 overlay：
+
+- `listBudget.limit` 200 → 1000：`C:\tools` 有 293 份会话，旧的每目录 200 份窗口把 82 条真会话
+  整体挤出窗口，`tools` 组就渲染成空的；
+- **header 帧放宽**：83 份会话把 header 行和首批事件压进了同一个 zstd 帧，旧的「第一帧必须恰好一行」
+  判据把它们从每次 `list()` 里丢掉（其中包括 `tools` 的 50 条主会话）；现在按第一个换行截断。
+  修复后 `session/list` 返回 **910** 条，`tools` 293 条；
+- 跨重启 header 索引（`<DSH_HOME>\cache\session-header-index.json`，键 = 路径 + size + mtime）+
+  1.5s 并发 `list()` 合并，减少重复 sweep；本机 910 条首轮落盘 442KB。
+
+侧栏「分批渲染」overlay 仍然**停用**：它在这个 0.2.2-rc.3 客户端上会把整个「工作区」段渲染没
+（需要 `Ctrl+Shift+R` 才恢复），在查清之前不启用。
+
 ## 0.6.4 — 桌面宿主的残留与死管道
 
 2026-11-23 23:45–23:56 连做 11 次重启调试，留下了两样东西：5 个**孤儿宿主**（父进程已退出、

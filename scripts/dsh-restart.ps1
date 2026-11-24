@@ -77,7 +77,9 @@ param(
   [switch]$Stop,          # 只停机（不深度验证、不写续跑通知、不拉起）：跨端口迁移/彻底关停用
   [switch]$Json,
   [switch]$Fast,          # 跳过深度验证；存在运行实例时默认仍拒绝停机（需 -ForceUnverified）
-  [switch]$ForceUnverified, # 显式承担「未验证即停机」的风险（与 -Fast 配套，R1 的唯一豁免）
+  [switch]$ForceUnverified,
+  # 存储预检失败时仍继续（只在明确知道 workspace 域已经 FAILED、准备手工修的时候用）
+  [switch]$ForceStorage, # 显式承担「未验证即停机」的风险（与 -Fast 配套，R1 的唯一豁免）
   [switch]$VerifyOnly,    # 只跑「深度验证」配方（隔离 home + 空闲端口真启一次），绝不碰生产实例
   [switch]$Preflight,     # 同上，且显式做「符号链接权限」预检（推荐在任何重启前先跑一次）
   [string]$VerifyTempRoot = '',   # 验证实例临时根目录，缺省用 $env:TEMP
@@ -2575,6 +2577,157 @@ function Exit-RestartLock {
   }
 }
 
+
+function Test-StorageGate {
+  <#
+    存储预检的统一入口：写 steps，返回「是否放行」。
+    -Rehearsal 给 -DryRun 用：失败只 warn，不拦；$ForceStorage 由脚本作用域提供。
+  #>
+  param([switch]$Rehearsal)
+  $check = Test-StoragePreflight
+  Add-Step 'storage' ('存储预检：' + $check.summary) $(if ($check.ok) { 'ok' } else { 'fail' })
+  if ($check.ok) { return $true }
+  foreach ($e in @($check.errors | Select-Object -First 8)) { Add-Step 'storage' ($e.file + ': ' + $e.message) 'fail' }
+  if ($Rehearsal) {
+    Add-Step 'storage' '-DryRun：只报告，不中止（真实重启会在这里 exit 3）' 'warn'
+    return $true
+  }
+  if ($ForceStorage) {
+    Add-Step 'storage' '-ForceStorage：已显式忽略存储预检失败，继续' 'warn'
+    return $true
+  }
+  Add-Step 'storage' '先修存储再重启：node scripts\workspace-store-doctor.mjs --check；宿主退出后 --fix --apply' 'fail'
+  return $false
+}
+
+function Test-StoragePreflight {
+  <#
+    只读体检 <DshHome>\storages：JSON 能否解析 + workspace 域记录是否符合 schema 形状。
+    为什么放在重启前：workspace.json 是整份 zod 校验，任何一条记录不合规（最常见：
+    createdAt/updatedAt 被外部脚本写成 Date.now() 毫秒数）都会让 workspace 域 FAILED，
+    侧栏「工作区」变空、10 个依赖插件 PENDING，而宿主日志里只有一行 state=FAILED。
+    -WorkspaceOnly 只查 workspace.json，供 -Status 轮询使用（几十毫秒）。
+    返回 [pscustomobject]：ok / checked / errors / warnings / files / summary。
+  #>
+  param([switch]$WorkspaceOnly)
+
+  $errors = New-Object System.Collections.ArrayList
+  $warnings = New-Object System.Collections.ArrayList
+  $files = New-Object System.Collections.ArrayList
+  $addErr = { param($f, $m) [void]$errors.Add([pscustomobject]@{ file = [string]$f; message = [string]$m }) }
+  $addWarn = { param($f, $m) [void]$warnings.Add([pscustomobject]@{ file = [string]$f; message = [string]$m }) }
+
+  $root = Join-Path $DshHome 'storages'
+  if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+    & $addWarn 'storages' '目录不存在（全新安装或 DSH_HOME 指错）'
+    return [pscustomobject]@{
+      ok = $true; checked = 0; errors = @(); warnings = @($warnings); files = @()
+      summary = 'storages 目录不存在'
+    }
+  }
+
+  foreach ($f in @(Get-ChildItem -LiteralPath $root -File -Filter '*.json' -ErrorAction SilentlyContinue)) {
+    $name = $f.Name
+    if ($WorkspaceOnly -and $name -ne 'workspace.json') { continue }
+    [void]$files.Add([pscustomobject]@{ file = $name; bytes = [int64]$f.Length; ok = $true })
+    if ($f.Length -gt 33554432) {
+      & $addWarn $name ('文件 {0:N1} MB，超过 32 MB 上限，已跳过解析' -f ($f.Length / 1MB))
+      continue
+    }
+    $obj = $null
+    try {
+      $obj = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+      & $addErr $name ('JSON 解析失败：' + $_.Exception.Message.Split([char]10)[0])
+      $files[$files.Count - 1].ok = $false
+      continue
+    }
+    if ($name -eq 'workspace.json') {
+      $unit = $null
+      if ($obj.PSObject.Properties['unit']) { $unit = $obj.unit }
+      if (-not $unit) { & $addErr $name '缺少 unit' }
+      else {
+        if ([string]$unit.name -ne 'workspace') { & $addErr $name ("unit.name 应为 'workspace'，实际 '" + [string]$unit.name + "'") }
+        if ([int]$unit.version -ne 2) { & $addErr $name ('unit.version 应为 2，实际 ' + [string]$unit.version) }
+      }
+      $g = $null
+      if ($obj.PSObject.Properties['global']) { $g = $obj.global }
+      if (-not $g) { & $addErr $name '缺少 global' }
+      else {
+        if ($g.PSObject.Properties['initialized'] -and $g.initialized -isnot [bool]) { & $addErr $name 'global.initialized 应为 boolean' }
+        foreach ($key in @('workspaceIds', 'archivedSessionIds', 'pinnedSessionIds')) {
+          $kp = $g.PSObject.Properties[$key]
+          if (-not $kp) {
+            if ($key -eq 'workspaceIds') { & $addErr $name 'global.workspaceIds 缺失' }
+            else { & $addWarn $name ('global.' + $key + ' 缺失（schema 有默认值，建议补 []）') }
+            continue
+          }
+          if ($kp.Value -isnot [System.Array]) { & $addErr $name ('global.' + $key + ' 应为字符串数组') }
+        }
+      }
+      $tables = $null
+      if ($obj.PSObject.Properties['tables']) { $tables = $obj.tables }
+      $rows = $null
+      if ($tables) { $rp = $tables.PSObject.Properties['workspaces']; if ($rp) { $rows = $rp.Value } }
+      if (-not $rows) { & $addErr $name '缺少 tables.workspaces' }
+      else {
+        $ids = @($rows.PSObject.Properties | ForEach-Object { $_.Name })
+        $order = @()
+        if ($g) { $op = $g.PSObject.Properties['workspaceIds']; if ($op) { $order = @($op.Value) } }
+        foreach ($id in $order) { if ($ids -notcontains [string]$id) { & $addErr $name ('global.workspaceIds 引用了不存在的记录 ' + $id) } }
+        $owners = @{}
+        foreach ($prop in $rows.PSObject.Properties) {
+          $wid = [string]$prop.Name
+          $rec = $prop.Value
+          if ($order.Count -gt 0 -and ($order -notcontains $wid)) { & $addWarn $name ('记录 ' + $wid + ' 不在 workspaceIds 顺序里') }
+          if ($null -eq $rec) { & $addErr $name ($wid + ' 记录为空'); continue }
+          foreach ($k in @('path', 'title')) {
+            $kp = $rec.PSObject.Properties[$k]
+            if (-not $kp -or $kp.Value -isnot [string]) { & $addErr $name ($wid + '.' + $k + ' 应为 string') }
+          }
+          foreach ($k in @('createdAt', 'updatedAt')) {
+            $kp = $rec.PSObject.Properties[$k]
+            $v = $null
+            if ($kp) { $v = $kp.Value }
+            # 注意：ConvertFrom-Json 会把 ISO-8601 字符串自动转成 [datetime]，所以这里
+            # 不能只认 [string] —— [datetime] 说明原文就是合法 ISO 文本；数字才是 epoch。
+            if ($v -is [datetime]) {
+              # 原文是 ISO-8601 文本，PowerShell 已解析成功
+            } elseif ($v -is [string]) {
+              $parsed = [datetime]::MinValue
+              if (-not ([datetime]::TryParse([string]$v, [ref]$parsed))) {
+                & $addErr $name ($wid + '.' + $k + " 不是可解析的 ISO-8601 字符串：'" + [string]$v + "'")
+              } elseif ([string]$v -notmatch '^\d{4}-\d{2}-\d{2}T') {
+                & $addErr $name ($wid + '.' + $k + " 不是 ISO-8601（应以 yyyy-MM-ddT 开头）：'" + [string]$v + "'")
+              }
+            } else {
+              & $addErr $name ($wid + '.' + $k + ' 必须是 ISO-8601 字符串；数字 epoch（' + [string]$v + '）会让整个 workspace 域 FAILED')
+            }
+          }
+          $sp = $rec.PSObject.Properties['sessionIds']
+          if (-not $sp -or $sp.Value -isnot [System.Array]) { & $addErr $name ($wid + '.sessionIds 应为字符串数组') }
+          else {
+            foreach ($sid in @($sp.Value)) {
+              $sv = [string]$sid
+              if ($owners.ContainsKey($sv)) { & $addErr $name ('会话 ' + $sv + ' 同时挂在 ' + $owners[$sv] + ' 与 ' + $wid) }
+              else { $owners[$sv] = $wid }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return [pscustomobject]@{
+    ok = ($errors.Count -eq 0)
+    checked = $files.Count
+    errors = @($errors)
+    warnings = @($warnings)
+    files = @($files)
+    summary = ('{0} 个文件，{1} 个错误，{2} 个警告' -f $files.Count, $errors.Count, $warnings.Count)
+  }
+}
+
 # ---------------------------------------------------------------- Status
 
 function Show-Status {
@@ -2619,6 +2772,10 @@ function Show-Status {
   }
   $cim = Get-CimAvailable
   Add-Phase 'cim'
+  # 存储预检：只查 workspace.json（整份 zod 校验，最容易被外部脚本写坏）。只读、几十毫秒。
+  $storage = $null
+  try { $storage = Test-StoragePreflight -WorkspaceOnly } catch { $storage = $null }
+  Add-Phase 'storage'
   $rec = Get-BootRecord
   $last = $null
   $hist = Get-StatePath 'restart-history.jsonl'
@@ -2727,11 +2884,16 @@ function Show-Status {
       nodeChildren = @($children)
       bootRecord = $rec
       lastRestart = $last
+      # 存储体检：ok=false 表示下一次宿主启动 workspace 域会整份 FAILED（侧栏工作区变空）
+      storage    = $storage
       marker     = $(try { Get-Content (Join-Path $DshHome '.smart-restart\marker.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null })
     }
     # 信封里这两个字段在只读动作下同样有确切含义：targetPid=当前监听者、hostUrl=已校验地址
     if ($instances.Count -ge 1) { $script:TargetPid = $instances[0].pid }
     if ($auth.State -ne 'ok') { [void]$script:Warn.Add('launchUrl: ' + $auth.Detail) }
+    if ($storage -and -not $storage.ok) {
+      [void]$script:Warn.Add('storage: workspace.json 预检失败（' + $storage.errors[0].message + '）→ 下一次宿主启动 workspace 域会 FAILED')
+    }
   }
   if ($Json) { return }
 
@@ -2747,6 +2909,12 @@ function Show-Status {
   try { $mk = Get-Content (Join-Path $DshHome '.smart-restart\marker.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
   if ($mk) { Write-Diag ("  marker.json : pid={0} lastBootAt={1} ver={2}" -f $mk.pid, $mk.lastBootAt, $mk.dshVersion) }
   Write-Diag ("  进程发现    : {0}" -f $(if ($cim) { 'CIM 可用' } else { 'CIM 不可用（沙箱/权限）→ 以端口监听者为权威' }))
+  if ($storage) {
+    Write-Diag ("  存储预检    : {0}" -f $storage.summary) -ForegroundColor $(if ($storage.ok) { 'Gray' } else { 'Red' })
+    if (-not $storage.ok) {
+      foreach ($e in @($storage.errors | Select-Object -First 3)) { Write-Diag ("      {0}: {1}" -f $e.file, $e.message) -ForegroundColor Red }
+    }
+  }
   if ($instances.Count -eq 0) {
     Write-Diag ("  实例        : 无（{0}）" -f $(if ($script:HostKind -eq 'desktop') { '未发现 DSH Desktop 宿主子进程' } else { "端口 $Port 无监听者" })) -ForegroundColor Yellow
   }
@@ -4348,6 +4516,9 @@ try {
 
   # ---- 0b. 只跑深度验证配方（验收/排障用，完全不碰生产实例）
   if ($VerifyOnly -or $Preflight) {
+    # 存储预检是验证配方的一部分：workspace.json 写坏时，深验证会「真起一个宿主」，
+    # 而那个宿主同样会在 workspace 域 FAILED —— 先在这里把根因说清楚。
+    if (-not (Test-StorageGate)) { Write-Terminal 'storage-invalid' 3; exit 3 }
     $symOk = Test-SymlinkPrivilege
     $script:VerifyTail = @()
     # 这一步以前只有「开始」和「结果」两条记录，中间的 60-200s 完全静默 —— 命令行里看起来
@@ -4549,6 +4720,11 @@ try {
     }
     if ($script:TargetPid) { Add-Step 'verify-gate' '-ForceUnverified：已显式承担"未验证即停机"的风险' 'warn' }
   } elseif ($DryRun) { Add-Step 'deep-verify' '-DryRun：跳过（不做副作用）' 'skip' }
+
+  # ---- 3b. 存储预检（fail-closed）：workspace.json 一旦写坏，宿主下次启动整域 FAILED，
+  #      侧栏工作区变空、十个依赖插件 PENDING。必须在停机之前拦住，别去动正在跑的实例。
+  #      -DryRun 只报告不中止（演练本来就不写盘）。
+  if (-not (Test-StorageGate -Rehearsal:$DryRun)) { Write-Terminal 'storage-invalid' 3; exit 3 }
 
   if ($DryRun) {
     $launch = Resolve-Launch

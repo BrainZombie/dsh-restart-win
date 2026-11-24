@@ -348,6 +348,7 @@ The `%LOCALAPPDATA%\dsh-restart\bin\dsh-restart-win.cmd` shim that `install.ps1`
 | `-Json` | — | Emit a single JSON object on stdout |
 | `-Fast` | — | Skip deep verification |
 | `-ForceUnverified` | — | With `-Fast`, explicitly accept an unverified stop |
+| `-ForceStorage` | — | Continue even when the storage preflight fails (only after you have decided the `workspace` domain is already broken and you are repairing it by hand) |
 | `-VerifyOnly` | — | Deep verification only |
 | `-Preflight` | — | Equivalent to `-VerifyOnly` |
 | `-Record` | — | Write the launch record |
@@ -572,6 +573,7 @@ Look at three places first: the tool's `error` (or the CLI's stderr), the last l
 | 2 `engine-requires-pwsh` | The current PowerShell lacks a capability this action needs | Install pwsh 7.4+, or point `pwshPath` at it |
 | 2 `invalid-args` | `-Stop` with `-Start`, or `-ResultFile` is not writable | Fix the argument combination; check the result-file directory |
 | 3 `config-invalid` | The `--dump-config` combination check failed | Fix the profile per the logged reason; permission errors are not config errors and do not land here |
+| 3 `storage-invalid` | `<DSH_HOME>\storages\workspace.json` fails the schema preflight (a numeric `createdAt`/`updatedAt` epoch is the classic case) | Run `node scripts\workspace-store-doctor.mjs --check`; with the host stopped, `--fix --apply`. A broken record makes the whole `workspace` domain FAILED on the next boot |
 | 4 `verify-failed` / `verify-only-failed` | The isolated instance would not start | Read the logs in the kept `dsh-verify.*` directory; usual causes are a missing `node_modules` or missing symlink privilege |
 | 5 `gate-blocked` | An unfinished configuration transaction or lock file | Clear `*.transaction` / `RECOVERY_REQUIRED*` first; the log prints the stale-lock recovery command |
 | 6 `stop-failed` | Insufficient rights, or the process survived | Read the `Access is denied` section and its two ways out; retry from the same user or an elevated shell |
