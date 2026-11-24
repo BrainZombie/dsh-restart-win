@@ -1291,6 +1291,25 @@ PROBES['MP-10'] = [{
     },
 }];
 
+// ------------------------------------------------------------------ §16 workspace storage preflight
+PROBES['WS-01'] = [
+    { file: ENGINE, inFunction: 'Test-StoragePreflight', has: /数字 epoch/ },
+    { file: ENGINE, inFunction: 'Test-StoragePreflight', has: /TryParse/ },
+    { file: ENGINE, inFunction: 'Test-StoragePreflight', has: /sessionIds/ },
+    { file: ENGINE, inFunction: 'Test-StoragePreflight', has: /workspaceIds/ },
+];
+PROBES['WS-02'] = [
+    eng(/if \(-not \(Test-StorageGate -Rehearsal:\$DryRun\)\) \{ Write-Terminal 'storage-invalid' 3; exit 3 \}/),
+    { file: ENGINE, inFunction: 'Test-StorageGate', has: /return \$false/ },
+    eng(/if \(-not \(Test-StorageGate\)\) \{ Write-Terminal 'storage-invalid' 3; exit 3 \}/, { note: 'the -Preflight branch is gated too' }),
+];
+PROBES['WS-03'] = [
+    { file: 'scripts/workspace-store-doctor.mjs', has: /RECONCILE/ },
+    { file: 'scripts/workspace-store-doctor.mjs', has: /droppedSubagent/ },
+    { file: 'scripts/workspace-store-doctor.mjs', has: /sessionIds = keep/ },
+];
+
+
 PROBES['MP-06'] = [{
     note: 'dsh-config writes the probe result; the engine reads it back',
     fn: () => {
