@@ -52,7 +52,7 @@ The differences concentrate in five places:
 | Executor leaves the host process tree | No | Yes | **Yes** — detached supervisor or scheduled task |
 | Scriptable read-only surface | Usually none | Partial | **Yes** — single-JSON `-Status -Json`, stable exit codes |
 
-It does not provide "return to the previous conversation after the restart": the host does that by consuming `<DshHome>\.smart-restart\pending-notice.json` (which is what a plugin like `dsh-smart-restart` does). This plugin only guarantees the notice is written **before** the stop.
+It does not provide "return to the previous conversation after the restart": the host does that by consuming `<DshHome>\.smart-restart\pending-notice.json` (which is what [`dsh-pending-notice-waker`](https://github.com/BrainZombie/dsh-pending-notice-waker) does — see §10.1). This plugin only guarantees the notice is written **before** the stop.
 
 ---
 
@@ -530,6 +530,56 @@ Two other locations:
 | `<DshHome>\.smart-restart\pending-notice.json` | Resume notice `{sessionId, reason, when}`, UTF-8 without BOM, written **before** the stop and deleted by the host once consumed |
 | `<DshHome>\.smart-restart\marker.json` | pid / lastBootAt / dshVersion written by the host; the engine only reads it |
 | `<VerifyTempRoot>\dsh-verify.<8hex>` | Temporary home of the isolated verification instance; logs are kept on failure |
+
+### 10.1 Pairing with `dsh-pending-notice-waker`
+
+`pending-notice.json` is a hand-off file, and something has to consume it. The consumer is
+[`dsh-pending-notice-waker`](https://github.com/BrainZombie/dsh-pending-notice-waker) — a
+bundle that runs once, `delaySec` after the host starts, and does nothing else.
+
+| | Engine (this repo) | Waker |
+|---|---|---|
+| Job | stop the host, start it again | wake the interrupted session once |
+| Moment | **before** the stop | **after** the boot |
+| Writes | `pending-notice.json` (UTF-8 no BOM, `.tmp` then rename) | `inbox/` / `archive/` / `throttle.json` / `waker.log` under `.smart-restart` |
+| If missing | restart still works, the conversation stays dead until you reopen it | it waits for a notice nobody writes and stays silent |
+
+Neither package depends on the other at the package level and neither ships the other, so
+installing this engine does **not** install the waker. Install both if you want the restart to
+end with the conversation back where it was:
+
+```powershell
+# engine (this repo)
+pwsh -File .\install.ps1
+# waker
+pwsh -File <dsh-restart-win>\scripts\dsh-plugin-install.ps1 -Spec link:<path-to>\dsh-pending-notice-waker -Confirm -Bundle
+# or, once published: -Spec dsh-pending-notice-waker
+```
+
+What the waker does with the notice, in order: rename it into `inbox/` (so an in-flight notice
+is never overwritten) → skip if empty `sessionId` (`no-session-id`), older than `maxAgeHours`
+(`stale`), or the same session already woke twice within 60 minutes (`throttled`) →
+`agents.resume` on a dead session, `agents.get` on a live one → `agent.followup(...)` with the
+wake prompt → archive `done`. A resume failure retries up to 3 times (`attempts` written back
+into the `inbox/` copy) and then archives `failed-attempts`; a `not found` archives `dropped`
+without retrying. Nothing bubbles into the host.
+
+Two details that matter in practice:
+
+- **The preset has to be mounted on wake.** `agents.resume({ resumeSessionId })` restores the
+  conversation but not the agent preset, so the official tool groups never compose and the
+  woken session runs with third-party plugin tools only. Measured on a real host: 39 tools
+  missing and `pwsh` answering `unknown tool "pwsh"`. Waker `>= 0.2.0` reads the persisted
+  header and mounts the preset through the same `setup` hook `dsh-api-session-controller`,
+  `dsh-acp` and `dsh-subagent` use. Pin `>= 0.2.0` if you rely on this.
+- **The symptom is intermittent by design.** `agents.get(sessionId)` short-circuits the resume
+  path, so a session the GUI already opened comes back intact and only a session this waker
+  revives from dead can lose its composition. If a woken session seems to have "half the
+  tools", that is where to look.
+
+Waker config (`enabled` / `delaySec` / `maxAgeHours` / `prompt`) is documented in its own
+README; the defaults are `true` / `6` / `24` and a built-in wake prompt that names the
+interruption reason and appends `安装结果：<resultPath>` when the notice carries one.
 
 ---
 
