@@ -52,7 +52,7 @@
 | 执行者是否脱离宿主进程树 | 否 | 是 | **是**：分离 supervisor 或计划任务 |
 | 可脚本化只读面 | 通常无 | 部分 | **有**：`-Status -Json` 单 JSON + 稳定退出码表 |
 
-它不提供「重启后自动回到原会话」：那一步由宿主侧消费 `<DshHome>\.smart-restart\pending-notice.json` 完成（`dsh-smart-restart` 一类插件做的正是这件事）。本插件只保证在停机**之前**把这条通知写好。
+它不提供「重启后自动回到原会话」：那一步由宿主侧消费 `<DshHome>\.smart-restart\pending-notice.json` 完成（[`dsh-pending-notice-waker`](https://github.com/BrainZombie/dsh-pending-notice-waker) 做的正是这件事，见 §10.1）。本插件只保证在停机**之前**把这条通知写好。
 
 ---
 
@@ -631,6 +631,38 @@ App 重启后 pid 变了，旧结论一律作废。`401` 面永不被当作附�
 | `<DshHome>\.smart-restart\pending-notice.json` | 续跑通知 `{sessionId, reason, when}`，UTF-8 无 BOM，**停机之前**写，宿主启动时消费后删除 |
 | `<DshHome>\.smart-restart\marker.json` | 宿主写的 pid / lastBootAt / dshVersion，引擎**只读** |
 | `<VerifyTempRoot>\dsh-verify.<8hex>` | 隔离验证实例的临时 home；失败时保留日志供排障 |
+
+### 10.1 配对使用：`dsh-pending-notice-waker`
+
+`pending-notice.json` 是一张交接单，得有人来消费。消费方就是
+[`dsh-pending-notice-waker`](https://github.com/BrainZombie/dsh-pending-notice-waker)——
+一个宿主启动后延迟 `delaySec` 秒跑一次、跑完就退的 bundle。
+
+| | 引擎（本仓库） | waker |
+|---|---|---|
+| 职责 | 把宿主停掉、再拉起来 | 把被中断的会话唤醒一次 |
+| 时机 | **停机之前** | **启动之后** |
+| 产出 | `pending-notice.json`（UTF-8 无 BOM，先写 `.tmp` 再改名） | `.smart-restart` 下的 `inbox/` / `archive/` / `throttle.json` / `waker.log` |
+| 缺了对方 | 重启照常，但会话不会自己回来，得手动点开 | 等一个没人写的文件，正常情况下一条日志都不会有 |
+
+两个包在包级别互不依赖、也互不附带，所以**装本引擎不会顺带装 waker**。想让「重启完回到原会话」闭环，两个都要装：
+
+```powershell
+# 引擎（本仓库）
+pwsh -File .\install.ps1
+# waker
+pwsh -File <dsh-restart-win>\scripts\dsh-plugin-install.ps1 -Spec link:<path-to>\dsh-pending-notice-waker -Confirm -Bundle
+# 已发布后可直接：-Spec dsh-pending-notice-waker
+```
+
+waker 拿到通知后的顺序：先 rename 进 `inbox/`（处理中的文件不会被新通知覆盖）→ `sessionId` 为空（`no-session-id`）、超过 `maxAgeHours`（`stale`）、同会话 60 分钟内已唤醒两次（`throttled`）则只归档 → 会话是死的就 `agents.resume`、活的就 `agents.get` → `agent.followup(...)` 投递唤醒文案 → 归档 `done`。resume 失败累加 `attempts`（写回 `inbox/` 那份）满 3 次归档 `failed-attempts`；报 `not found` 直接归档 `dropped` 不重试。任何异常都不向宿主冒泡。
+
+两个实测要紧的点：
+
+- **唤醒时必须挂回 preset。** `agents.resume({ resumeSessionId })` 只恢复会话、不恢复 agent preset，官方工具组整批不会组合进来，唤醒出来的会话只剩第三方插件工具——本机实测少 **39 个工具**、调 `pwsh` 直接 `Error: unknown tool "pwsh"`。waker **≥ 0.2.0** 会读持久化 header，用 `setup` 钩子把预设挂回去，和 `dsh-api-session-controller` / `dsh-acp` / `dsh-subagent` 走的是同一个入口。依赖这个行为就钉 `>= 0.2.0`。
+- **这个症状天生是间歇的。** `agents.get(sessionId)` 命中时会直接短路掉 resume，所以 GUI 已经打开过的会话醒来是完整的；只有「宿主刚起来、GUI 还没打开、waker 抢先救活死会话」那一次才会降级。看到唤醒后的会话「少了一半工具」，先查这里。
+
+waker 自己的配置（`enabled` / `delaySec` / `maxAgeHours` / `prompt`）见它仓库的 README；默认 `true` / `6` / `24`，唤醒文案内置，会在通知带 `resultPath` 时追加一行 `安装结果：<resultPath>`。
 
 ---
 
