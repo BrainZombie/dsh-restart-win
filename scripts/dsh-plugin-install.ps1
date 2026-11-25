@@ -220,7 +220,9 @@ $nodeExe = $Facts.nodeExe
 $pnpmMjs = $Facts.pnpm
 $stateDir = if ($StateDir) { $StateDir } elseif ($env:DSH_RESTART_HOME) { $env:DSH_RESTART_HOME } else { Join-Path $env:LOCALAPPDATA 'dsh-restart' }
 $logPath = Join-Path $stateDir "dsh-plugin-install-$($script:Stamp).log"
-$resultPath = Join-Path $stateDir "dsh-plugin-install-$($script:Stamp).json"
+# -Report 是调用方（install_plugin / 自动化）指定的结果路径：它拿不到子进程的 stamp，
+# 只能按这个路径去读。默认名只在没人指定时用。
+$resultPath = if ($Report) { $Report } else { Join-Path $stateDir "dsh-plugin-install-$($script:Stamp).json" }
 $snapDir = Join-Path $stateDir "dsh-plugin-install-$($script:Stamp).snapshot"
 $noticePath = Join-Path $dshHome '.smart-restart\pending-notice.json'
 
