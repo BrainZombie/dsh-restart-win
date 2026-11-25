@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+﻿#Requires -Version 7.0
 <#
 .SYNOPSIS
   dsh-restart-win 的机器配置：一次探测、写进状态目录，之后引擎自己读。
