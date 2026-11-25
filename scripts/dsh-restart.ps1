@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   dsh-restart — 安全重启 Windows 上的 DSH Web 宿主。
 
@@ -2809,7 +2809,9 @@ function Show-Status {
   # 持久地址的端口必须在「这个实例现在真的在监听的端口」里：换端口之后记录里的端口属于上一个
   # 实例，去探它只会白等一个死端口（实测 1.5s 连接超时）。
   $livePorts = @()
-  foreach ($inst in $instances) { $livePorts += @($inst.ports) }
+  # web 分支的实例对象由 Get-HostCandidate 产出，只有 port，没有 ports；直接访问在
+  # Set-StrictMode 2.0 下抛 PropertyNotFound，-Status 会以 "找不到属性 ports" 中止。
+  foreach ($inst in $instances) { $livePorts += @($(if ($inst.PSObject.Properties['ports']) { $inst.ports } else { $inst.port })) }
   # 持久记录里的 pid 不是当前实例时，日志里只会有旧 boot 的 token —— 不必扫
   $preRec = Read-WebAuthUrlRecord
   $authPidMatches = ($preRec -and [int]$preRec.Pid -gt 0 -and ($currentHostPids -contains [int]$preRec.Pid))
@@ -2862,10 +2864,12 @@ function Show-Status {
       desktopAppSource = [string]$script:DesktopAppPathSource
       runtimeDir = $(if ($desktopApp) { (Get-DesktopPaths $desktopApp).runtimeDir } else { '' })
       appRoot    = $(if ($desktopApp) { (Get-DesktopPaths $desktopApp).appRoot } else { '' })
-      pnpm       = $(if ($desktopApp) { (Get-DesktopPaths $desktopApp).pnpm } else { '' })
+      pnpm       = $(if ($desktopApp) { (Get-DesktopPaths $desktopApp).pnpm } else { Resolve-GlobalPnpm })
       # 实际存在的那个 pnpm.mjs：官方布局在 resources\runtime 下，解包后桥把 pnpm 放在
       # resources\app\runtime 下 —— 两种都验一遍再报，外部工具直接用，不必自己拼分支。
-      pnpmResolved = $(if ($desktopApp) { $dp = Get-DesktopPaths $desktopApp; Resolve-FirstPath @($dp.pnpm, $dp.pnpmFallback) } else { '' })
+      # 没有 DSH Desktop（npm 全局安装的 `dsh web`）时退回到全局 pnpm.mjs，否则
+      # install_plugin 会以「找不到 pnpm.mjs」失败。
+      pnpmResolved = $(if ($desktopApp) { $dp = Get-DesktopPaths $desktopApp; Resolve-FirstPath @($dp.pnpm, $dp.pnpmFallback) } else { Resolve-GlobalPnpm })
       cliCmd     = $(if ($desktopApp) { $dp2 = Get-DesktopPaths $desktopApp; Resolve-FirstPath @($dp2.cliCmd, $dp2.cliCmdFallback) } else { '' })
       nodeExe    = $(if ($script:HostKind -eq 'desktop') { (Get-DesktopNodeExe) } else { '' })
       configuredPort = [int]$script:ConfiguredPort
@@ -3370,6 +3374,19 @@ function Get-DesktopHostProcesses {
     })
   }
   return @($out.ToArray())
+}
+
+function Resolve-GlobalPnpm {
+  # 没有 DSH Desktop 布局时（npm 全局安装的 `dsh web`），pnpm 只存在于 npm 全局目录；
+  # 引擎原先只认 Desktop 的 resources\runtime，install_plugin 因此报「找不到 pnpm.mjs」。
+  $candidates = @(
+    (Join-Path $env:APPDATA 'npm\node_modules\pnpm\bin\pnpm.mjs'),
+    (Join-Path $env:ProgramFiles 'nodejs\node_modules\pnpm\bin\pnpm.mjs')
+  )
+  foreach ($candidate in $candidates) {
+    if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+  }
+  return ''
 }
 
 function Get-DesktopPaths([string]$MainPath) {
