@@ -76,6 +76,9 @@ param(
   [string]$DshHome = '',
   [string]$NodeExe = '',
   [string]$PnpmMjs = '',
+  # pnpm 单次运行的上限。宿主已经停了，pnpm 卡住就等于整台机器一直关着，所以必须有上限：
+  # 2026-11-25 实测 lockfile 17:50:38 就写完了，进程到 18:06 仍 0% CPU 挂着不退。
+  [int]$PnpmTimeoutSec = 600,
   [string]$StateDir = '',
   [string]$Engine = '',
 
@@ -712,13 +715,39 @@ try {
 
   # 3) 安装
   Write-Log 'pnpm add（宿主已停；--prefer-offline 优先吃本地缓存）'
+  $pnpmOut = Join-Path $stateDir ("dsh-plugin-install-$($script:Stamp).pnpm.out.log")
+  $pnpmErr = Join-Path $stateDir ("dsh-plugin-install-$($script:Stamp).pnpm.err.log")
+  $pnpmTimedOut = $false
   Push-Location -LiteralPath $profileDir
   try {
-    $out = & $nodeExe $pnpmMjs add $Spec --prefer-offline 2>&1
-    $pnpmExit = $LASTEXITCODE
-    foreach ($line in $out) { Write-Log ('  ' + [string]$line) }
+    # 不能用 `& $nodeExe ... 2>&1`：那条路径没有任何上限，pnpm 不退出脚本就永远停在这里，
+    # 宿主也永远起不来（finally 里的拉起根本轮不到）。
+    $pnpmProc = Start-Process -FilePath $nodeExe `
+      -ArgumentList @($pnpmMjs, 'add', $Spec, '--prefer-offline') `
+      -WorkingDirectory $profileDir -NoNewWindow -PassThru `
+      -RedirectStandardOutput $pnpmOut -RedirectStandardError $pnpmErr
+    if ($pnpmProc.WaitForExit([Math]::Max(30, $PnpmTimeoutSec) * 1000)) {
+      $pnpmExit = $pnpmProc.ExitCode
+    }
+    else {
+      try { $pnpmProc.Kill($true) } catch { }
+      $pnpmTimedOut = $true
+      $pnpmExit = 124
+      Write-Log ("pnpm 超过 {0}s 未退出，已终止（退出码记 124）" -f $PnpmTimeoutSec)
+    }
+    foreach ($line in (Get-Content -LiteralPath $pnpmOut -ErrorAction SilentlyContinue)) { Write-Log ('  ' + [string]$line) }
+    foreach ($line in (Get-Content -LiteralPath $pnpmErr -ErrorAction SilentlyContinue)) { Write-Log ('  ' + [string]$line) }
   }
   finally { Pop-Location }
+  # 超时不等于失败：实测这时包往往已经写好，只是进程没退。先验落盘，写好了就按成功继续，
+  # 否则回滚会把一次成功的安装撤掉。
+  if ($pnpmTimedOut -and $null -ne $pkgName) {
+    $probe = Join-Path $profileDir "node_modules\$pkgName\package.json"
+    if (Test-Path -LiteralPath $probe) {
+      Write-Log '超时但包已落盘 → 按成功继续（不执行回滚）'
+      $pnpmExit = 0
+    }
+  }
   $steps.Add([pscustomobject]@{ step = 'pnpm-add'; code = $pnpmExit })
 
   # 4) 失败即回滚
