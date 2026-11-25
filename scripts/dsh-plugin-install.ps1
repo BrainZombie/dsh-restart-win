@@ -1,4 +1,4 @@
-﻿#Requires -Version 7.0
+#Requires -Version 7.0
 <#
 .SYNOPSIS
   dsh-restart-win 的插件安装通道：装一个插件而不把宿主弄坏。
@@ -602,14 +602,17 @@ if (-not $Confirm) {
 if ($Detach) {
   $idArg = if ($SessionId) { ' -SessionId "{0}"' -f $SessionId } else { '' }
   $bundleArg = if ($Bundle) { ' -Bundle' } else { '' }
+  # 宿主侧调用方（install_plugin）拿不到子进程的 stamp，必须把报告路径显式传下去，
+  # 否则它只能去 stateDir 里猜最新文件。
+  $reportArg = if ($Report) { ' -Report "{0}"' -f $Report } else { '' }
   $outLog = Join-Path $stateDir "dsh-plugin-install-$($script:Stamp).out.log"
   $runner = Join-Path $stateDir "dsh-plugin-install-$($script:Stamp).run.cmd"
 
   # 用 .cmd 落地再执行，避免 cmd 的嵌套引号解析问题
   $body = @(
     '@echo off',
-    ('pwsh -NoProfile -ExecutionPolicy Bypass -File "{0}" -Spec "{1}" -Confirm -Reason "{2}" -Profile "{3}" -HealthSec {4}{5}{6} > "{7}" 2>&1' -f `
-      $PSCommandPath, $Spec, $Reason, $Facts.profile, $HealthSec, $idArg, $bundleArg, $outLog)
+    ('pwsh -NoProfile -ExecutionPolicy Bypass -File "{0}" -Spec "{1}" -Confirm -Reason "{2}" -Profile "{3}" -HealthSec {4}{5}{6}{8} > "{7}" 2>&1' -f `
+      $PSCommandPath, $Spec, $Reason, $Facts.profile, $HealthSec, $idArg, $bundleArg, $outLog, $reportArg)
   ) -join "`r`n"
   [System.IO.File]::WriteAllBytes($runner, (New-Object System.Text.ASCIIEncoding).GetBytes($body + "`r`n"))
 
@@ -627,8 +630,8 @@ if ($Detach) {
     if (-not $TaskName) { $TaskName = "DSH Plugin Install $($script:Stamp)" }
     try {
       $pwshExe = (Get-Process -Id $PID).Path
-      $argLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Spec "{1}" -Confirm -Reason "{2}" -TaskName "{3}" -Profile "{4}" -HealthSec {5}{6}{7}' -f `
-        $PSCommandPath, $Spec, $Reason, $TaskName, $Facts.profile, $HealthSec, $idArg, $bundleArg
+      $argLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Spec "{1}" -Confirm -Reason "{2}" -TaskName "{3}" -Profile "{4}" -HealthSec {5}{6}{7}{8}' -f `
+        $PSCommandPath, $Spec, $Reason, $TaskName, $Facts.profile, $HealthSec, $idArg, $bundleArg, $reportArg
       Register-ScheduledTask -TaskName $TaskName -Action (New-ScheduledTaskAction -Execute $pwshExe -Argument $argLine) `
         -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddYears(1)) -Force | Out-Null
       Start-ScheduledTask -TaskName $TaskName
@@ -640,7 +643,7 @@ if ($Detach) {
 
   if ($launched) {
     Write-Host "已脱离启动（脚本 $runner）"
-    Write-Host "结果 $resultPath；日志 $outLog"
+    if ($Report) { Write-Host "结果 $Report；日志 $outLog" } else { Write-Host "结果 $resultPath；日志 $outLog" }
     Write-Host '宿主会停一次再起来，本轮对话会断 —— 需要先约一次唤醒'
   }
   else {
