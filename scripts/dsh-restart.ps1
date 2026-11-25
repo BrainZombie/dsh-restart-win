@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   dsh-restart — 安全重启 Windows 上的 DSH Web 宿主。
 

@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+﻿#Requires -Version 7.0
 <#
 .SYNOPSIS
   dsh-restart-win 的插件安装通道：装一个插件而不把宿主弄坏。
