@@ -384,9 +384,9 @@ test('resolveInvocation rejects a path-shaped recordWorkingDirectory', () => {
     );
 });
 
-test('normalizeSessionId strips the session- prefix and keeps a bare id', () => {
-    assert.equal(normalizeSessionId('session-4a1b2c3d'), '4a1b2c3d');
-    assert.equal(normalizeSessionId('4a1b2c3d'), '4a1b2c3d');
+test('normalizeSessionId returns the canonical session-<id> form', () => {
+    assert.equal(normalizeSessionId('session-4a1b2c3d'), 'session-4a1b2c3d');
+    assert.equal(normalizeSessionId('4a1b2c3d'), 'session-4a1b2c3d');
     assert.equal(normalizeSessionId(''), '');
     assert.equal(normalizeSessionId(undefined), '');
 });
@@ -711,7 +711,7 @@ test('argv: restart with a fake -File target, no shell string anywhere', () => {
         '-PortFreeSec', '30',
         '-WaitIdleSec', '5',
         '-IdleMaxSec', '300',
-        '-Session', 'abc123',
+        '-Session', 'session-abc123',
         '-Reason', 'unit-test',
         '-Fast',
         '-ForceUnverified',
@@ -1673,7 +1673,7 @@ if (PLATFORM !== 'win32') {
         assert.equal(envelope.fake.taskName, 'DSH Restart');
         assert.equal(envelope.fake.fast, true);
         assert.equal(envelope.fake.waitIdleSec, 5);
-        assert.equal(envelope.fake.session, 'selftest');
+        assert.equal(envelope.fake.session, 'session-selftest');
         assert.equal(envelope.fake.reason, 'selftest');
         assert.ok(envelope.fake.bound.includes('Json'));
         assert.ok(envelope.fake.bound.includes('ForceUnverified'));
@@ -1752,7 +1752,7 @@ if (PLATFORM !== 'win32') {
         );
         assert.equal(started.ok, true, `start error: ${started.error}`);
         const request = JSON.parse(readFileSync(join(stateDir, 'runs', `${started.runId}.request.json`), 'utf8'));
-        assert.equal(request.args[request.args.indexOf('-Session') + 1], 'abc999');
+        assert.equal(request.args[request.args.indexOf('-Session') + 1], 'session-abc999');
         assert.ok(await waitFor(() => readRunState({ stateDir, runId: started.runId }).state !== 'running', 30000));
     });
 
@@ -1788,17 +1788,17 @@ if (PLATFORM !== 'win32') {
         // The resume notice must exist before anything was spawned.
         const noticeFile = pendingNoticePath(dshHome);
         const notice = JSON.parse(readFileSync(noticeFile, 'utf8'));
-        assert.equal(notice.sessionId, 'tooltest');
+        assert.equal(notice.sessionId, 'session-tooltest');
         assert.ok(notice.reason.startsWith('detached-tool'), `notice reason: ${notice.reason}`);
 
         // The request file carries the exact engine argv: the calling session is
         // explicit (never left to the engine's environment fallback), plus the
         // detached-mode parameters.
         const request = JSON.parse(readFileSync(join(stateDir, 'runs', `${started.runId}.request.json`), 'utf8'));
-        assert.equal(request.args[request.args.indexOf('-Session') + 1], 'tooltest');
+        assert.equal(request.args[request.args.indexOf('-Session') + 1], 'session-tooltest');
         assert.equal(request.args[request.args.indexOf('-ResultFile') + 1], started.resultFile);
         assert.ok(request.args.includes('-NoWait'));
-        assert.equal(request.notice.sessionId, 'tooltest');
+        assert.equal(request.notice.sessionId, 'session-tooltest');
         assert.equal(request.notice.path, noticeFile);
 
         const settled = await waitFor(
@@ -1810,7 +1810,7 @@ if (PLATFORM !== 'win32') {
         assert.equal(state.state, 'ok', `run error: ${state.error}`);
         assert.equal(state.envelope.fake.noWait, true);
         assert.equal(state.envelope.fake.reason, 'detached-tool');
-        assert.equal(state.envelope.fake.session, 'tooltest');
+        assert.equal(state.envelope.fake.session, 'session-tooltest');
 
         // The fake engine never wrote a notice, so the supervisor's own bytes
         // were still there and must have been removed (stale notice gone).
@@ -1855,7 +1855,7 @@ if (PLATFORM !== 'win32') {
         // next boot must consume, so it has to survive.
         const notice = JSON.parse(readFileSync(pendingNoticePath(dshHome), 'utf8'));
         assert.equal(notice.reason, 'fake engine notice');
-        assert.equal(notice.sessionId, 'keep1');
+        assert.equal(notice.sessionId, 'session-keep1');
         const launch = JSON.parse(readFileSync(join(stateDir, 'runs', `${started.runId}.launch.json`), 'utf8'));
         assert.equal(launch.notice, 'kept-engine-notice');
     });

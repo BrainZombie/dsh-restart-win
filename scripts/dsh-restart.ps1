@@ -2064,9 +2064,18 @@ function Get-NewestSessionId {
 }
 
 function Normalize-SessionId([string]$Id) {
+  # 续跑通知里的 sessionId 必须是 DSH 认的规范形态 `session-<id>`
+  # （持久化目录就是 sessions\<workspace>\session-<id>）。2026-11-25 实测：
+  # 旧实现剥掉前缀写成裸 uuid，waker 拿它去 sessionPersistence.stat 找不到会话，
+  # notice 直接归档成 dropped，被中断的会话不会被唤醒。
+  # 两种输入都接受，输出恒为规范形态，所以幂等。
   if (-not $Id) { return $null }
-  if ($Id -eq 'auto') { return (Get-NewestSessionId) }
-  return ($Id -replace '^session-', '')
+  if ($Id -eq 'auto') {
+    $newest = Get-NewestSessionId
+    if (-not $newest) { return $null }
+    return ('session-' + ($newest -replace '^session-', ''))
+  }
+  return ('session-' + ($Id -replace '^session-', ''))
 }
 
 function Write-PendingNotice([string]$SessionId, [string]$Why) {
@@ -2164,28 +2173,35 @@ function Wait-SessionIdle([int]$MaxSec) {
 
 function Invoke-TryCtrlC([int]$Pid_) {
   # 同控制台才有效；失败无害，直接回退强杀。默认关闭。
-  try {
-    if (-not ('DshCtrlC' -as [type])) {
-      Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class DshCtrlC {
-  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AttachConsole(uint dwProcessId);
-  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool FreeConsole();
-  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
-  public static bool Send(uint pid) {
-    FreeConsole();
-    if (!AttachConsole(pid)) return false;
-    bool ok = GenerateConsoleCtrlEvent(0, 0);
-    FreeConsole();
-    return ok;
+  #
+  # 【必须隔离到子进程】FreeConsole + AttachConsole 之后本进程就没有控制台了，
+  # 紧接着的 netstat.exe 会以「程序'netstat.exe'运行失败：获取控制台模式时发生
+  # Win32 内部错误 句柄无效。0x6」直接终止 —— 2026-11-25 18:30 那次 restart 就是
+  # 在 graceful 之后这样 aborted 的（宿主没停、run 失败）。子进程崩掉只回一个非零
+  # 退出码，主进程继续走 taskkill 强杀。发送器：scripts/dsh-ctrlc-sender.ps1；
+  # 对照组：test/console-probe.ps1。
+  $sender = Join-Path $PSScriptRoot 'dsh-ctrlc-sender.ps1'
+  if (-not (Test-Path -LiteralPath $sender -PathType Leaf)) {
+    Add-Step 'graceful' "Ctrl+C 发送器缺失（$sender），回退强杀" 'warn'
+    return $false
   }
-}
-'@ -ErrorAction Stop
+  try {
+    $self = $null
+    try { $self = (Get-Process -Id $PID -ErrorAction Stop).Path } catch { $self = $null }
+    if (-not $self) { $self = Join-Path $PSHOME 'pwsh.exe' }
+    $proc = Start-Process -FilePath $self -ArgumentList @(
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', $sender, '-TargetPid', "$Pid_"
+    ) -WindowStyle Hidden -PassThru
+    $null = $proc.WaitForExit(10000)
+    if (-not $proc.HasExited) {
+      try { $proc.Kill() } catch { }
+      Add-Step 'graceful' 'Ctrl+C 发送器超时（10s），回退强杀' 'warn'
+      return $false
     }
-    $ok = [DshCtrlC]::Send([uint32]$Pid_)
-    Add-Step 'graceful' "AttachConsole+Ctrl+C 结果: $ok" $(if ($ok) { 'ok' } else { 'warn' })
-    return $ok
+    $rc = $proc.ExitCode
+    Add-Step 'graceful' "AttachConsole+Ctrl+C 结果: $($rc -eq 0)（隔离子进程 exit=$rc）" $(if ($rc -eq 0) { 'ok' } else { 'warn' })
+    return ($rc -eq 0)
   } catch {
     Add-Step 'graceful' "Ctrl+C 路径不可用（$($_.Exception.Message.Split([char]10)[0])），回退强杀" 'warn'
     return $false

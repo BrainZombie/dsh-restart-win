@@ -1,5 +1,49 @@
 # 变更记录
 
+## 未发布 — 续跑通知的会话 id、Ctrl+C 路径隔离
+
+2026-11-25。升级到 `0aada87` 之后在本机做了一次重启，暴露出两处只在真机路径上才现形的问题。
+
+### 续跑通知写规范 session id
+
+`-SessionId` 一路传给引擎时被剥成裸 uuid（`lib/config.js` 的 `normalizeSessionId`
+与 `scripts/dsh-restart.ps1` 的 `Normalize-SessionId` 都做 `-replace '^session-'`），
+写进 `.smart-restart\pending-notice.json` 的 `sessionId` 是 `c36fce12-…`。宿主的 waker
+拿它调 `sessionPersistence.stat()` / `agents.resume()`，而 DSH 的持久化目录是
+`sessions\<workspace>\session-<uuid>` → `not found` → notice 归档成 `dropped`，
+被中断的会话不会被唤醒。
+
+- `lib/config.js`：`normalizeSessionId` 输出规范形态 `session-<id>`，两种输入都收、幂等。
+- `scripts/dsh-restart.ps1`：`Normalize-SessionId` 同样输出规范形态，`auto` 分支补前缀。
+- `scripts/dsh-plugin-install.ps1`：写通知前归一化，install 与 restart 两条通道契约一致。
+- 本机对照：07:41 的 install 通知写的是 `session-ff9f11e7-…`（带前缀，resume 成功）；
+  10:37 的 restart 通知写的是 `c36fce12-…`（裸，dropped）。
+
+### Ctrl+C 路径隔离到子进程（`-TryCtrlC`）
+
+`DshCtrlC.Send` 先 `FreeConsole()` 再 `AttachConsole()`；AttachConsole 失败时直接返回，
+进程此时已无控制台，紧接着的 `netstat.exe` 以
+「获取控制台模式时发生 Win32 内部错误 句柄无效。0x6」终止整个 run（宿主没停）。
+
+- 发送器独立成 `scripts/dsh-ctrlc-sender.ps1`；`Invoke-TryCtrlC` 改用 `Start-Process`
+  起它并读退出码，子进程崩掉只回非零码，主引擎继续走 taskkill 强杀。
+- 对照组 `test/console-probe.ps1`（无控制台环境下 `freeonly` 在第一次 netstat 后即终止，
+  `baseline` 正常）、回归验证 `test/verify-ctrlc-isolation.ps1`，两者都用
+  `test/run-detached-probe.ps1` 以 WMI 拉起（父进程 WmiPrvSE、无控制台）。
+
+### 上游合并
+
+- #6 `fix(install): write the result to -Report` —— 调用方给的 `-Report` 优先于内部 stamp 命名。
+
+### 本机实测（2026-11-25）
+
+| 项 | 之前 | 现在 |
+|---|---|---|
+| notice 的 sessionId | `c36fce12-…`（裸） | `session-c36fce12-…` |
+| waker 结果 | `dropped`（not found） | 可取到会话并 resume |
+| `-TryCtrlC` 的 run | aborted 0x6，宿主未停 | 子进程发 Ctrl+C，主引擎继续 |
+| selftest / parity | 95/95、262/262 | 95/95、262/262 |
+
 ## 0.6.5 — 工作区存储预检、花名册重建与会话列表修复
 
 2026-11-24。侧栏 `tools` 工作区变空的那次事故有三层，这一版把能落在本仓库的两层修掉，

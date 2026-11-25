@@ -498,13 +498,17 @@ function Write-PendingNoticeSafe {
     Write-Log '未拿到会话 id，跳过续跑通知'
     return
   }
+  # 通知里的 sessionId 必须是 DSH 认的规范形态 `session-<id>`：waker 拿它直接调
+  # sessionPersistence.stat()/agents.resume()，裸 uuid 会被判 not found 并归档成
+  # dropped。两种输入都收，统一写成规范形态（2026-11-25 实测）。
+  $noticeSessionId = 'session-' + ($SessionId -replace '^session-', '')
   $tmpPath = $noticePath + '.tmp'
   try {
     $dir = Split-Path $noticePath -Parent
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $noticePkg = if ($pkgName) { $pkgName } elseif ($Spec) { Get-SpecPackageName $Spec } else { $null }
     $payload = [ordered]@{
-      sessionId = $SessionId
+      sessionId = $noticeSessionId
       reason    = $Reason
       when      = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
       attempts  = 0
