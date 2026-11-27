@@ -1,5 +1,58 @@
 # 变更记录
 
+## 0.6.8 — 选面不再被 JSON 兜底面骗过；看门狗有了真机探针；`-DryRun` 真的不写
+
+2026-11-27。三处都来自同一天的真机观察，不是推演。
+
+### 1. `-Status` 的端口选面（`Resolve-HostPort`）
+
+现象：重启后第一次 `-Status` 报 `resolvedPort=35877` + `http=404`，第二次才是 `35863/401` ——
+两个端口都属于同一个宿主 pid。根因是 401 面偶尔读超时（连上了、5s 内没回话），而兜底路由
+`35877` 8ms 就答 `404 + application/json`；`Resolve-HostPort` 把它当兜底候选，于是「谁先答谁赢」。
+更糟的是这条结论学不到：`Save-AuxPortHint` 只在「本轮选中了就绪面」时才写，404 赢的那一轮
+什么也没记，下次照旧。
+
+改了三处：`Get-HttpStatusCodeDetail` 读 `content-type`；JSON+404 只做最后兜底、且无论本轮
+是否就绪都学进 `aux-ports.json`（并按 pid 合并，不再覆盖掉 CDP 面）；没有任何面就绪且有人
+「连上没回话」时，对这一组再探一遍。
+
+本机实测：连续 5 次 `-Status -Json` 全部 `resolvedPort=35863 / http=401`（每次 3.3–3.6s），
+`aux-ports.json` 由 `[3082,4173]` 变为 `[3082,4173,35877]`，此后该面直接 `stage=skipped`。
+`test/probe-hostport.ps1`（新增，真 socket）四种形状全过：healthy 0.8s 选 401 面；busy
+（401 面首次拖 6s）5.7s 经第二遍仍选 401；两个 404 时非 JSON 面胜出；401 面两次都不回时
+退回 JSON 面并如实报 404。
+
+### 2. 就绪阶段崩溃看门狗的真机探针（`watchdog` 步）
+
+0.6.6 的看门狗只有代码和单测，从未端到端触发。新增 `Invoke-WatchdogProbe`：在 gui-smoke 的
+临时 userData 里写一份带该主进程 `shell pid` 的 `crash-*-main.log`，然后调用生产用的
+`Wait-DesktopHostReady`，要求秒级失败并透传 `Error:` 行。
+
+`-Preflight` 实测：`gui-smoke` 2s（拉起宿主 pid=176），`watchdog` **0.1s** 识别
+`reason=main-crashed`，`deep-verify` 43187/401，总 60.4s，rc=0。注：注入的是崩溃**记录**，
+不是真崩溃；读它的是生产代码，进程是真的，userData 是隔离的。`-Preflight` 下探针不过会在
+停机前中止，普通重启只记 warn。
+
+### 3. `-RepairSharedScope -DryRun` 不再真重建
+
+旧分支只判断 `$RepairSharedScope`，从不看 `$DryRun`：一次「演练」会重写
+`<DSH_HOME>\profiles\node_modules`（本机 20570 个文件）。现在演练只报源布局与当前形状后退出
+（`result=dry-run`，rc=0）。实测：3.5s，报「将用 unpacked 重建 … 当前 20570 个文件 / 434.3MB；
+不写盘」，目标树 20570 文件 / 455,415,387 字节 / 最新 mtime 前后完全一致。
+
+### 4. 残留台账被 pid 复用误报成「卡住了」
+
+`-Status` 判「还有引擎在跑」只看 `Get-Process -Id`。Windows 复用 pid 时，一份早已结束的台账
+会被报成「还在，但 3602s 没推进 —— 多半是卡住了」。新判据 `Test-ActivityProcessAlive`：
+进程存在 **且** 启动时刻不晚于台账最后一次写入（容差 30s）。同一份台账（pid 指向一个刚启动的
+进程）A/B：旧引擎 `进程 pid=26136 还在 … 多半是卡住了`，新引擎
+`没有正在进行的动作（…进程已退出）`。
+
+### 三套件
+
+`npm test`：selftest 97 passed / parity 263/263 / integration 16 passed + 1 skipped；
+`test/probe-hostport.ps1` 21.7s 全过。
+
 ## 0.6.7 — 重启后的访问地址能自愈补写
 
 2026-11-27。0.6.6 的真机重启成功（`restarted-ok`，130s，新宿主 28824 / 端口 59729 / HTTP 401），

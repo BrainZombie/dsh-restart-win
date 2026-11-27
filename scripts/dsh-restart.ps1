@@ -140,6 +140,25 @@ Set-StrictMode -Version 2.0
 # ---------------------------------------------------------------------------
 function Get-ActivityPath { return (Get-StatePath 'activity.json') }
 
+function Test-ActivityProcessAlive($Rec) {
+  <#
+    台账里的 pid 还活着吗？—— 不能只看 Get-Process：Windows 会复用 pid，
+    一个早该结束的引擎的 pid 可能落在刚启动的另一个进程上。
+    判据：进程存在 **且** 它的启动时刻不晚于台账最后一次写入（容差 30s）。
+    比台账还新 = 那个 pid 不是写台账的人。2026-11-27 实测：一份 3612s 前就该结束的台账，
+    因为 pid 被 python 进程复用，-Status 报「多半是卡住了」，把一次正常的只读查询带偏。
+  #>
+  if (-not $Rec) { return $false }
+  $proc = $null
+  try { $proc = Get-Process -Id ([int]$Rec.pid) -ErrorAction Stop } catch { return $false }
+  if (-not $proc) { return $false }
+  $updated = $null
+  try { $updated = [datetime]$Rec.updatedAt } catch { return $true }
+  if (-not $updated) { return $true }
+  try { if ($proc.StartTime -gt $updated.AddSeconds(30)) { return $false } } catch { return $true }
+  return $true
+}
+
 function Write-Activity([string]$Step, [string]$Note = '') {
     if (-not $script:ActivityOn) { return }
     # 每一步只写一次会漏掉「一步之内长时间等待」的形状（实测：深度验证一步内部要等 150s 的
@@ -1410,13 +1429,21 @@ function Get-HttpStatusCodeDetail {
     # 走到这里连接一定已经关了：所有判定都在 try/finally 之外
     if ($n -gt 0) {
       $m = [regex]::Match($head, '^HTTP/\d\.\d\s+(\d{3})')
-      if ($m.Success) { return [pscustomobject]@{ code = [int]$m.Groups[1].Value; reconnecting = ($attempt -eq 1) } }
+      if ($m.Success) {
+        # 响应头里的 content-type 是区分「宿主面」与「兜底路由」的唯一廉价证据：
+        # 兜底路由几毫秒就回 404 + application/json，宿主的认证面回 401 + text/plain。
+        # 2026-11-27 实测：401 面一次读超时，-Status 就报 35877/404 而不是 35863/401。
+        $ct = ''
+        $ctm = [regex]::Match($head, '(?im)^content-type:\s*([^\r\n]+)')
+        if ($ctm.Success) { $ct = $ctm.Groups[1].Value.Trim() }
+        return [pscustomobject]@{ code = [int]$m.Groups[1].Value; reconnecting = ($attempt -eq 1); contentType = $ct }
+      }
     }
   }
   # 区分两种失败，上游靠它决定要不要再等一次：连不上（端口没绑）vs 连上了但没回状态行
   # （读超时 / 对端乱说话）。前者重发没有意义，后者才值得在「宿主启动早期」再问一遍。
-  if ($connectFailed -and $attempts -eq 1) { return [pscustomobject]@{ code = 0; reconnecting = $false } }
-  return [pscustomobject]@{ code = 0; reconnecting = $true }
+  if ($connectFailed -and $attempts -eq 1) { return [pscustomobject]@{ code = 0; reconnecting = $false; contentType = '' } }
+  return [pscustomobject]@{ code = 0; reconnecting = $true; contentType = '' }
 }
 
 function Invoke-HttpProbe {
@@ -1440,11 +1467,11 @@ function Invoke-HttpProbe {
     $c = [System.Net.Sockets.TcpClient]::new()
     if (-not $c.ConnectAsync($Host_, [int]$Port).Wait([Math]::Max(200, $ConnectTimeoutMs))) {
       $sw.Stop()
-      return [pscustomobject]@{ status = 0; code = 0; ms = [int]$sw.ElapsedMilliseconds; stage = 'connect-timeout' }
+      return [pscustomobject]@{ status = 0; code = 0; ms = [int]$sw.ElapsedMilliseconds; stage = 'connect-timeout'; contentType = '' }
     }
   } catch {
     $sw.Stop()
-    return [pscustomobject]@{ status = 0; code = 0; ms = [int]$sw.ElapsedMilliseconds; stage = 'connect-failed' }
+    return [pscustomobject]@{ status = 0; code = 0; ms = [int]$sw.ElapsedMilliseconds; stage = 'connect-failed'; contentType = '' }
   } finally {
     if ($c) { try { $c.Close() } catch { } }
   }
@@ -1457,11 +1484,12 @@ function Invoke-HttpProbe {
   $r = Get-HttpStatusCodeDetail -Port $Port -Host_ $Host_ -TimeoutMs $RequestTimeoutMs -Retries 1
   $sw.Stop()
   return [pscustomobject]@{
-    status = $r.code
-    code   = $r.code
-    ms     = [int]$sw.ElapsedMilliseconds
-    stage  = 'http'
-    reconn = [bool]$r.reconnecting
+    status      = $r.code
+    code        = $r.code
+    ms          = [int]$sw.ElapsedMilliseconds
+    stage       = 'http'
+    reconn      = [bool]$r.reconnecting
+    contentType = [string]$r.contentType
   }
 }
 
@@ -2885,8 +2913,7 @@ function Show-Status {
             $a = Get-Content -LiteralPath $ap -Raw -Encoding UTF8 | ConvertFrom-Json
             $age = 0
             try { $age = [int]((Get-Date) - [datetime]$a.updatedAt).TotalSeconds } catch { $age = -1 }
-            $alive = $false
-            try { $alive = [bool](Get-Process -Id ([int]$a.pid) -ErrorAction Stop) } catch { $alive = $false }
+            $alive = Test-ActivityProcessAlive $a
             [ordered]@{ pid = [int]$a.pid; step = [string]$a.step; note = [string]$a.note;
                         action = [string]$a.action; ageSec = $age; processAlive = $alive;
                         elapsedSec = $a.elapsedSec; updatedAt = $a.updatedAt }
@@ -2971,8 +2998,7 @@ function Show-Status {
       $a = Get-Content -LiteralPath $ap -Raw -Encoding UTF8 | ConvertFrom-Json
       $age = 0
       try { $age = [int]((Get-Date) - [datetime]$a.updatedAt).TotalSeconds } catch { $age = -1 }
-      $alive = $false
-      try { $alive = [bool](Get-Process -Id ([int]$a.pid) -ErrorAction Stop) } catch { $alive = $false }
+      $alive = Test-ActivityProcessAlive $a
       $stateText = if ($alive -and $age -ge 0 -and $age -le 90) {
         "进行中：$($a.action) 的 $($a.step)，已跑 $($a.elapsedSec)s，$($age)s 前还在动（pid=$($a.pid)）"
       } elseif ($alive) {
@@ -3554,44 +3580,54 @@ function Get-HostFaceRank([int]$Status) {
 
 function Resolve-HostPort {
   <#
-    从某个 pid 的监听端口里挑出「这个宿主自己那根 HTTP 面」。返回 @{ port; status; order; probed }。
+    从某个 pid 的监听端口里挑出「这个宿主自己那根 HTTP 面」。返回 @{ port; status; order; probed; contentType }。
     为什么不能「第一个回应的就是」：本机实测一个桌面宿主同时监听 4 个端口 ——
       3082 = dsh web 面（200）、4173 = dsh-browser 的 CDP（也是 200，但它是浏览器调试协议）、
-      48xxx = 宿主自身的面板端口（401）、48xxx+5 = 兜底路由（404）。
+      48xxx = 宿主自身的面板端口（401）、48xxx+5 = 兜底路由（404 + application/json）。
     旧逻辑按 netstat 顺序无脑逐个 GET，全部按 6s 超时，一次 -Status 要白等十几秒；
     而且「第一个回应」会挑到 4173 —— 端口是随机的，那个顺序并不稳定。
 
     判据（按优先级，全部来自实测）：
-      1. 200 是默认面：不带 token 直接 200 的，就是宿主给本机打开的那一面；
-      2. 401 说明端口已绑、认证层在要 token（隔离宿主里常见）——路由是挂上的，只是要先认证；
+      1. 401 是宿主面：端口已绑、认证层在要 token —— 路由挂上了，只是要先认证；
+      2. 200 是默认面：不带 token 直接 200 的，是宿主给本机打开的那一面；
       3. 303 是 token 重定向：带 token 的访问地址过这一面，同样是活的服务；
       4. 404 / 连不上只能兜底，且明确不算「就绪」（404 = 端口绑了但路由还没挂完）。
     同分时按 netstat 顺序，保持既有行为可预测。
+
+    2026-11-27 真机两次修（-Status 报 35877/404 而不是 35863/401）：
+      * **content-type: application/json 的 404** 是宿主的路由兜底面（几毫秒就答），从来不是
+        宿主面。它和 401 面平等做兜底候选时，401 面一次读超时（0）就让它胜出。现在它只做
+        最后的兜底，并且会被 Get-DesktopInstances 学成 aux，下次直接跳过。
+      * 401 面「连上了但没回话」（0）不是终局：还有别的端口在听时，对这一组再问一遍。
+        这一遍只发生在「本来就要报一个不健康面」的坏路径上，好路径一个字节都不多花。
   #>
   param([int[]]$Ports = @(), [string]$Host_ = $BindHost, [int]$ConnectTimeoutMs = 1500, [int[]]$SkipPorts = @(), [int]$DeadlineMs = 3000, [switch]$ProbeAll)
   $order = New-Object System.Collections.ArrayList
   $all = @($Ports | Where-Object { $_ -gt 0 })
-  if ($all.Count -eq 0) { return [pscustomobject]@{ port = 0; status = 0; order = @(); probed = 0 } }
-  $best = $null; $bestRank = 99; $bestStatus = 0; $fallback = $null
+  if ($all.Count -eq 0) { return [pscustomobject]@{ port = 0; status = 0; order = @(); probed = 0; contentType = '' } }
+  $best = $null; $bestRank = 99; $bestStatus = 0
+  $fallback = $null        # 非 JSON 的兜底面（优先）
+  $fallbackJson = $null    # JSON 兜底面（最后才用）
   $probed = 0
   $unprobed = New-Object System.Collections.ArrayList
+  $zero = New-Object System.Collections.ArrayList
   foreach ($p in @($all | Sort-Object)) {
     if (@($SkipPorts) -contains [int]$p) {
       # 已知不是宿主的面（实测过的浏览器调试端口等）。不探、不占预算，也**不算**兜底候选。
-      [void]$order.Add([pscustomobject]@{ port = $p; status = -1; ms = 0; stage = 'skipped'; known = 'aux' })
+      [void]$order.Add([pscustomobject]@{ port = $p; status = -1; ms = 0; stage = 'skipped'; known = 'aux'; ct = '' })
       continue
     }
     if ($bestRank -eq 0 -and -not $ProbeAll) {
-      # 已经确定是宿主面了（200）。剩下的端口在 -ProbeAll 那一轮再补探，这一轮先记账。
+      # 已经确定是宿主面了（401）。剩下的端口在 -ProbeAll 那一轮再补探，这一轮先记账。
       [void]$unprobed.Add([int]$p)
       continue
     }
     Add-Phase ("probe:" + $p)
     $s = Invoke-HttpProbe -Port $p -Host_ $Host_ -ConnectTimeoutMs $ConnectTimeoutMs
     $probed++
-    [void]$order.Add([pscustomobject]@{ port = $p; status = $s.status; ms = $s.ms; stage = $s.stage })
+    [void]$order.Add([pscustomobject]@{ port = $p; status = $s.status; ms = $s.ms; stage = $s.stage; ct = [string]$s.contentType })
     # 200 是宿主给本机开的默认面；401 是认证层在要 token —— 两者都说明「端口绑了、路由挂上了」。
-    # 顺序固定为 200 > 401 > 303 > 其他：主面偶尔读慢（实测先 404、隔一秒 401），若把 401 排末位，
+    # 顺序固定为 401 > 200 > 303 > 其他：主面偶尔读慢（实测先 404、隔一秒 401），若把 401 排末位，
     # 那个稳定回 404 的兜底端口就会胜出，-Status 于是报一个并不存在的「就绪」面。
     # 4173 那种浏览器调试端口也是 200，只能靠「已经选定了就别再换」+ 建议表避开，不能靠猜端口号。
     $rank = Get-HostFaceRank $s.status
@@ -3601,24 +3637,47 @@ function Resolve-HostPort {
       Start-Sleep -Milliseconds 700
       $again = Invoke-HttpProbe -Port $p -Host_ $Host_ -ConnectTimeoutMs $ConnectTimeoutMs
       $probed++
-      [void]$order.Add([pscustomobject]@{ port = $p; status = $again.status; ms = $again.ms; stage = $again.stage; retry = $true })
+      [void]$order.Add([pscustomobject]@{ port = $p; status = $again.status; ms = $again.ms; stage = $again.stage; ct = [string]$again.contentType; retry = $true })
       $s = $again
       $rank = Get-HostFaceRank $s.status
     }
+    # 连上了、却一个字都没回：这一眼不能算终局（宿主忙时 401 面会先读超时），先记账，坏路径上再补一次。
+    if ($rank -eq 99 -and $s.status -eq 0 -and $s.stage -eq 'http') { [void]$zero.Add([int]$p) }
     if ($rank -lt $bestRank) { $bestRank = $rank; $best = $p; $bestStatus = $s.status }
-    if (-not $fallback -and $s.status -ne 0) { $fallback = $p }
+    if ($s.status -ne 0) {
+      if ([string]$s.contentType -like 'application/json*') {
+        if (-not $fallbackJson) { $fallbackJson = $p }
+      } elseif (-not $fallback) { $fallback = $p }
+    }
+  }
+  # 第二遍：只在「没有任何一面试就绪，而且刚才有人一个字都没回」时补一次。见函数头 2026-11-27 第二条。
+  if ($bestRank -eq 99 -and -not $ProbeAll -and @($all).Count -gt 1 -and @($zero).Count -gt 0) {
+    foreach ($p in @($zero)) {
+      Add-Phase ("probe2:" + $p)
+      $s2 = Invoke-HttpProbe -Port $p -Host_ $Host_ -ConnectTimeoutMs $ConnectTimeoutMs -RequestTimeoutMs 5000
+      $probed++
+      [void]$order.Add([pscustomobject]@{ port = [int]$p; status = $s2.status; ms = $s2.ms; stage = $s2.stage; ct = [string]$s2.contentType; retry = $true; pass = 2 })
+      $r2 = Get-HostFaceRank $s2.status
+      if ($r2 -lt $bestRank) { $bestRank = $r2; $best = $p; $bestStatus = $s2.status }
+    }
   }
   # 没探的那些明确标成 unprobed —— 「没看过」和「看过没回」是两件事，消费方要能分清
   foreach ($q in @($unprobed)) {
-    [void]$order.Add([pscustomobject]@{ port = [int]$q; status = -1; ms = 0; stage = 'unprobed' })
+    [void]$order.Add([pscustomobject]@{ port = [int]$q; status = -1; ms = 0; stage = 'unprobed'; ct = '' })
   }
   if ($bestRank -lt 99) {
-    return [pscustomobject]@{ port = [int]$best; status = $bestStatus; order = @($order.ToArray()); probed = $probed }
+    $bestEntry = @($order.ToArray() | Where-Object { [int]$_.port -eq [int]$best -and [int]$_.status -eq [int]$bestStatus })[0]
+    return [pscustomobject]@{ port = [int]$best; status = $bestStatus; order = @($order.ToArray()); probed = $probed; contentType = [string]$bestEntry.ct }
   }
-  $pick = $fallback
+  $pick = if ($fallback) { $fallback } else { $fallbackJson }
   $status = 0
-  if ($pick) { $status = @($order.ToArray() | Where-Object { $_.port -eq $pick })[0].status }
-  return [pscustomobject]@{ port = [int]$pick; status = $status; order = @($order.ToArray()); probed = $probed }
+  $ct = ''
+  if ($pick) {
+    $e = @($order.ToArray() | Where-Object { [int]$_.port -eq [int]$pick })[0]
+    $status = [int]$e.status
+    $ct = [string]$e.ct
+  }
+  return [pscustomobject]@{ port = [int]$pick; status = $status; order = @($order.ToArray()); probed = $probed; contentType = $ct }
 }
 
 function Get-AuxPortHint([int]$MainPid_) {
@@ -3641,9 +3700,13 @@ function Get-AuxPortHint([int]$MainPid_) {
 
 function Save-AuxPortHint([int]$MainPid_, [int[]]$Ports) {
   # 把「本次实测确认不是宿主面」的端口记下来（供下次先跳过）。失败不影响任何行为。
+  # 合并而不是覆盖：CDP 的 200 面与路由兜底的 JSON 404 面是两次独立发现，
+  # 覆盖写入会让后一次把前一次学过的东西丢掉（于是每次都要重新踩一遍）。
   if (-not $MainPid_ -or @($Ports).Count -eq 0) { return }
   try {
-    $rec = [ordered]@{ mainPid = [int]$MainPid_; ports = @($Ports | Sort-Object -Unique); savedAt = (Get-Date).ToString('o') }
+    $old = @(Get-AuxPortHint $MainPid_)
+    $all = @(@($old) + @($Ports) | Where-Object { $_ -and [int]$_ -gt 0 } | ForEach-Object { [int]$_ } | Sort-Object -Unique)
+    $rec = [ordered]@{ mainPid = [int]$MainPid_; ports = @($all); savedAt = (Get-Date).ToString('o') }
     New-Utf8NoBom (Get-StatePath 'aux-ports.json') ($rec | ConvertTo-Json -Compress)
   } catch { }
 }
@@ -3705,6 +3768,13 @@ function Get-DesktopInstances {
       } | ForEach-Object { [int]$_.port })
     $pickReady = ([int]$pick.status -eq 200 -or [int]$pick.status -eq 401)
     if ($aux.Count -gt 0 -and $pick.port -gt 0 -and $pickReady) { Save-AuxPortHint $h.mainPid $aux }
+    # JSON + 404 是路由兜底面（几毫秒就答、content-type 明确），从来不是宿主面 ——
+    # 这条结论不依赖「本轮选没选中就绪面」。学不到它，下一次 401 面一忙（读超时）
+    # 它就会赢（2026-11-27 实测 35877/404 胜 35863/401）。
+    $auxJson = @($pick.order | Where-Object {
+        $_.stage -eq 'http' -and [int]$_.status -eq 404 -and ([string]$_.ct -like 'application/json*') -and [int]$_.port -ne [int]$pick.port
+      } | ForEach-Object { [int]$_.port })
+    if ($auxJson.Count -gt 0) { Save-AuxPortHint $h.mainPid $auxJson }
     $proc = Get-Process -Id $h.pid -ErrorAction SilentlyContinue
     [void]$list.Add([pscustomobject]@{
       pid            = $h.pid
@@ -4113,7 +4183,7 @@ function Start-DesktopApp {
   return $p
 }
 
-function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec, [datetime]$MainStart) {
+function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec, [datetime]$MainStart, [string]$UserDataDir = '') {
   # 就绪判据：出现「本次启动生出来的」宿主子进程 + 它监听的端口 401/200。
   # 为什么不能只看 pid：Windows 会复用 pid —— 本机实测一次重启里 pid 7080 是上一轮早已死掉的
   # 主进程，32044 这个**别人的**实例恰好复用了它；只按 pid 判「主进程还活着」就会一直等，
@@ -4129,11 +4199,14 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec, [datetime]$MainStar
   # （弹「应用无法启动」窗口），所以 HasExited 永远为 false —— 只看进程/端口会白等到超时。
   # 2026-11-27 实测：主进程 70s 前就写下了 DSH_DESKTOP_UPDATE_CHECK_INTERVAL_MS 越界，
   # 引擎却继续等到预算耗尽，最后只报「未发现宿主子进程的监听端口」。
-  $udDir = ''
-  try {
-    $udExe = Resolve-DesktopAppPath
-    if ($udExe) { $udDir = Get-DesktopUserDataDir $udExe }
-  } catch { }
+  # 显式传入的 userData 优先：看门狗探针跑在临时 userData 上，走缓存/探测会读到生产目录。
+  $udDir = $UserDataDir
+  if (-not $udDir) {
+    try {
+      $udExe = Resolve-DesktopAppPath
+      if ($udExe) { $udDir = Get-DesktopUserDataDir $udExe }
+    } catch { }
+  }
   $crashSince = if ($newMainStart) { $newMainStart.AddSeconds(-5) } else { (Get-Date).AddSeconds(-120) }
   $nextCrashScan = (Get-Date)
   $deadline = (Get-Date).AddSeconds($MaxSec)
@@ -4297,7 +4370,40 @@ function Get-MainCrashRecord([string]$UserDataDir, [datetime]$Since, [int]$MainP
   return $null
 }
 
+function Invoke-WatchdogProbe([int]$MainPid, [string]$UserDataDir, [datetime]$SpawnedAt) {
+  <#
+    真机验证「就绪阶段崩溃看门狗」：在**临时** userData 里写一份主进程崩溃记录
+    （shell pid 与本次冒烟的主进程一致），然后直接调用生产用的 Wait-DesktopHostReady，
+    要求它在秒级内以 reason=main-crashed 失败，并把原始的 Error 行透传出来。
+
+    边界要说清：注入的是一份崩溃**记录**，不是真的崩溃 —— 但读它的是生产代码、进程是真的、
+    userData 是隔离的。「冒烟通过之后主进程才崩」在本机无法安全制造（那要把生产实例弄坏），
+    所以这一层用注入来覆盖：检查的正是「崩溃日志出现 → 立即失败」这条分支。
+  #>
+  $logs = Join-Path $UserDataDir 'logs'
+  New-Item -ItemType Directory -Force -Path $logs | Out-Null
+  $text = "shell pid: $MainPid`r`nError: watchdog-probe injected crash record (expected)`r`n"
+  $file = Join-Path $logs ('crash-' + (Get-Date).ToString('yyyyMMdd-HHmmss') + '-main.log')
+  [System.IO.File]::WriteAllText($file, $text, (New-Object System.Text.UTF8Encoding($false)))
+  $before = $script:Steps.Count
+  $t0 = Get-Date
+  $wd = Wait-DesktopHostReady $MainPid 15 $SpawnedAt -UserDataDir $UserDataDir
+  $sec = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
+  # 探针借用了生产函数，它会往 steps 里写自己的 'ready' 行；那是探针的中间态，
+  # 不该出现在本次动作的终态里（更不能把一次成功的重启变成 ok=false）。
+  while ($script:Steps.Count -gt $before) { $script:Steps.RemoveAt($script:Steps.Count - 1) }
+  $detected = (-not $wd.ok) -and ([string]$wd.reason -eq 'main-crashed') -and ([string]$wd.error -like '*watchdog-probe*')
+  Add-Step 'watchdog' $(if ($detected) {
+      "就绪阶段看门狗在 ${sec}s 内识别注入的崩溃记录（reason=main-crashed，错误文本已透传）"
+    } else {
+      "看门狗没有按预期识别注入的崩溃记录：ok=$($wd.ok) reason=$($wd.reason) error=$($wd.error)"
+    }) $(if ($detected) { 'ok' } else { 'warn' })
+  try { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue } catch { }
+  return [pscustomobject]@{ ok = $detected; sec = $sec }
+}
+
 function Test-DesktopGuiStartup {
+  param([switch]$WatchdogProbe)
   <#
     真起一次 Electron **主进程**（不是宿主），确认它能过启动期校验并拉起自己的宿主。
     隔离：--user-data-dir 指向临时目录（Electron 的单实例锁按 userData 分域，实测不会碰
@@ -4356,6 +4462,15 @@ function Test-DesktopGuiStartup {
       foreach ($k in $kids) {
         if ($k.CommandLine -and $k.CommandLine -match 'dsh-desktop-host[\\/]lib[\\/]index\.js') {
           Add-Step 'gui-smoke' ('主进程 ' + [int]((Get-Date) - $start).TotalSeconds + 's 内完成启动期校验并拉起宿主 pid=' + $k.ProcessId + '（临时 userData，未触碰生产实例）') 'ok'
+          if ($WatchdogProbe) {
+            $wd = Invoke-WatchdogProbe -MainPid $p.Id -UserDataDir $ud -SpawnedAt $start
+            # 普通重启：探针失败只留 warn（检测层坏了不该拦住一次能成功的重启）；
+            # -Preflight 是验收闸门：它不过就不许停生产实例。
+            if (-not $wd.ok -and $Preflight) {
+              Add-Step 'abort' '就绪阶段看门狗对注入的崩溃记录没有反应 → -Preflight 判定验收失败，停机前中止' 'fail'
+              return [pscustomobject]@{ ok = $false; reason = 'watchdog-probe-failed' }
+            }
+          }
           return [pscustomobject]@{ ok = $true; reason = 'host-spawned'; hostPid = [int]$k.ProcessId }
         }
       }
@@ -4661,6 +4776,32 @@ try {
   }
 
   if ($RepairSharedScope) {
+    if ($DryRun) {
+      # 演练：只回答「会从哪来、到哪去、现在是什么形状」，一个字节都不写。
+      # 旧行为是 -DryRun 照样重建（要几十秒、动 <DSH_HOME>\profiles\node_modules），
+      # 与「演练不写入」的承诺矛盾 —— 2026-11-27 修。
+      $exe = Resolve-DesktopAppPath
+      $root = Get-SharedScopePath
+      $curFiles = 0; $curBytes = [int64]0
+      if (Test-Path -LiteralPath $root) {
+        $cur = @(Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue)
+        $curFiles = $cur.Count
+        if ($curFiles -gt 0) { $curBytes = [int64](($cur | Measure-Object Length -Sum).Sum) }
+      }
+      $layout = 'missing'
+      $srcNote = '(找不到 DSH Desktop)'
+      if ($exe) {
+        $paths = Get-DesktopPaths $exe
+        if (Test-Path -LiteralPath $paths.asar -PathType Leaf) { $layout = 'app.asar'; $srcNote = $paths.asar }
+        elseif (Test-Path -LiteralPath (Join-Path $paths.runtimeDir 'node_modules') -PathType Container) {
+          $layout = 'unpacked'; $srcNote = (Join-Path $paths.runtimeDir 'node_modules')
+        }
+      }
+      Add-Step 'shared-scope' ("-DryRun：将用 $layout 重建 $root（当前 $curFiles 个文件 / " +
+        [math]::Round($curBytes / 1MB, 1) + "MB）；源：" + $srcNote + "；不写盘") 'warn'
+      Write-Terminal 'dry-run' 0
+      exit 0
+    }
     $rep = Repair-SharedScope
     if ($rep.ok) {
       Add-Step 'shared-scope' ("已重建共享投影 " + (Get-SharedScopePath) + "：" + $rep.stats.Files + " 个文件、" +
@@ -4734,7 +4875,7 @@ try {
   if (($VerifyOnly -or $Preflight) -and $script:HostKind -eq 'desktop') {
     if ($SkipGuiProbe) { Add-Step 'gui-smoke' '-SkipGuiProbe：跳过主进程冒烟（主进程启动期校验未覆盖）' 'warn' }
     else {
-      $gui = Test-DesktopGuiStartup
+      $gui = Test-DesktopGuiStartup -WatchdogProbe
       if (-not $gui.ok) { Write-Terminal 'verify-only-failed' 4; exit 4 }
     }
   }
@@ -4909,7 +5050,7 @@ try {
     if ($SkipGuiProbe) {
       Add-Step 'gui-smoke' '-SkipGuiProbe：跳过主进程冒烟（主进程启动期校验未覆盖，失败时只能靠就绪阶段兜底）' 'warn'
     } else {
-      $gui = Test-DesktopGuiStartup
+      $gui = Test-DesktopGuiStartup -WatchdogProbe
       if (-not $gui.ok) {
         Add-Step 'abort' '主进程无法完成启动期校验 → 在停机之前中止，旧实例保持不动（R1）' 'fail'
         Write-Terminal 'verify-failed' 4

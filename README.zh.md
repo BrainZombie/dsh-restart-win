@@ -191,6 +191,13 @@ dsh-restart-win -Record -RecordCommand '"C:\<app>\DeepSeek Harness.exe"' -Record
 
 桌面版上的 `-Preflight` 直接以 Node 模式起 Electron 宿主入口（隔离 home），不碰正在运行的 App，验证的是同一套插件栈。
 
+每次桌面版重启在**碰旧实例之前**还有两道检查：`gui-smoke` 用临时 `--user-data-dir` 真起一次
+Electron **主进程**（只验隔离宿主入口，证明不了壳自己的启动期校验能过），要求它拉起宿主；随后
+`watchdog` 往同一个临时 userData 写一份带该主进程 `shell pid` 的崩溃记录，要求
+`Wait-DesktopHostReady` 在秒级内以 `reason=main-crashed` 失败并透传原始 `Error:` 行。第二步注入的
+是崩溃**记录**而不是真崩溃 —— 但读它的是生产函数、进程是真的、userData 是隔离的。`-Preflight`
+下看门狗没反应会在停机前中止；普通重启只记 warn。
+
 
 ### 4.7 右栏面板
 
@@ -440,7 +447,7 @@ dsh-restart-win -DryRun
 | `-NoWait` | — | 收尾不停留：跳过等新 boot token 的 20 s，只做一次非阻塞扫描 |
 | `-Profile` | string | DSH profile（默认 `web`） |
 | `-HostKind` | `auto` / `web` / `desktop` | 宿主形态；`auto` 检测 DSH Desktop，否则按 `dsh web` |
-| `-RepairSharedScope` | — | 从已安装的 `app.asar` 重建 `<DSH_HOME>\profiles\node_modules`（桌面宿主解析 `@deepseek-ai/*` 用的基础包投影）后退出。App 打不开、崩溃日志里基础包全是 `ERR_MODULE_NOT_FOUND` 时用它 |
+| `-RepairSharedScope` | — | 从已安装的 `app.asar` 重建 `<DSH_HOME>\profiles\node_modules`（桌面宿主解析 `@deepseek-ai/*` 用的基础包投影）后退出。App 打不开、崩溃日志里基础包全是 `ERR_MODULE_NOT_FOUND` 时用它。加 `-DryRun` 只报源布局与当前文件数，**不写盘** |
 | `-CheckShadowed` | — | 把 profile 里版本与 App 自带不一致的 `@deepseek-ai/*` 移进 `.stale-packages`（这类遮蔽会让 `settings` 服务起不来：App 报 *Web RPC failed*，6 个插件一直 pending） |
 | `-Port` | int | 宿主端口（默认 `3080`，同时决定互斥体名） |
 | `-BindHost` | string | 探针地址（默认 `127.0.0.1`）。它**不影响**宿主监听地址，见 §8 |
@@ -546,10 +553,19 @@ DSH Desktop 的宿主是 `--port 0` 起的，起来之后可能同时监听好�
 | 48696 | `404` | 兜底路由还挂着的空壳 |
 
 引擎按 **401 > 200 > 303 > 其他** 的优先级逐个探，命中就停，结果写进 `instances[].probe`
-（每个端口的实测状态、毫秒、阶段）。`401` 排在第二是因为「端口绑好、认证层要 token」同样说明
-服务是活的；`4173` 这种同为 200 的调试面只能靠「已经选定了就别再换」避开，不能靠猜端口号。
+（每个端口的实测状态、毫秒、阶段）。`401` 排在第一是因为「端口绑好、认证层要 token」说明服务
+是活的；`4173` 这种同为 200 的调试面只能靠「已经选定了就别再换」避开，不能靠猜端口号。
 等新一轮重启时，宿主会在随机端口上先回 `404`、隔一秒才变 `401`/`200`，所以只有「端口通了但给了
 状态码」的候选才会在 700ms 后重问一次 —— 连不上的端口不会翻倍等待。
+
+2026-11-27 两次真机修（都不是推演）：
+
+- `content-type: application/json` 的 `404` 是宿主的路由**兜底面**（几毫秒就答），永远不是宿主面。
+  它现在排在所有兜底候选的最后，并且**不管本轮有没有选中就绪面**都会被学进 `aux-ports.json`。
+  在此之前，真面偶尔读超时一次就让它赢了：`-Status` 报的是 `48xxx+14/404` 而不是活着的 `401` 面。
+- 没有任何面就绪、且至少有一个端口「连上了但一个字没回」时，这一组会再探一遍，然后才退回 404。
+  忙起来的宿主长的就是这个样子：socket 连上，读超时。第二遍只发生在本来就要报坏消息的路径上
+  （实测 5.7s 换来正确答案；健康路径仍是 0.8s）。
 
 `probe` 里每个条目还有 `stage`，它区分「没选它」的三种情况：
 
@@ -786,6 +802,8 @@ scripts/dsh-restart.task.xml  计划任务模板（占位符版）
 scripts/check-encoding.ps1    编码 / 换行 / 双引擎 Parser 校验
 install.ps1               装 profile + 写 PATH shim
 test/selftest.mjs         单测与契约测试
+test/probe-hostport.ps1   真 socket 验证 -Status 的选面（从引擎里抽出 Resolve-HostPort /
+                          Invoke-HttpProbe 原样执行，对面是两个真实的 HTTP 面）
 docs/parity-matrix.md     功能对照表（每行有旧实现位置、目标位置、验证方式）
 docs/migration.md         从旧引擎切换与回退
 ```

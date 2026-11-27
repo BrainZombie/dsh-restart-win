@@ -337,7 +337,7 @@
 | U-02 | **身份校正**：`USERNAME`/`USERDOMAIN` 不在注册表里，用令牌身份覆盖（实测遇到过 `USERNAME=SYSTEM` 而真实身份是普通用户） | bin/dsh-restart.ps1:347-358 | scripts/dsh-restart.ps1::Sync-ProcessEnvironment | 不变 | parity:U-02 断言 `WindowsIdentity::GetCurrent().Name` 分割赋值 |
 | U-03 | 两处硬编码偏差：`Show-Status` 用字面量 `"DSH Restart"`（不跟 `$TaskName`）、用字面量 `profiles\web\...dsh-smart-restart`（不跟 `$Profile`） | bin/dsh-restart.ps1:1916,1918,1920 | scripts/dsh-restart.ps1::Show-Status | 不变（改为参数化） | parity:U-03 断言无字面量残留 |
 | U-04 | `-BindHost` **不参与启动命令**：宿主绑哪里由 boot-record/DEFAULT_LAUNCH 决定，`-BindHost` 只影响探针 URL 与状态显示（已冻结为接口事实：CONTRACT §3.8） | bin/dsh-restart.ps1:36,126,1002,1015 对比 1759,1853,1873 | scripts/dsh-restart.ps1 + docs/migration.md | config.bindHost（须在文档写明该边界） | parity:U-04 断言启动 argv 不含 `$BindHost`；文档写明「改 bindHost 不会改宿主监听」 |
-| U-05 | README 退出码表缺 **11**（launch-prereq-failed）与 **12**（stop-refused）→ 已冻结为契约事实（CONTRACT §3.9：以代码为准，新文档必须补齐 0–12 与 26 个终态词） | README.md:212-226 对比 bin/dsh-restart.ps1:2236,2100 | README.md / README.zh.md（docs-writer 修） | 不变 | 人工：README 退出码表含 0-12 全量；`test/parity.mjs` 断言码表 = X-01..X-26 的 rc 集合 |
+| U-05 | README 退出码表缺 **11**（launch-prereq-failed）与 **12**（stop-refused）→ **2026-11-27 已补齐**：README.md / README.zh.md 都列出 0–12，probe U-05 断言 13 个码齐（CONTRACT §3.9：以代码为准，新文档必须补齐 0–12 与 26 个终态词） | README.md:212-226 对比 bin/dsh-restart.ps1:2236,2100 | README.md / README.zh.md（docs-writer 修） | 不变 | 人工：README 退出码表含 0-12 全量；`test/parity.mjs` 断言码表 = X-01..X-26 的 rc 集合 |
 | U-06 | `-Json` 形状由 CONTRACT §3.3 重定义（旧版是「状态对象」，字段与 history 记录不同）。**已定案（2026-11-14 Lead 裁决）**：固定字段 **13 个**（契约原文「14 个」系笔误，§3.3 已改为 13）；`status` 动作必须把旧富对象原样嵌在 `status` 键下（§3.3 第 2 条），消费方不得从 `steps[]` 反推 status | bin/dsh-restart.ps1:1866-1887 对比 CONTRACT.md:55-61 | lib/runner.js + scripts/dsh-restart.ps1 | **新增**（允许的破坏性变更，须迁移说明） | parity:U-06 断言 13 个固定字段齐备、`.status` 嵌套保留旧富对象（ST-01..ST-09 字段名逐字存在）；`docs/migration.md` 说明旧消费方改法 |
 | U-07 | `-Stop` 也会执行配置操作门禁（README 只说「只停机」） | bin/dsh-restart.ps1:2103-2116 | scripts/dsh-restart.ps1::main | 不变 | parity:U-07 |
 | U-08 | `Get-ResidualChildren` 语义是「除根 pid 外的**全部 node 进程**」，不是「子进程」；`-Status` 里作为 `nodeChildren` 暴露 | bin/dsh-restart.ps1:1670-1678,1864 | scripts/dsh-restart.ps1::Get-ResidualChildren | 不变（**不得**为了名实相符改行为） | parity:U-08 断言只遍历 `Get-Process -Name node` |
@@ -394,11 +394,11 @@
 | 三、改脚本工作流（pack/check-encoding） | B-01, B-02, M-09 |
 | 三、已知易踩的 PowerShell 坑（空数组解包） | U-09, D-02 |
 | 四、快速上手（12 条命令示例） | P-12..P-31, X-01..X-26 |
-| 四、退出码（0-10） | X-01..X-24（+ U-05 指出缺 11/12） |
+| 四、退出码（0-12） | X-01..X-26（U-05 已补齐 11/12） |
 | 五、符号链接权限（机器级阻塞项 + 两条修复） | G-03, G-04, X-17, V-14 |
 | 六、与设计文档的偏差（5 条）+ 深度验证配方 | D-05, D-01, V-02..V-05, F-16, V-07 |
 | 七、验收清单 1-16 | 1→ST-01..ST-13；2→G-03；3→V-09/X-18；4→F-16/X-16；5→F-21/F-22/F-25/F-28..F-35（重启主链，本机已 196 次 restarted-ok）；6→N-01..N-07；7→F-31/F-43/D-11；8→G-11/D-09；9→D-05/F-12；10→S-03/S-04；11→F-02/G-01；12→（未实现，矩阵**不含**该能力）；13→F-33；14→B-01/U-14；15→G-03；16→G-06 |
-| 八、未验证项 / 已知限制（9 条） | P-27（TryCtrlC 未实测）、T-16（ViaTask 已后补实测）、N-04（投递已实测生效）、U-12（无看门狗） |
+| 八、未验证项 / 已知限制（9 条） | P-27（TryCtrlC 未实测）、T-16（ViaTask 已后补实测）、N-04（投递已实测生效）；**看门狗已于 0.6.6/0.6.8 补上**（停机前 gui-smoke + 就绪期 crash 看门狗 + `-Preflight` 下真机注入探针，见 §4.6） |
 | 九、重启由用户执行 + 2026-09-12 事故复盘（3 处修复） | M-01, G-07, G-08, F-42, S-01, U-04 |
 
 ### 14.2 `bin/dsh-restart.ps1:33-85` param 块 → 矩阵行

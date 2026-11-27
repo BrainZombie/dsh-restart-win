@@ -191,6 +191,15 @@ dsh-restart-win -Record -RecordCommand '"C:\<app>\DeepSeek Harness.exe"' -Record
 
 `-Preflight` on a desktop profile boots the Electron host entry directly (Node mode + isolated home), so it validates the same plugin stack without touching the running app.
 
+Two checks sit in front of every desktop restart, both before the old instance is touched: `gui-smoke`
+starts the real Electron **main** process against a temporary `--user-data-dir` (the isolated host entry
+proves the child works, not that the shell's own startup checks pass) and requires it to spawn its host;
+then `watchdog` writes a crash record with that main process's `shell pid` into the same temporary
+userData and requires `Wait-DesktopHostReady` to fail with `reason=main-crashed` and the original
+`Error:` line within seconds. The second step is an injected record, not a real crash — but the reader
+is the production function, the process is real and the userData is isolated. Under `-Preflight` a
+watchdog that does not react aborts the run before the stop; on an ordinary restart it only warns.
+
 
 ### 4.7 The sidebar panel
 
@@ -360,7 +369,7 @@ The `%LOCALAPPDATA%\dsh-restart\bin\dsh-restart-win.cmd` shim that `install.ps1`
 | `-NoWait` | — | Do not linger at the end: skip the 20 s boot-token wait and scan once |
 | `-Profile` | string | DSH profile (default `web`) |
 | `-HostKind` | `auto` / `web` / `desktop` | Host shape; `auto` detects DSH Desktop and otherwise stays on `dsh web` |
-| `-RepairSharedScope` | — | Rebuild `<DSH_HOME>\profiles\node_modules` (the base-package projection the desktop host resolves `@deepseek-ai/*` from) out of the installed `app.asar`, then exit. Use it when the app no longer starts and its crash log lists base packages as `ERR_MODULE_NOT_FOUND` |
+| `-RepairSharedScope` | — | Rebuild `<DSH_HOME>\profiles\node_modules` (the base-package projection the desktop host resolves `@deepseek-ai/*` from) out of the installed `app.asar`, then exit. Use it when the app no longer starts and its crash log lists base packages as `ERR_MODULE_NOT_FOUND`. With `-DryRun` it only reports the source layout and the current file count — nothing is written |
 | `-CheckShadowed` | — | Move any `@deepseek-ai/*` inside the profile whose version differs from the app's own copy into `.stale-packages` (that shadowing makes the `settings` service never register: the app shows *Web RPC failed* and six plugins stay pending) |
 | `-Port` | int | Host port (default `3080`; also names the mutex) |
 | `-BindHost` | string | Probe address (default `127.0.0.1`). It does **not** change the host's listen address — see §8 |
@@ -464,6 +473,17 @@ answers 200 can only be avoided by rank, never by guessing the port number. Righ
 host answers `404` on its random port for about a second before flipping to `401`/`200`, so a candidate
 that answered with a status code is asked once more 700 ms later — a port that refuses connections is
 never waited on twice.
+
+Two corrections from 2026-11-27, both measured on this machine:
+
+- A `404` whose `content-type` is `application/json` is the host's **router fallback** (it answers in
+  milliseconds), never the host's face. It now ranks below every other fallback and is learned into
+  `aux-ports.json` regardless of whether a ready face was found — previously the real face could time
+  out once and the JSON face won, so `-Status` reported `48xxx+14/404` instead of the live `401` face.
+- When nothing is ready and at least one port connected but never answered, those ports are probed a
+  second time before a 404 fallback is reported. A busy host looks exactly like that: the socket
+  connects, the read times out. The second pass only runs on the already-bad path (measured: 5.7 s
+  instead of a wrong answer; the healthy path is unchanged at 0.8 s).
 
 ---
 
@@ -693,6 +713,8 @@ scripts/dsh-restart.task.xml  scheduled-task template (placeholder form)
 scripts/check-encoding.ps1    encoding / newline / dual-engine parser check
 install.ps1               add to profile + write the PATH shim
 test/selftest.mjs         unit and contract tests
+test/probe-hostport.ps1   real-socket check of -Status' port selection (extracts the engine's own
+                          Resolve-HostPort / Invoke-HttpProbe and drives them against two live faces)
 docs/parity-matrix.md     capability matrix (source position, target, verification per row)
 docs/migration.md         switching from the old engine and rolling back
 ```
