@@ -982,6 +982,19 @@ PROBES['D-17'] = [
     { file: ENGINE, inFunction: 'Stop-OrphanDesktopHosts', has: /taskkill/, note: 'an orphan is killed by identity' },
     { file: ENGINE, inFunction: 'Stop-OrphanDesktopHosts', has: /DryRunOnly/, note: '-DryRun only reports' },
 ];
+PROBES['D-18'] = [
+    { file: ENGINE, inFunction: 'Resolve-WebAuthUrl', has: /Get-HostAuthUrlRecord \(Get-StatePath \(Get-HostLogName 'out'\)\)/, note: 'the log candidate is the redirected host log' },
+    { file: ENGINE, inFunction: 'Resolve-WebAuthUrl', has: /Save-WebAuthUrlRecord \$hit\.Url/, note: 'a hit is persisted' },
+    { file: ENGINE, fn: (ctx) => {
+        const body = ctx.functionBody(ENGINE, 'Resolve-WebAuthUrl');
+        assert.ok(/Test-WebAuthUrl \$hit\.Url/.test(body), 'a log hit must be proven by the token probe before it is persisted');
+        assert.ok(!/NoLogScan/.test(body), 'the pid pre-filter is gone: right after a restart the persisted record is always one generation old');
+        const probeAt = body.indexOf('Test-WebAuthUrl $hit.Url');
+        const saveAt = body.indexOf('Save-WebAuthUrlRecord $hit.Url');
+        assert.ok(probeAt > 0 && saveAt > probeAt, 'the probe must run before the write');
+    } },
+    { file: ENGINE, has: /\$auth = Resolve-WebAuthUrl \$currentHostPids -ProbePorts \$livePorts\r?\n/, note: 'the -Status call site scans the log unconditionally' },
+];
 PROBES['D-10'] = [{ file: ENGINE, inFunction: 'Get-ResidualChildren', has: /Get-Process -Name node/ }];
 PROBES['D-11'] = [{ file: ENGINE, inFunction: 'Remove-OrphanDshChildren', has: /deepseek-ai\|codegraph/ }, { file: ENGINE, inFunction: 'Remove-OrphanDshChildren', has: /if \(\$ppid -gt 0 -and \(Get-Process -Id \$ppid/ }];
 

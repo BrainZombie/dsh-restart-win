@@ -1,5 +1,30 @@
 # 变更记录
 
+## 0.6.7 — 重启后的访问地址能自愈补写
+
+2026-11-27。0.6.6 的真机重启成功（`restarted-ok`，130s，新宿主 28824 / 端口 59729 / HTTP 401），
+但紧接着的 `-Status` 报 `launchUrlState=unknown`：`web-auth-url.txt` 里是上一代记录
+（pid=18144 / 端口 19398），而本次 boot 的 `dsh web: …?token=…` 行就在 `host.desktop.out.log` 里。
+根因是 `Resolve-WebAuthUrl` 先按 pid 预筛：持久文件的 pid 对不上当前宿主就 `-NoLogScan` 直接返回，
+连日志都不扫 —— 而「重启之后持久文件的 pid 必然对不上」正是它唯一该工作的场景。于是重启步骤里
+那句「地址稍后由 `dsh-restart -Status` 校验并补写」永远不成立（本机 token 行实测 60~200s 才打印，
+必然错过重启时的 20s 窗口）。
+
+### 改了什么
+
+- 删掉 pid 预筛与 `-NoLogScan` 分支：日志候选一律参与。`host.desktop.out.log` 每次拉起都由
+  `Start-Process` 截断重写，最后一条 `dsh web:` 行只属于当前 boot —— 预筛本身是错的假设。
+- 安全性不收窄：补写前必须先过 `Test-WebAuthUrl`（有效 token → 303；旧 token 在新实例上必被拒），
+  探测通过才落盘，所以「日志里有旧 token」不会被写成「当前地址」。
+- `docs/parity-matrix.md` 新增 D-18，`test/parity.mjs` 断言无 pid 预筛、探测先于落盘。
+
+### 本机实测
+
+- 同一实例上 `-Status`：`launchUrlState` 由 `unknown` 转 `ok`，detail 为
+  「持久文件已补写（pid=28824，token 已被当前实例接受）」，`web-auth-url.txt` 刷新为
+  pid=28824 / port=59729；原始 TCP 探测 `GET /?token=…` → **303**，`GET /` → 401；`auth-log` 阶段 6ms。
+- 三套件：selftest 97 passed / parity 263/263 / integration 16 passed + 1 skipped。
+
 ## 0.6.6 — 停机前真起一次主进程（gui-smoke）
 
 2026-11-27。一次重启把 DSH 留在「应用无法启动」的错误窗口上：用户环境变量

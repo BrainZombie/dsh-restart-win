@@ -1162,7 +1162,7 @@ function Test-WebAuthUrl([string]$Url, [int]$Port_ = 0) {
   return ($code -ge 200 -and $code -lt 400)
 }
 
-function Resolve-WebAuthUrl($CurrentPids, $ProbePorts = @(), [switch]$NoLogScan) {
+function Resolve-WebAuthUrl($CurrentPids, $ProbePorts = @()) {
   <#
     -Status 用：返回 @{ Url; State = 'ok'|'stale'|'unknown'; Detail; Refreshed }。
     旧地址绝不能被当成当前有效地址 —— 必须同时满足：
@@ -1171,6 +1171,10 @@ function Resolve-WebAuthUrl($CurrentPids, $ProbePorts = @(), [switch]$NoLogScan)
     文件缺失/过期时做一次「只读修复」：若日志里已经有**当前实例**的 token（同样以 HTTP
     探测证明），就补写持久文件。补写的只是状态目录里的一个缓存文件，不碰 DSH 实例 ——
     这样 20s 窗口错过 token 行（实测 117s）后，用户仍能在 -Status 里拿到地址。
+    日志候选**不按 pid 预筛**：拉起时 `host.desktop.out.log` 是被 Start-Process 截断重写的，
+    最后一条 `dsh web:` 行只可能属于当前 boot；而真正的判据是第 ② 条的带 token 探测 ——
+    上一代的 token 会被新实例拒绝，绝不会被补写成「当前地址」。曾经的 pid 预筛把这条
+    唯一的自愈路径关掉了：重启后持久文件里必然是上一代记录，于是 -Status 恒为 unknown。
   #>
   $pids = @()
   foreach ($p in @($CurrentPids)) { if ($null -ne $p) { $pids += [int]$p } }
@@ -1196,11 +1200,6 @@ function Resolve-WebAuthUrl($CurrentPids, $ProbePorts = @(), [switch]$NoLogScan)
     $why = '持久文件里的 token 未被当前实例接受（pid=' + $rec.Pid + '；宿主可能仍在启动，或该记录已过期）'
   }
 
-  if ($NoLogScan) {
-    # 持久文件记的是别的 pid：日志里只可能有旧 boot 的 token，扫它纯属白花时间
-    Add-Phase 'auth-log'
-    return [pscustomobject]@{ Url = $null; State = 'unknown'; Detail = $why; Refreshed = $false }
-  }
   Add-Phase 'auth-log'
   $hit = Get-HostAuthUrlRecord (Get-StatePath (Get-HostLogName 'out'))
   if ($hit -and (Test-WebAuthUrl $hit.Url)) {
@@ -2845,10 +2844,10 @@ function Show-Status {
   # web 分支的实例对象由 Get-HostCandidate 产出，只有 port，没有 ports；直接访问在
   # Set-StrictMode 2.0 下抛 PropertyNotFound，-Status 会以 "找不到属性 ports" 中止。
   foreach ($inst in $instances) { $livePorts += @($(if ($inst.PSObject.Properties['ports']) { $inst.ports } else { $inst.port })) }
-  # 持久记录里的 pid 不是当前实例时，日志里只会有旧 boot 的 token —— 不必扫
-  $preRec = Read-WebAuthUrlRecord
-  $authPidMatches = ($preRec -and [int]$preRec.Pid -gt 0 -and ($currentHostPids -contains [int]$preRec.Pid))
-  $auth = Resolve-WebAuthUrl $currentHostPids -ProbePorts $livePorts -NoLogScan:(-not $authPidMatches)
+  # 持久记录的 pid 对不上时也必须扫日志：重启后 web-auth-url.txt 里必然是上一代记录，
+  # 而本次 boot 的 token 行就在被重定向（截断重写）的宿主日志里 —— 那正是要补写的场景。
+  # 安全性不靠 pid 预筛，靠 Resolve-WebAuthUrl 里的带 token HTTP 探测（旧 token 必被拒）。
+  $auth = Resolve-WebAuthUrl $currentHostPids -ProbePorts $livePorts
   Add-Phase 'auth-url'
   $script:HostUrl = $auth.Url
   $stUrl = $script:HostUrl
