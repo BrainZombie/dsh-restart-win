@@ -1,5 +1,40 @@
 # 变更记录
 
+## 0.6.6 — 停机前真起一次主进程（gui-smoke）
+
+2026-11-27。一次重启把 DSH 留在「应用无法启动」的错误窗口上：用户环境变量
+`DSH_DESKTOP_UPDATE_CHECK_INTERVAL_MS=2592000000`（30 天）超过了 App 自己的上限
+2147483647，Electron 主进程在 `main()` 的启动期校验里直接抛错。工具当时的两层判断都失效：
+
+- **深度验证通过**（隔离宿主 HTTP 401）。它起的是 `dsh-desktop-host`，主进程自己的
+  环境变量/设置/policy 校验根本不在那条路径上。
+- **就绪等待白等**。主进程失败后会**继续存活**（只剩错误窗口），`HasExited` 一直是 false，
+  引擎只能等到预算耗尽，最后报「未发现宿主子进程的监听端口」——真正的 `Error:` 行就写在
+  `%APPDATA%\<app>\logs\crash-*-main.log` 里。
+
+### 改了什么
+
+- 新增 `Test-DesktopGuiStartup` / `gui-smoke` 步：在停机**之前**用
+  `--user-data-dir=<临时目录>` + 临时 `DSH_HOME` 真起一次 Electron 主进程。单实例锁按
+  userData 分域，实测不影响正在跑的实例。判据只到「拉起自己的宿主子进程」为止（主进程
+  已过启动期校验），宿主的可服务性仍由 deep-verify 负责。
+- `Wait-DesktopHostReady` 每 3s 扫一次新写的 `crash-*-main.log`（按 `shell pid` 匹配本次
+  启动的主进程）：拿到 `Error:` 就以 `main-crashed` 立即失败，并把原文写进 steps。
+- 失败的主进程崩溃日志复制到状态目录 `gui-smoke-<stamp>.log`，临时目录清理后证据还在。
+- 预算修正：旧判据把 desktop 排除在 `verifyPart` 之外，预算行写「深度验证 0s」实际却跑
+  40-150s，就绪等待被总预算提前掐断。现在桌面版同样计 `2 × VerifyReadySec`，并加上
+  gui-smoke 的 25s。
+- 逃生开关 `-SkipGuiProbe`（显式跳过主进程冒烟，失败时只剩就绪阶段的崩溃日志兜底）。
+
+### 本机实测
+
+- 正向 `-Preflight`：`gui-smoke` 3s 通过（拉起宿主 pid=24824），`deep-verify` 40s 通过
+  （隔离宿主 55523 / HTTP 401），总 53s。
+- 反向：把两个 `DSH_DESKTOP_UPDATE_CHECK_*` 临时改回 `2592000000`，`-Preflight` 在
+  **6s** 内以 rc=4 失败，steps 里就是
+  `主进程启动即失败：Error: DSH_DESKTOP_UPDATE_CHECK_INTERVAL_MS must be an integer from 1000 through 2147483647`，
+  没有进入深度验证，生产实例未被触碰；随后变量已恢复为 `2147483647`。
+
 ## 未发布 — 续跑通知的会话 id、Ctrl+C 路径隔离
 
 2026-11-25。升级到 `0aada87` 之后在本机做了一次重启，暴露出两处只在真机路径上才现形的问题。

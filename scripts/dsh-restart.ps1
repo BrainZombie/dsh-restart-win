@@ -77,6 +77,9 @@ param(
   [switch]$Stop,          # 只停机（不深度验证、不写续跑通知、不拉起）：跨端口迁移/彻底关停用
   [switch]$Json,
   [switch]$Fast,          # 跳过深度验证；存在运行实例时默认仍拒绝停机（需 -ForceUnverified）
+  # 跳过「主进程冒烟」：默认会真起一次 Electron 主进程（临时 userData + 临时 DSH_HOME），
+  # 确认它能过启动期校验并拉起宿主，再动生产实例。只有明确知道主进程起不来也照重启时才用。
+  [switch]$SkipGuiProbe,
   [switch]$ForceUnverified,
   # 存储预检失败时仍继续（只在明确知道 workspace 域已经 FAILED、准备手工修的时候用）
   [switch]$ForceStorage, # 显式承担「未验证即停机」的风险（与 -Fast 配套，R1 的唯一豁免）
@@ -344,6 +347,8 @@ $script:NewMainPid        = $null
 $script:DesktopAppPath    = $null
 # 这个路径是从哪推导出来的（resolved / running-instance / boot-record / default-location / registry/shortcut）
 $script:DesktopAppPathSource = ''
+# Electron 的 userData（崩溃日志固定在 <userData>\logs\crash-*-main.log）。按需探测后缓存。
+$script:DesktopUserData = ''
 # -Profile 是否由用户显式指定：桌面版下若没指定，profile 从运行中的宿主推导
 $script:ProfileExplicit   = $PSBoundParameters.ContainsKey('Profile')
 
@@ -2528,12 +2533,17 @@ function Format-BudgetParts {
     # 与预算里按 240s 算的两套说法）。
     $verify = 0
     if ($Preflight -or $VerifyOnly) { $verify = 2 * $VerifyReadySec }
-    elseif (-not $Start -and -not $Fast -and -not $Stop -and -not $DryRun -and $script:HostKind -ne 'desktop') { $verify = 2 * $VerifyReadySec }
+    elseif (-not $Start -and -not $Fast -and -not $Stop -and -not $DryRun) { $verify = 2 * $VerifyReadySec }
+    # 主进程冒烟：桌面版在深验证之外还要真起一次 Electron 主进程（临时 userData/DSH_HOME）。
+    # 它和深验证是两层，不能互相替代：深验证只覆盖 dsh-desktop-host。
+    $gui = 0
+    if ($script:HostKind -eq 'desktop' -and -not $Start -and -not $Stop -and -not $DryRun -and -not $Fast -and -not $SkipGuiProbe) { $gui = 25 }
     $ready = $ReadySec
     $free = if ($Stop) { [Math]::Max(30, $PortFreeSec) } else { $PortFreeSec }
     $grace = if ($Stop) { 0 } else { $GraceSec }
     $parts = @()
     if ($verify -gt 0) { $parts += ('深度验证 ' + $verify + 's（' + $VerifyReadySec + 's × 2 次尝试）') } else { $parts += '深度验证 0s（本次跳过）' }
+    if ($gui -gt 0) { $parts += ('主进程冒烟 ' + $gui + 's') }
     $parts += ('端口释放 ' + $free + 's')
     if (-not $Stop) { $parts += ('就绪 ' + $ready + 's') }
     if ($grace -gt 0) { $parts += ('收尾 ' + $grace + 's') }
@@ -2550,12 +2560,19 @@ function Set-ActionBudget {
     $budget = 0
     if ($DryRun) { $budget = [Math]::Max(30, $ReadySec) }
     elseif ($Stop) { $budget = [Math]::Max(30, $PortFreeSec) + 30 }
-    elseif ($Preflight -or $VerifyOnly) { $budget = 2 * $VerifyReadySec + 60 }
+    elseif ($Preflight -or $VerifyOnly) {
+        $guiPart = 0
+        if ($script:HostKind -eq 'desktop' -and -not $SkipGuiProbe) { $guiPart = 25 }
+        $budget = 2 * $VerifyReadySec + 60 + $guiPart
+    }
     else {
         $verifyPart = 0
-        # 桌面版的组合校验走「隔离宿主深验证」那一路；-Fast 明确要求跳过。与 needsDeepVerify 同判据。
-        if (-not $Start -and -not $Fast -and $script:HostKind -ne 'desktop') { $verifyPart = 2 * $VerifyReadySec + 60 }
-        $budget = $verifyPart + $PortFreeSec + $ReadySec + $GraceSec + 60
+        # 桌面版同样要深验证（隔离宿主）—— 旧判据把 desktop 排除在外，预算里写「深度验证 0s」，
+        # 实际却跑了 60-150s，就绪等待于是被总预算提前掐断（2026-11-27 实测）。
+        if (-not $Start -and -not $Fast) { $verifyPart = 2 * $VerifyReadySec + 60 }
+        $guiPart = 0
+        if ($script:HostKind -eq 'desktop' -and -not $Start -and -not $Fast -and -not $SkipGuiProbe) { $guiPart = 25 }
+        $budget = $verifyPart + $guiPart + $PortFreeSec + $ReadySec + $GraceSec + 60
     }
     $script:ActionBudgetSec = [int]$budget
     $script:ActionDeadline = (Get-Date).AddSeconds([int]$budget)
@@ -4109,6 +4126,17 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec, [datetime]$MainStar
   if (-not $newMainStart) {
     try { $newMainStart = (Get-Process -Id $MainPid_ -ErrorAction Stop).StartTime } catch { $newMainStart = $null }
   }
+  # 主进程启动期失败的判据：Electron 会写 <userData>\logs\crash-*-main.log 并**继续存活**
+  # （弹「应用无法启动」窗口），所以 HasExited 永远为 false —— 只看进程/端口会白等到超时。
+  # 2026-11-27 实测：主进程 70s 前就写下了 DSH_DESKTOP_UPDATE_CHECK_INTERVAL_MS 越界，
+  # 引擎却继续等到预算耗尽，最后只报「未发现宿主子进程的监听端口」。
+  $udDir = ''
+  try {
+    $udExe = Resolve-DesktopAppPath
+    if ($udExe) { $udDir = Get-DesktopUserDataDir $udExe }
+  } catch { }
+  $crashSince = if ($newMainStart) { $newMainStart.AddSeconds(-5) } else { (Get-Date).AddSeconds(-120) }
+  $nextCrashScan = (Get-Date)
   $deadline = (Get-Date).AddSeconds($MaxSec)
   # 本次动作的总预算封顶：深度验证/停机/启动已经花掉的要从就绪等待里扣掉，不让每一层
   # 各自重新计一个 90s（否则一次失败的重启可以合法地耗掉 7 分钟以上而全程无声）。
@@ -4137,6 +4165,15 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec, [datetime]$MainStar
       Add-Step 'ready' "DSH Desktop 主进程 $MainPid_ 已退出（未就绪）" 'fail'
       Show-LaunchFailure $script:HostOutPath $script:HostErrPath
       return [pscustomobject]@{ ok = $false; reason = 'exited' }
+    }
+    # 崩溃日志扫描（每 3s 一次，够快也不抢 netstat 的预算）
+    if ($udDir -and (Get-Date) -ge $nextCrashScan) {
+      $nextCrashScan = (Get-Date).AddSeconds(3)
+      $crash = Get-MainCrashRecord $udDir $crashSince $MainPid_
+      if ($crash -and $crash.error) {
+        Add-Step 'ready' ('主进程启动失败（' + (Split-Path $crash.path -Leaf) + '）：' + $crash.error) 'fail'
+        return [pscustomobject]@{ ok = $false; reason = 'main-crashed'; error = $crash.error }
+      }
     }
     # 必须 -Refresh：不刷新就一直是启动前那次 WMI 快照（那时还没有新宿主），循环永远看不到它。
     foreach ($h in @(Get-DesktopHostProcesses -Refresh)) {
@@ -4187,6 +4224,150 @@ function Remove-TreeSafe([string]$Dir) {
     [void]$rp.WaitForExit(60000)
   } catch {
     & cmd.exe /c "rmdir /s /q `"$Dir`"" *> $null
+  }
+}
+
+# ---------------------------------------------------------------- 主进程启动校验（gui-smoke）
+# 深验证只证明「dsh-desktop-host 能起来」。Electron **主进程**自己的启动期校验（环境变量、
+# 设置文件、policy）不在它的覆盖范围内。2026-11-27 实测：隔离宿主 401 通过，真主进程却因
+# DSH_DESKTOP_UPDATE_CHECK_INTERVAL_MS 越界直接弹「应用无法启动」，而且主进程**继续存活**
+# （只剩错误窗口）—— 旧的就绪等待只看 HasExited / 端口，白等到超时还说不出原因。
+# 两层必须分开验：deep-verify 覆盖宿主，gui-smoke 覆盖主进程。
+
+function Get-DesktopUserDataDir([string]$Exe) {
+  if ($script:DesktopUserData) { return $script:DesktopUserData }
+  $found = ''
+  if ($Exe) {
+    try {
+      $paths = Get-DesktopPaths $Exe
+      if ($paths) {
+        $pkg = Join-Path $paths.appRoot 'package.json'
+        if (Test-Path -LiteralPath $pkg -PathType Leaf) {
+          $doc = Get-Content -LiteralPath $pkg -Raw -Encoding UTF8 | ConvertFrom-Json
+          $name = [string]$doc.name
+          if ($name -and $env:APPDATA) {
+            $cand = Join-Path $env:APPDATA $name
+            if (Test-Path -LiteralPath $cand) { $found = $cand }
+          }
+        }
+      }
+    } catch { }
+  }
+  if (-not $found -and $env:APPDATA) {
+    # 布局无关的兜底：Electron 的崩溃日志固定在 <userData>\logs\crash-*-main.log。
+    # 只扫两层（<vendor>\<app>），不递归整个 APPDATA。
+    try {
+      $hits = New-Object System.Collections.ArrayList
+      foreach ($vendor in @(Get-ChildItem -LiteralPath $env:APPDATA -Directory -ErrorAction SilentlyContinue)) {
+        foreach ($app in @(Get-ChildItem -LiteralPath $vendor.FullName -Directory -ErrorAction SilentlyContinue)) {
+          $logs = Join-Path $app.FullName 'logs'
+          if (-not (Test-Path -LiteralPath $logs)) { continue }
+          $crash = Get-ChildItem -LiteralPath $logs -Filter 'crash-*-main.log' -File -ErrorAction SilentlyContinue |
+                   Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($crash) { [void]$hits.Add([pscustomobject]@{ dir = $app.FullName; stamp = $crash.LastWriteTime }) }
+        }
+      }
+      if ($hits.Count -gt 0) { $found = (@($hits | Sort-Object stamp -Descending)[0]).dir }
+    } catch { }
+  }
+  $script:DesktopUserData = $found
+  return $found
+}
+
+function Get-MainCrashRecord([string]$UserDataDir, [datetime]$Since, [int]$MainPid_) {
+  <#
+    读「主进程启动期崩溃」记录，返回最近一份 crash-*-main.log 的 Error 行。
+    -MainPid_ > 0 时只认 shell pid 与它一致的文件（pid 复用/上一代残留都不会误报）。
+  #>
+  if (-not $UserDataDir) { return $null }
+  $logs = Join-Path $UserDataDir 'logs'
+  if (-not (Test-Path -LiteralPath $logs)) { return $null }
+  $files = @(Get-ChildItem -LiteralPath $logs -Filter 'crash-*-main.log' -File -ErrorAction SilentlyContinue |
+             Where-Object { $_.LastWriteTime -ge $Since } | Sort-Object LastWriteTime -Descending)
+  foreach ($f in $files) {
+    $head = @(Get-Content -LiteralPath $f.FullName -TotalCount 40 -ErrorAction SilentlyContinue)
+    $shellPid = 0
+    $pidLine = @($head | Where-Object { $_ -match '^shell pid:\s*(\d+)' } | Select-Object -First 1)
+    if ($pidLine.Count -gt 0 -and $pidLine[0] -match '^shell pid:\s*(\d+)') { $shellPid = [int]$Matches[1] }
+    if ($MainPid_ -gt 0 -and $shellPid -gt 0 -and $shellPid -ne $MainPid_) { continue }
+    $errLine = @($head | Where-Object { $_ -match '^Error:' } | Select-Object -First 1)
+    $msg = ''
+    if ($errLine.Count -gt 0) { $msg = ([string]$errLine[0]).Trim() }
+    return [pscustomobject]@{ path = $f.FullName; shellPid = $shellPid; error = $msg; time = $f.LastWriteTime }
+  }
+  return $null
+}
+
+function Test-DesktopGuiStartup {
+  <#
+    真起一次 Electron **主进程**（不是宿主），确认它能过启动期校验并拉起自己的宿主。
+    隔离：--user-data-dir 指向临时目录（Electron 的单实例锁按 userData 分域，实测不会碰
+    正在跑的生产实例），DSH_HOME 也指向临时目录。
+    判据只到「宿主子进程出现」：主进程已解析完配置并进入 spawn 阶段；宿主能否服务由
+    deep-verify 负责，不在这里重复等 60-140s。
+  #>
+  $exe = Resolve-DesktopAppPath
+  if (-not $exe) {
+    Add-Step 'gui-smoke' '找不到 DSH Desktop 可执行文件 → 无法做主进程冒烟（深度验证仍会真起宿主）' 'warn'
+    return [pscustomobject]@{ ok = $true; reason = 'app-missing'; skipped = $true }
+  }
+  $root = if ($VerifyTempRoot) { $VerifyTempRoot } else { $env:TEMP }
+  if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Force -Path $root | Out-Null }
+  $probe = Join-Path $root ('dsh-gui-smoke.' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+  $ud = Join-Path $probe 'userdata'
+  $home2 = Join-Path $probe 'home'
+  $p = $null
+  $start = Get-Date
+  try {
+    New-Item -ItemType Directory -Force -Path $ud, $home2 | Out-Null
+    # 真实 settings.json 里可能有启动期会读的开关；复制过去，避免「临时 userData = 首次运行」。
+    try {
+      $realUd = Get-DesktopUserDataDir $exe
+      if ($realUd) {
+        $srcSettings = Join-Path $realUd 'desktop\settings.json'
+        if (Test-Path -LiteralPath $srcSettings -PathType Leaf) {
+          New-Item -ItemType Directory -Force -Path (Join-Path $ud 'desktop') | Out-Null
+          Copy-Item -LiteralPath $srcSettings -Destination (Join-Path $ud 'desktop\settings.json') -Force
+        }
+      }
+    } catch { }
+
+    $plan = Get-RegistryEnvironmentBlock
+    $env2 = @{}
+    foreach ($n in $plan.Names) { if ($n -and $n -ine 'Path') { $env2[$n] = [string]$plan.Block[$n] } }
+    $env2['PATH'] = [string]$plan.PathValue
+    $env2['DSH_HOME'] = $home2
+    if ($env2.ContainsKey('ELECTRON_RUN_AS_NODE')) { $env2.Remove('ELECTRON_RUN_AS_NODE') }
+
+    $p = Start-Process -FilePath $exe -ArgumentList @("--user-data-dir=$ud") -WorkingDirectory (Split-Path $exe -Parent) -Environment $env2 -PassThru
+    $deadline = $start.AddSeconds(25)
+    while ((Get-Date) -lt $deadline) {
+      $crash = Get-MainCrashRecord $ud $start.AddSeconds(-3) $p.Id
+      if ($crash -and $crash.error) {
+        $keep = Join-Path $StateDir ('gui-smoke-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
+        try { Copy-Item -LiteralPath $crash.path -Destination $keep -Force } catch { }
+        Add-Step 'gui-smoke' ('主进程启动即失败：' + $crash.error + '（崩溃日志：' + $keep + '）') 'fail'
+        return [pscustomobject]@{ ok = $false; reason = 'main-crashed'; error = $crash.error; log = $keep }
+      }
+      if ($p.HasExited) {
+        Add-Step 'gui-smoke' ('主进程在 ' + [int]((Get-Date) - $start).TotalSeconds + 's 内退出（exit=' + $p.ExitCode + '），没有拉起宿主') 'fail'
+        return [pscustomobject]@{ ok = $false; reason = 'exited'; error = '' }
+      }
+      $kids = @(Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $p.Id) -ErrorAction SilentlyContinue)
+      foreach ($k in $kids) {
+        if ($k.CommandLine -and $k.CommandLine -match 'dsh-desktop-host[\\/]lib[\\/]index\.js') {
+          Add-Step 'gui-smoke' ('主进程 ' + [int]((Get-Date) - $start).TotalSeconds + 's 内完成启动期校验并拉起宿主 pid=' + $k.ProcessId + '（临时 userData，未触碰生产实例）') 'ok'
+          return [pscustomobject]@{ ok = $true; reason = 'host-spawned'; hostPid = [int]$k.ProcessId }
+        }
+      }
+      Start-Sleep -Milliseconds 600
+    }
+    Add-Step 'gui-smoke' '主进程 25s 内既没拉起宿主、也没写崩溃日志 → 无法确认它能启动（fail-closed）' 'fail'
+    return [pscustomobject]@{ ok = $false; reason = 'timeout' }
+  } finally {
+    if ($p -and -not $p.HasExited) { try { & (Get-SystemTool 'taskkill') /PID $p.Id /T /F *> $null } catch { } }
+    Start-Sleep -Milliseconds 600
+    try { Remove-TreeSafe $probe } catch { }
   }
 }
 
@@ -4548,6 +4729,16 @@ try {
   if ($Status) { Show-Status; Write-Terminal 'status' 0; exit 0 }
 
   # ---- 0b. 只跑深度验证配方（验收/排障用，完全不碰生产实例）
+  # 主进程冒烟也属于「验证配方」：深验证只覆盖 dsh-desktop-host，主进程自己的启动期校验
+  # （DSH_DESKTOP_* 环境变量、设置、policy）不在其中。先真起一次主进程（临时 userData），
+  # 2-5s 就能给出结论；失败时不用白等 60-150s 的深验证。
+  if (($VerifyOnly -or $Preflight) -and $script:HostKind -eq 'desktop') {
+    if ($SkipGuiProbe) { Add-Step 'gui-smoke' '-SkipGuiProbe：跳过主进程冒烟（主进程启动期校验未覆盖）' 'warn' }
+    else {
+      $gui = Test-DesktopGuiStartup
+      if (-not $gui.ok) { Write-Terminal 'verify-only-failed' 4; exit 4 }
+    }
+  }
   if ($VerifyOnly -or $Preflight) {
     # 存储预检是验证配方的一部分：workspace.json 写坏时，深验证会「真起一个宿主」，
     # 而那个宿主同样会在 workspace 域 FAILED —— 先在这里把根因说清楚。
@@ -4710,6 +4901,23 @@ try {
     }
     if ($dumpOk -eq $false) { Write-Terminal 'config-invalid' 3; exit 3 }
   } else { Add-Step 'dump-config' '仅启动模式，跳过' 'skip' }
+
+  # ---- 2b. 主进程冒烟（R1 的上一层）：真起一次 Electron 主进程，确认它能过启动期校验。
+  #      deep-verify 覆盖的是 dsh-desktop-host；主进程自己的校验（DSH_DESKTOP_* 环境变量、
+  #      设置文件、policy）不在其中。2026-11-27 实测：隔离宿主 401 通过，真主进程却因
+  #      DSH_DESKTOP_UPDATE_CHECK_INTERVAL_MS 越界立刻弹「应用无法启动」。这一步必须在停机之前。
+  if ($script:HostKind -eq 'desktop' -and -not $Start -and -not $DryRun -and -not $Fast) {
+    if ($SkipGuiProbe) {
+      Add-Step 'gui-smoke' '-SkipGuiProbe：跳过主进程冒烟（主进程启动期校验未覆盖，失败时只能靠就绪阶段兜底）' 'warn'
+    } else {
+      $gui = Test-DesktopGuiStartup
+      if (-not $gui.ok) {
+        Add-Step 'abort' '主进程无法完成启动期校验 → 在停机之前中止，旧实例保持不动（R1）' 'fail'
+        Write-Terminal 'verify-failed' 4
+        exit 4
+      }
+    }
+  }
 
   # ---- 3. 深度验证（R1/R2/R16）：真启一次，能服务才算过
   #       R1 硬约束：没有「证明新组合能起来」，就绝不动在跑的实例。

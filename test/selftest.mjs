@@ -1977,6 +1977,59 @@ test('Show-Status never calls the interactive port probe (Test-HttpServing)', ()
 });
 
 // --------------------------------------------------------------------------
+// Desktop main-process smoke (gui-smoke)
+// --------------------------------------------------------------------------
+
+test('desktop gui-smoke covers the main process, not just the host', () => {
+    /**
+     * 2026-11-27 事故：隔离宿主 deep-verify 通过（HTTP 401），真正拉起的 Electron
+     * **主进程**却因为 DSH_DESKTOP_UPDATE_CHECK_INTERVAL_MS 越界弹「应用无法启动」。
+     * 主进程失败后会继续存活（只剩错误窗口），所以旧的 Wait-DesktopHostReady 只按
+     * HasExited / 端口判断，永远等不到结论。这里锁死两层：
+     *   1) 停机前真起一次主进程（临时 userData，单实例锁按 userData 分域）；
+     *   2) 就绪等待要读 crash-*-main.log，拿到 Error 行就立刻失败。
+     */
+    const root = fileURLToPath(new URL('..', import.meta.url));
+    const source = readFileSync(join(root, 'scripts', 'dsh-restart.ps1'), 'utf8');
+    assert.match(source, /\[switch\]\$SkipGuiProbe/, 'the escape hatch must be an explicit switch');
+
+    const start = source.indexOf('function Test-DesktopGuiStartup');
+    assert.ok(start > 0, 'Test-DesktopGuiStartup must exist');
+    const end = source.indexOf('\nfunction ', start + 10);
+    const body = source.slice(start, end === -1 ? source.length : end);
+    assert.ok(body.includes('--user-data-dir='), 'the probe must isolate userData: the single-instance lock is per userData');
+    assert.ok(body.includes('Get-MainCrashRecord'), 'the probe must read the main-process crash log');
+    assert.ok(body.includes('taskkill'), 'the probe must clean up its own process tree');
+    assert.ok(body.includes("Add-Step 'gui-smoke'"), 'the probe must write a step of its own');
+
+    const waitStart = source.indexOf('function Wait-DesktopHostReady');
+    assert.ok(waitStart > 0, 'Wait-DesktopHostReady must exist');
+    const waitEnd = source.indexOf('\nfunction ', waitStart + 10);
+    const waitBody = source.slice(waitStart, waitEnd === -1 ? source.length : waitEnd);
+    assert.ok(waitBody.includes('Get-MainCrashRecord'), 'the ready wait must fail fast on a main-process crash log');
+    assert.ok(waitBody.includes("reason = 'main-crashed'"), 'a main-process crash must be a distinct ready reason');
+});
+
+test('budget: a desktop restart reserves deep-verify and the gui probe', () => {
+    // 旧实现把 desktop 排除在 verifyPart 之外：预算写「深度验证 0s」，实际却跑了 40-150s，
+    // 就绪等待于是被总预算提前掐断。这里防止该判断回退。
+    const root = fileURLToPath(new URL('..', import.meta.url));
+    const source = readFileSync(join(root, 'scripts', 'dsh-restart.ps1'), 'utf8');
+    const slice = (name) => {
+        const start = source.indexOf(`function ${name}`);
+        assert.ok(start > 0, `${name} must exist`);
+        const end = source.indexOf('\nfunction ', start + 10);
+        return source.slice(start, end === -1 ? source.length : end);
+    };
+    const format = slice('Format-BudgetParts');
+    const budget = slice('Set-ActionBudget');
+    assert.equal(/HostKind -ne 'desktop'/.test(format), false, 'Format-BudgetParts must not exclude desktop deep-verify');
+    assert.equal(/HostKind -ne 'desktop'/.test(budget), false, 'Set-ActionBudget must not exclude desktop deep-verify');
+    assert.match(format, /主进程冒烟/, 'the budget text must name the gui probe');
+    assert.match(budget, /guiPart/, 'the budget arithmetic must include the gui probe');
+});
+
+// --------------------------------------------------------------------------
 // Syntax check
 // --------------------------------------------------------------------------
 
