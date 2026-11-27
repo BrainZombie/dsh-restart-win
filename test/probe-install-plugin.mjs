@@ -17,8 +17,20 @@
  *
  * The probe package lives outside the repository (scratch dir) and contains no
  * behavior: it exists only to prove a package can be installed and that the host
- * comes back afterwards. Remove it with the same safe channel (stop → pnpm remove
- * → start) once the run is verified.
+ * comes back afterwards.
+ *
+ * Removing it (verified 2026-11-27 — package.json and pnpm-lock.yaml came back
+ * byte-identical to the pre-install snapshot):
+ *
+ *   pwsh -File scripts/dsh-restart.ps1 -Stop -Profile desktop
+ *   (cd <dshHome>/profiles/<profile> && node <pnpm.mjs> remove @local/dsh-restart-install-probe)
+ *   unlink <dshHome>/profiles/<profile>/node_modules/@local/dsh-restart-install-probe
+ *   pwsh -File scripts/dsh-restart.ps1 -Start -Profile desktop
+ *
+ * Two traps, both found by running it: `pnpm remove` does NOT accept
+ * `--prefer-offline` (the `add` path does) and exits 1 with `Unknown option`;
+ * and a `link:` dependency's symlink survives `pnpm remove`, so it has to be
+ * unlinked by hand or the profile keeps a dangling link into the temp dir.
  */
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -65,9 +77,18 @@ function ensureProbePackage() {
     }
 }
 
-/** Read the report the install script wrote, plus the observable profile state. */
+/**
+ * Read the report the install script wrote, plus the observable profile state.
+ *
+ * `scripts/dsh-plugin-install.ps1` writes its own verdict shape — `status`,
+ * `pnpmExit`, `landed`, `healthy`, `steps` — not the tool's `ok`/`result`
+ * envelope. Treat `status` as authoritative and keep the older fields as a
+ * fallback so this driver also reads a report from an older engine.
+ */
 function verify(reportPath) {
-    const report = JSON.parse(readFileSync(reportPath, 'utf8'));
+    const report = JSON.parse(readFileSync(reportPath, 'utf8').replace(/^\uFEFF/, ''));
+    const scriptOk = typeof report.status === 'string' ? report.status === 'ok' : report.ok === true;
+    const pnpmExit = Number.isInteger(report.pnpmExit) ? report.pnpmExit : null;
     const dshHome = resolveDshHome({ dshHome: '' }, process.env);
     const profileDir = join(dshHome, 'profiles', typeof report.profile === 'string' ? report.profile : 'desktop');
     const pkg = JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8'));
@@ -81,15 +102,17 @@ function verify(reportPath) {
         http = JSON.parse(status.stdout.replace(/^\uFEFF/, '')).status.http;
     } catch { /* reported below */ }
     const out = {
-        report: report.result ?? null,
-        reportOk: report.ok ?? null,
+        status: report.status ?? null,
+        pnpmExit,
+        steps: Array.isArray(report.steps) ? report.steps.map((s) => `${s.step}:${s.code}`) : null,
+        reportOk: scriptOk,
         dependency: dep,
         landed,
         http,
         healthy: http === 401 || http === 200,
     };
     console.log(JSON.stringify(out, null, 2));
-    const ok = out.reportOk === true && out.landed && out.healthy;
+    const ok = scriptOk && out.landed && out.healthy && (pnpmExit === null || pnpmExit === 0);
     process.exitCode = ok ? 0 : 1;
     return out;
 }

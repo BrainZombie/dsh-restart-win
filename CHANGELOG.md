@@ -48,10 +48,34 @@
 进程）A/B：旧引擎 `进程 pid=26136 还在 … 多半是卡住了`，新引擎
 `没有正在进行的动作（…进程已退出）`。
 
+### 5. `install_plugin` 的第一次真机端到端安装
+
+`node test/probe-install-plugin.mjs --run` 走的是工具自己的 `execute()`：校验 spec → WMI 分离
+（父进程 WmiPrvSE，宿主停机杀不掉它）→ 脚本的 gate/stop/pnpm add/landed/遮蔽检查/start/健康校验。
+
+实测（2026-11-27 15:38–15:39）：`status=ok`、`pnpmExit=0`、`steps=gate:0 stop:0 pnpm-add:0 landed:0`、
+58.6s；旧实例（主 27460 / 端口 35863）确实被停掉（进程数归零）后重新拉起为宿主 16872 / 端口 49549 /
+HTTP 401；遮蔽检查真实生效 —— 移走 `dsh-package-manifest@0.2.1-alpha.4`、`dsh-plugin-market-index@0.2.1-alpha.4`、
+`schemastery@3.18.5` 到 `.stale-packages`。
+
+卸载回滚也实测：`-Stop` → `pnpm remove @local/dsh-restart-install-probe` → 解掉残留符号链接 → `-Start`。
+**package.json 与 pnpm-lock.yaml 与安装前快照逐字节相同**（sha256 `b7e3d59a…` / `f1815c8c…`，
+8194 / 298066 字节），profile 回到原样；随后重启为宿主 28220 / 端口 52185 / HTTP 401，
+`host.desktop.err.log` 0 字节（无 EPIPE）、无 JS 错误弹窗。
+
+两个只有真跑才知道的坑，已写进驱动头注释：
+
+- `pnpm remove` **不接受** `--prefer-offline`（`add` 接受），带上直接 `Unknown option`、rc=1。
+- `link:` 依赖被移除后 pnpm 留下 `node_modules/@local/<name>` 符号链接，必须自己 unlink，
+  否则 profile 里留一条指向临时目录的悬空链接。
+
+顺带修了驱动的 `--verify`：安装报告是 `status/pnpmExit/landed/healthy/steps`，不是工具的
+`ok/result` 信封；旧代码读不存在的字段，会把一次成功的安装判成 rc=1。
+
 ### 三套件
 
 `npm test`：selftest 97 passed / parity 263/263 / integration 16 passed + 1 skipped；
-`test/probe-hostport.ps1` 21.7s 全过。
+`test/probe-hostport.ps1` 21.7s 全过；`test/probe-install-plugin.mjs` 真机安装 + 卸载各一轮（见 §5）。
 
 ## 0.6.7 — 重启后的访问地址能自愈补写
 
