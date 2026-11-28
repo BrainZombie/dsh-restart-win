@@ -191,7 +191,7 @@ dsh-restart-win -Record -RecordCommand '"C:\<app>\DeepSeek Harness.exe"' -Record
 
 桌面版上的 `-Preflight` 直接以 Node 模式起 Electron 宿主入口（隔离 home），不碰正在运行的 App，验证的是同一套插件栈。
 
-每次桌面版重启在**碰旧实例之前**还有两道检查：`gui-smoke` 用临时 `--user-data-dir` 真起一次
+有运行实例的桌面版重启在**碰旧实例之前**还有两道检查：`gui-smoke` 用临时 `--user-data-dir` 真起一次
 Electron **主进程**（只验隔离宿主入口，证明不了壳自己的启动期校验能过），要求它拉起宿主；随后
 `watchdog` 往同一个临时 userData 写一份带该主进程 `shell pid` 的崩溃记录，要求
 `Wait-DesktopHostReady` 在秒级内以 `reason=main-crashed` 失败并透传原始 `Error:` 行。第二步注入的
@@ -279,6 +279,7 @@ curl.exe -s --noproxy '*' http://127.0.0.1:<port>/dsh-restart-win/api/sessions
 |---|---|---|---|
 | `action` | string 枚举 | `restart` | `restart` 安全完整重启；`start` 只拉起；`stop` 只停机；`status` 只读快照；`dry_run` 演练；`record` 记录启动命令；`task_register` / `task_unregister` 管理计划任务；`preflight` / `verify_only` 长时隔离验证 |
 | `fast` | boolean | false | 跳过深度验证。存在运行实例时，引擎仍会拒绝停机，除非同时给 `forceUnverified` |
+| `skipGuiProbe` | boolean | false | 跳过停机前的主进程冒烟（gui-smoke）。只在已知 smoke 误报时用；它不修复让 App 以 Node 模式启动的调用环境 |
 | `forceUnverified` | boolean | false | 显式承担「未验证就停机」的风险（仅与 `fast` 同用有意义） |
 | `viaTask` | boolean | false | 由计划任务执行重启，脱离宿主进程树 |
 | `dryRun` | boolean | false | 演练；仅对 `action=restart` 有效，等价于引擎的 `-DryRun` |
@@ -435,6 +436,7 @@ dsh-restart-win -DryRun
 | `-Stop` | — | 只停机（不与 `-Start` 同用） |
 | `-Json` | — | stdout 输出单个 JSON 对象 |
 | `-Fast` | — | 跳过深度验证 |
+| `-SkipGuiProbe` | — | 跳过停机前的主进程冒烟（gui-smoke）；只跳过检查，不改变真实拉起环境 |
 | `-ForceUnverified` | — | 与 `-Fast` 同用，显式接受未验证停机 |
 | `-VerifyOnly` | — | 只跑深度验证 |
 | `-Preflight` | — | 与 `-VerifyOnly` 等价 |
@@ -553,7 +555,7 @@ DSH Desktop 的宿主是 `--port 0` 起的，起来之后可能同时监听好�
 | 48696 | `404` | 兜底路由还挂着的空壳 |
 
 引擎按 **401 > 200 > 303 > 其他** 的优先级逐个探，命中就停，结果写进 `instances[].probe`
-（每个端口的实测状态、毫秒、阶段）。`401` 排在第一是因为「端口绑好、认证层要 token」说明服务
+（每个端口的实测状态、毫秒、阶段、content-type —— JSON 字段名是 `ct`）。`401` 排在第一是因为「端口绑好、认证层要 token」说明服务
 是活的；`4173` 这种同为 200 的调试面只能靠「已经选定了就别再换」避开，不能靠猜端口号。
 等新一轮重启时，宿主会在随机端口上先回 `404`、隔一秒才变 `401`/`200`，所以只有「端口通了但给了
 状态码」的候选才会在 700ms 后重问一次 —— 连不上的端口不会翻倍等待。
@@ -609,13 +611,13 @@ App 重启后 pid 变了，旧结论一律作废。`401` 面永不被当作附�
 | 5 | `gate-blocked` | 配置操作门禁命中（transaction / lock 文件） |
 | 6 | `stop-failed` | 停机失败（含权限边界） |
 | 7 | `port-busy` | 端口未释放，放弃启动 |
-| 8 | `ready-failed:<原因>` | 拉起后未就绪，已回收本次启动链；原因 ∈ `port-owner-mismatch` / `exited` / `timeout` |
+| 8 | `ready-failed:<原因>` | 拉起后未就绪，已回收本次启动链；原因 ∈ `port-owner-mismatch` / `exited` / `timeout` / `main-crashed` |
 | 9 | `via-task-failed` | 任务未注册或触发失败 |
 | 10 | `verify-required` | 有实例但未验证就要停机，拒绝执行 |
 | 11 | `launch-prereq-failed` | 拉起前置检查失败，在停机之前中止 |
 | 12 | `stop-refused` | 端口占用者不是 node / dsh / bun，拒绝停机 |
 
-`ready-failed:` 的三个原因词、`rescued-after-abort:` 与 `aborted:` 的前缀都是逐字契约，日志与排障脚本依赖它们。
+`ready-failed:` 的四个原因词、`rescued-after-abort:` 与 `aborted:` 的前缀都是逐字契约，日志与排障脚本依赖它们。
 
 ---
 
@@ -740,6 +742,7 @@ CLI 直接跑（`dsh-restart-win -Start`）时每一行阶段输出都会实时�
 | 8 `ready-failed:timeout` | 新宿主在预算内没就绪 | 调大 `readySec`；看 `host.<hostKind>.err.log`（web 宿主上是 `host.web.err.log`） |
 | 8 `ready-failed:exited` | 新宿主起来又立刻退出 | 看 `host.<hostKind>.err.log` / `.out.log` 尾部；多为启动命令或 profile 问题 |
 | 8 `ready-failed:port-owner-mismatch` | 端口上的监听者不是本次启动的进程 | 检查是否有包装器脚本；引擎会沿父链核对 |
+| 8 `ready-failed:main-crashed` | 主进程写了 `crash-*-main.log` 并继续存活（错误窗） | 看 steps 里的 `Error:` 原文、`gui-smoke-*.log` 与 steps 的 stderr 尾部；修启动期环境/设置，不要用 `-SkipGuiProbe` 掩盖 |
 | 9 `via-task-failed` | 计划任务未注册或触发失败 | 先 `-RegisterTask`，再 `-ViaTask` |
 | 10 `verify-required` | `-Fast` 遇到运行中的实例 | 去掉 `-Fast` 做完整验证，或显式加 `-ForceUnverified` |
 | 11 `launch-prereq-failed` | 启动命令的第一个词解析不到，或 cwd 的 `package.json` 把它定义成本地脚本 | 用 `-Record` 写入一条可执行的启动命令；修好后再重启 |
@@ -776,6 +779,7 @@ CLI 直接跑（`dsh-restart-win -Start`）时每一行阶段输出都会实时�
 
 ```powershell
 npm test                                  # node --check + 单测/契约测试
+npm run probe                             # 慢探针：端口选面 / 崩溃记录与 userData / 预算公式
 node test/parity.mjs                      # 把 docs/parity-matrix.md 的每一行断言成「有实现 + 有证据」
 pwsh -NoProfile -File scripts\check-encoding.ps1
 powershell.exe -NoProfile -File scripts\check-encoding.ps1
@@ -804,6 +808,8 @@ install.ps1               装 profile + 写 PATH shim
 test/selftest.mjs         单测与契约测试
 test/probe-hostport.ps1   真 socket 验证 -Status 的选面（从引擎里抽出 Resolve-HostPort /
                           Invoke-HttpProbe 原样执行，对面是两个真实的 HTTP 面）
+test/probe-desktop-watchdog.ps1 崩溃记录归属 / userData 发现探针（fake APPDATA）
+test/probe-budget.ps1     预算文本与公式一致性探针（五种模式）
 docs/parity-matrix.md     功能对照表（每行有旧实现位置、目标位置、验证方式）
 docs/migration.md         从旧引擎切换与回退
 ```

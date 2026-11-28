@@ -191,7 +191,7 @@ dsh-restart-win -Record -RecordCommand '"C:\<app>\DeepSeek Harness.exe"' -Record
 
 `-Preflight` on a desktop profile boots the Electron host entry directly (Node mode + isolated home), so it validates the same plugin stack without touching the running app.
 
-Two checks sit in front of every desktop restart, both before the old instance is touched: `gui-smoke`
+Two checks sit in front of a desktop restart that replaces a running instance, both before the old instance is touched: `gui-smoke`
 starts the real Electron **main** process against a temporary `--user-data-dir` (the isolated host entry
 proves the child works, not that the shell's own startup checks pass) and requires it to spawn its host;
 then `watchdog` writes a crash record with that main process's `shell pid` into the same temporary
@@ -278,6 +278,7 @@ Start a restart (or start / stop / dry-run / record / scheduled-task management)
 |---|---|---|---|
 | `action` | string enum | `restart` | `restart` safe full restart; `start` launch only; `stop` stop only; `status` read-only snapshot; `dry_run` rehearse; `record` save the launch command; `task_register` / `task_unregister` manage the scheduled task; `preflight` / `verify_only` long isolated verification |
 | `fast` | boolean | false | Skip deep verification. With a running instance the engine still refuses to stop unless `forceUnverified` is also set |
+| `skipGuiProbe` | boolean | false | Skip the pre-stop main-process smoke test (gui-smoke). Only for a known false positive; it does not fix a caller environment that launches the app in Node mode |
 | `forceUnverified` | boolean | false | Explicitly accept stopping an instance that was not deep-verified (only meaningful with `fast`) |
 | `viaTask` | boolean | false | Let the scheduled task perform the restart, leaving the host process tree |
 | `dryRun` | boolean | false | Rehearse; valid only with `action=restart`, equivalent to the engine's `-DryRun` |
@@ -356,6 +357,7 @@ The `%LOCALAPPDATA%\dsh-restart\bin\dsh-restart-win.cmd` shim that `install.ps1`
 | `-Stop` | — | Stop only (mutually exclusive with `-Start`) |
 | `-Json` | — | Emit a single JSON object on stdout |
 | `-Fast` | — | Skip deep verification |
+| `-SkipGuiProbe` | — | Skip the pre-stop main-process smoke test (gui-smoke); it skips the check, not the real launch environment |
 | `-ForceUnverified` | — | With `-Fast`, explicitly accept an unverified stop |
 | `-ForceStorage` | — | Continue even when the storage preflight fails (only after you have decided the `workspace` domain is already broken and you are repairing it by hand) |
 | `-VerifyOnly` | — | Deep verification only |
@@ -451,7 +453,7 @@ port) are summed, not overwritten, so the parts add up to `total`. It is only pr
 interface, costs nothing in human mode, and the fourteen required envelope fields and their levels are
 unchanged.
 
-Each `instances[].probe` entry also carries a `stage`, which separates the three ways a port can end up
+Each `instances[].probe` entry also carries a `stage` and a `content-type` (JSON field `ct`), which separates the three ways a port can end up
 "not picked": `http` (actually probed, `status` is what it answered), `skipped` (known not to be the
 host's face — learned from an earlier measurement, `known: "aux"`), `unprobed` (not probed this round
 because the first 200 stopped the sweep; `instances-2` fills it in), and `budget-exhausted` (the probe
@@ -515,13 +517,13 @@ Exit codes and `result` words are an existing scriptable interface and have not 
 | 5 | `gate-blocked` | Configuration-operation gate hit (transaction / lock files) |
 | 6 | `stop-failed` | Stop failed (including permission boundaries) |
 | 7 | `port-busy` | Port was not released; launch abandoned |
-| 8 | `ready-failed:<reason>` | Not ready after launch; this launch chain was collected. Reason ∈ `port-owner-mismatch` / `exited` / `timeout` |
+| 8 | `ready-failed:<reason>` | Not ready after launch; this launch chain was collected. Reason ∈ `port-owner-mismatch` / `exited` / `timeout` / `main-crashed` |
 | 9 | `via-task-failed` | Task not registered, or triggering it failed |
 | 10 | `verify-required` | An instance exists and the restart is unverified: refused |
 | 11 | `launch-prereq-failed` | Launch preflight failed; aborted before the stop |
 | 12 | `stop-refused` | The port owner is not node / dsh / bun; stop refused |
 
-The three `ready-failed:` reasons and the `rescued-after-abort:` / `aborted:` prefixes are literal contracts: logs and troubleshooting scripts depend on them.
+The four `ready-failed:` reasons and the `rescued-after-abort:` / `aborted:` prefixes are literal contracts: logs and troubleshooting scripts depend on them.
 
 ---
 
@@ -651,6 +653,7 @@ Look at three places first: the tool's `error` (or the CLI's stderr), the last l
 | 8 `ready-failed:timeout` | The new host was not ready within budget | Raise `readySec`; read `host.<hostKind>.err.log` (on a web host: `host.web.err.log`) |
 | 8 `ready-failed:exited` | The new host started and immediately exited | Read the tail of `host.<hostKind>.err.log` / `.out.log`; usually the launch command or the profile |
 | 8 `ready-failed:port-owner-mismatch` | The listener on the port is not the process this run launched | Check for a wrapper script; the engine walks the parent chain |
+| 8 `ready-failed:main-crashed` | The main process wrote a `crash-*-main.log` and stayed alive (error window) | Read the `Error:` text in the steps, the `gui-smoke-*.log`, and the stderr tail in the steps; fix the startup environment/settings instead of hiding it with `-SkipGuiProbe` |
 | 9 `via-task-failed` | Task not registered, or triggering failed | `-RegisterTask` first, then `-ViaTask` |
 | 10 `verify-required` | `-Fast` met a running instance | Drop `-Fast` and verify, or pass `-ForceUnverified` explicitly |
 | 11 `launch-prereq-failed` | The first word of the launch command does not resolve, or the cwd `package.json` defines it as a local script | Write a runnable command with `-Record`, then restart |
@@ -687,6 +690,7 @@ So treat "not verified" as "not tried", not as "broken" — but do not make your
 
 ```powershell
 npm test                                  # node --check + unit / contract tests
+npm run probe                             # slow probes: port face / crash attribution + userData / budget formulas
 node test/parity.mjs                      # asserts every docs/parity-matrix.md row has an implementation and evidence
 pwsh -NoProfile -File scripts\check-encoding.ps1
 powershell.exe -NoProfile -File scripts\check-encoding.ps1
@@ -715,6 +719,8 @@ install.ps1               add to profile + write the PATH shim
 test/selftest.mjs         unit and contract tests
 test/probe-hostport.ps1   real-socket check of -Status' port selection (extracts the engine's own
                           Resolve-HostPort / Invoke-HttpProbe and drives them against two live faces)
+test/probe-desktop-watchdog.ps1 crash-record attribution / userData discovery probe (fake APPDATA)
+test/probe-budget.ps1     budget text vs formula consistency (five modes)
 docs/parity-matrix.md     capability matrix (source position, target, verification per row)
 docs/migration.md         switching from the old engine and rolling back
 ```

@@ -735,6 +735,7 @@ PROBES['X-22'] = [
     eng(/reason = 'port-owner-mismatch'/),
     eng(/reason = 'exited'/),
     eng(/reason = 'timeout'/),
+    eng(/reason = 'main-crashed'/),
     // 端到端：ready 失败必须先写终态再退出，两者相邻不可分。
     // 2026-11-23 真机踩过：进程在写终态前被打断，留下「App 起来了、引擎无记录」，
     // 那次 rc=127、run-out 里没有终态，-Status 只看得到半个状态。
@@ -994,6 +995,24 @@ PROBES['D-18'] = [
         assert.ok(probeAt > 0 && saveAt > probeAt, 'the probe must run before the write');
     } },
     { file: ENGINE, has: /\$auth = Resolve-WebAuthUrl \$currentHostPids -ProbePorts \$livePorts\r?\n/, note: 'the -Status call site scans the log unconditionally' },
+];
+PROBES['D-19'] = [
+    { file: ENGINE, inFunction: 'Test-DesktopGuiStartup', has: /--user-data-dir=/ },
+    { file: ENGINE, inFunction: 'Test-DesktopGuiStartup', has: /Invoke-WithCleanGuiEnvironment/ },
+    { file: ENGINE, inFunction: 'Test-DesktopGuiStartup', has: /Invoke-WatchdogProbe/ },
+    { file: ENGINE, inFunction: 'Test-DesktopGuiStartup', has: /-Discover/ },
+    { file: ENGINE, inFunction: 'Invoke-WatchdogProbe', has: /\$Discover/ },
+    { file: ENGINE, inFunction: 'Wait-DesktopHostReady', has: /Get-MainCrashRecord/ },
+    { file: ENGINE, inFunction: 'Wait-DesktopHostReady', has: /reason = 'main-crashed'/ },
+    { file: ENGINE, has: /Invoke-WithCleanGuiEnvironment/ },
+];
+PROBES['D-20'] = [
+    { file: ENGINE, inFunction: 'Get-HttpStatusCodeDetail', has: /contentType/ },
+    { file: ENGINE, inFunction: 'Resolve-HostPort', has: /pass = 2/ },
+    { file: ENGINE, inFunction: 'Resolve-HostPort', has: /fallbackJson/ },
+    { file: ENGINE, inFunction: 'Get-AuxPortHintPlan', has: /PickPort/ },
+    { file: ENGINE, inFunction: 'Get-DesktopInstances', has: /Get-AuxPortHintPlan/ },
+    { file: ENGINE, inFunction: 'Save-AuxPortHint', has: /Sort-Object -Unique/ },
 ];
 PROBES['D-10'] = [{ file: ENGINE, inFunction: 'Get-ResidualChildren', has: /Get-Process -Name node/ }];
 PROBES['D-11'] = [{ file: ENGINE, inFunction: 'Remove-OrphanDshChildren', has: /deepseek-ai\|codegraph/ }, { file: ENGINE, inFunction: 'Remove-OrphanDshChildren', has: /if \(\$ppid -gt 0 -and \(Get-Process -Id \$ppid/ }];
@@ -1290,8 +1309,11 @@ PROBES['MP-10'] = [{
     note: 'one action carries one budget: every wait layer is capped by the same deadline',
     fn: (ctx) => {
         const setup = ctx.functionBody(ENGINE, 'Set-ActionBudget');
+        const plan = ctx.functionBody(ENGINE, 'Get-ActionBudgetPlan');
         assert.ok(/ActionDeadline/.test(setup), 'Set-ActionBudget does not set a deadline');
-        assert.ok(/Status -or \$CheckShadowed/.test(setup) || /\$Status/.test(setup), 'read-only actions must not be capped');
+        assert.ok(/Get-ActionBudgetPlan/.test(setup), 'Set-ActionBudget must consume the shared budget plan');
+        assert.ok(/Status -or \$CheckShadowed/.test(plan) || /\$Status/.test(plan), 'read-only actions must not be capped');
+        assert.ok(/Get-ActionBudgetPlan/.test(ctx.functionBody(ENGINE, 'Format-BudgetParts')), 'Format-BudgetParts must render the shared plan');
         for (const fn of ['Wait-HostReady', 'Wait-DesktopHostReady', 'Test-DesktopVerify']) {
             const body = ctx.functionBody(ENGINE, fn);
             assert.ok(/ActionDeadline/.test(body), `${fn} does not honour the action deadline`);

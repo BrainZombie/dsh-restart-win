@@ -120,7 +120,8 @@ function verify(reportPath) {
 if (verifyReport) {
     verify(resolve(verifyReport));
 } else {
-    const probeDir = ensureProbePackage();
+    // Plan 模式不创建任何东西（连 %TEMP% 下的 probe 包也不建）。
+    const probeDir = join(tmpdir(), 'dsh-restart-install-probe');
     const spec = `link:${probeDir}`;
     if (!run) {
         console.log(JSON.stringify({
@@ -134,6 +135,8 @@ if (verifyReport) {
             stateDir: resolveStateDir({ stateDir: '' }, process.env),
         }, null, 2));
     } else {
+        const runProbeDir = ensureProbePackage();
+        const runSpec = `link:${runProbeDir}`;
         const [tool] = createInstallToolDefinitions({
             defineTool: (definition) => definition,
             config: {
@@ -152,7 +155,7 @@ if (verifyReport) {
                 installScript: installScriptPath(),
             },
         });
-        const value = await tool.execute({ action: 'install', spec, reason: 'install_plugin e2e probe' }, {});
+        const value = await tool.execute({ action: 'install', spec: runSpec, reason: 'install_plugin e2e probe' }, {});
         console.log(JSON.stringify(value, null, 2));
         process.exitCode = value.ok ? 0 : 1;
     }

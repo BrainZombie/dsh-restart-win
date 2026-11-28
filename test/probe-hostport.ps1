@@ -1,4 +1,4 @@
-# probe-hostport.ps1
+﻿# probe-hostport.ps1
 # 真机（真 socket）验证 Resolve-HostPort 选面：
 #   1) 从引擎 AST 里抽出真实的 Get-HostFaceRank / Get-HttpStatusCodeDetail / Invoke-HttpProbe /
 #      Resolve-HostPort，原样执行 —— 不是复制一份逻辑来测；
@@ -11,6 +11,7 @@
 #        plain404  两个都是 404 → 选非 JSON 的那个（JSON 兜底面永远排在最后）
 #        dead401   401 面两次都不回 → 退回 JSON 兜底面并如实报 404（不假装就绪）
 #   4) 顺带验证 Save-AuxPortHint 是合并写入（CDP 200 面 + JSON 404 面两条发现都要留下）。
+#   5) 验证 Get-AuxPortHintPlan：JSON 404 即使正好是 pick，也要进 aux 计划。
 # 不碰生产宿主、不写 <DshHome>、不写真实状态目录。
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -31,7 +32,7 @@ function Get-FunctionText([string]$Name) {
 }
 
 $names = @('Get-HostFaceRank', 'Get-HttpStatusCodeDetail', 'Invoke-HttpProbe', 'Resolve-HostPort',
-           'Get-JsonField', 'Get-AuxPortHint', 'Save-AuxPortHint')
+           'Get-JsonField', 'Get-AuxPortHint', 'Save-AuxPortHint', 'Get-AuxPortHintPlan')
 $texts = @{}
 foreach ($n in $names) { $texts[$n] = Get-FunctionText $n }
 $totalChars = ($texts.Values | ForEach-Object { $_.Length } | Measure-Object -Sum).Sum
@@ -143,6 +144,39 @@ Write-Host ("      learned = {0}" -f ($hint -join ','))
 Assert-True '两次发现都留着' (($hint -contains 1111) -and ($hint -contains 2222)) ("hint=" + ($hint -join ','))
 $raw = Get-Content -LiteralPath (Join-Path $work 'aux-ports.json') -Raw
 Assert-True '按 pid 归属' ($raw -match '"mainPid":4242') $raw
+
+# ---- 6. JSON 404 成为 pick 时也要进计划
+Write-Host '[5] Get-AuxPortHintPlan：JSON 404 赢了也要学'
+$orderHealthy = @(
+  [pscustomobject]@{ port = 1001; status = 401; stage = 'http'; ct = 'text/plain' }
+  [pscustomobject]@{ port = 1002; status = 404; stage = 'http'; ct = 'application/json' }
+)
+$plan = Get-AuxPortHintPlan $orderHealthy 1001 401
+Write-Host ("      healthy: Ready={0} Aux={1} Json={2}" -f $plan.Ready, ($plan.Aux -join ','), ($plan.Json -join ','))
+Assert-True 'healthy: 进 Json' ($plan.Json -contains 1002) ($plan.Json -join ',')
+Assert-True 'healthy: 401 不进 Json' (-not ($plan.Json -contains 1001)) ($plan.Json -join ',')
+Assert-True 'healthy: Ready=true' ($plan.Ready -eq $true) ([string]$plan.Ready)
+
+$plan = Get-AuxPortHintPlan $orderHealthy 1002 404
+Write-Host ("      pick=JSON404: Ready={0} Aux={1} Json={2}" -f $plan.Ready, ($plan.Aux -join ','), ($plan.Json -join ','))
+Assert-True 'pick=JSON404: Json 仍包含它' ($plan.Json -contains 1002) ($plan.Json -join ',')
+Assert-True 'pick=JSON404: Ready=false' ($plan.Ready -eq $false) ([string]$plan.Ready)
+
+$orderText = @(
+  [pscustomobject]@{ port = 1003; status = 404; stage = 'http'; ct = 'text/plain' }
+  [pscustomobject]@{ port = 1004; status = 404; stage = 'http'; ct = 'application/json' }
+)
+$plan = Get-AuxPortHintPlan $orderText 1003 404
+Assert-True '非 JSON 404 不进 Json' (-not ($plan.Json -contains 1003)) ($plan.Json -join ',')
+Assert-True 'JSON 404 进 Json' ($plan.Json -contains 1004) ($plan.Json -join ',')
+
+$orderAux = @(
+  [pscustomobject]@{ port = 1005; status = 200; stage = 'http'; ct = 'text/html' }
+  [pscustomobject]@{ port = 1006; status = 401; stage = 'http'; ct = 'text/plain' }
+)
+$plan = Get-AuxPortHintPlan $orderAux 1006 401
+Assert-True '200 附件面进 Aux' ($plan.Aux -contains 1005) ($plan.Aux -join ',')
+Assert-True '401 不进 Aux' (-not ($plan.Aux -contains 1006)) ($plan.Aux -join ',')
 
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 if ($script:failures -ne 0) { Write-Host ("RESULT: FAIL（{0} 项）" -f $script:failures); exit 1 }

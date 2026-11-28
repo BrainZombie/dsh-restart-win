@@ -368,6 +368,10 @@ $script:DesktopAppPath    = $null
 $script:DesktopAppPathSource = ''
 # Electron 的 userData（崩溃日志固定在 <userData>\logs\crash-*-main.log）。按需探测后缓存。
 $script:DesktopUserData = ''
+# 按本次 Electron 主进程 pid 缓存 userData：不同实例（尤其是 gui-smoke 的临时实例）不能共用生产缓存。
+$script:DesktopUserDataByPid = @{}
+# 主进程冒烟的等待上限：Test-DesktopGuiStartup / Format-BudgetParts / Set-ActionBudget 共用。
+$script:GuiProbeTimeoutSec = 25
 # -Profile 是否由用户显式指定：桌面版下若没指定，profile 从运行中的宿主推导
 $script:ProfileExplicit   = $PSBoundParameters.ContainsKey('Profile')
 
@@ -2555,54 +2559,70 @@ function Write-ProgressLine([string]$Stage, [string]$Detail) {
     Write-Diag ('  .. ' + $Stage + ' · 已等 ' + [int]($now - $script:ProgressStageStart).TotalSeconds + 's · ' + $leftText + $(if ($Detail) { ' · ' + $Detail } else { '' }))
 }
 
-function Format-BudgetParts {
-    # 预算由哪几段组成 —— 说明与措辞共用一处，免得两处数字对不上（旧版就出现过「就绪 90s」
-    # 与预算里按 240s 算的两套说法）。
-    $verify = 0
-    if ($Preflight -or $VerifyOnly) { $verify = 2 * $VerifyReadySec }
-    elseif (-not $Start -and -not $Fast -and -not $Stop -and -not $DryRun) { $verify = 2 * $VerifyReadySec }
-    # 主进程冒烟：桌面版在深验证之外还要真起一次 Electron 主进程（临时 userData/DSH_HOME）。
-    # 它和深验证是两层，不能互相替代：深验证只覆盖 dsh-desktop-host。
+function Get-ActionBudgetPlan {
+    <#
+      返回 @{ Sec; Parts }：本次动作的秒数上限与可读分项。
+      文本里每个数字都必须来自这里的同一组项 —— Format-BudgetParts 只渲染，
+      Set-ActionBudget 只使用 Sec，禁止两处再各自算一遍。
+    #>
+    if ($Status -or $CheckShadowed -or $RepairSharedScope -or $Record) {
+        return [pscustomobject]@{ Sec = 0; Parts = @() }
+    }
+    $parts = New-Object System.Collections.ArrayList
     $gui = 0
-    if ($script:HostKind -eq 'desktop' -and -not $Start -and -not $Stop -and -not $DryRun -and -not $Fast -and -not $SkipGuiProbe) { $gui = 25 }
-    $ready = $ReadySec
-    $free = if ($Stop) { [Math]::Max(30, $PortFreeSec) } else { $PortFreeSec }
-    $grace = if ($Stop) { 0 } else { $GraceSec }
-    $parts = @()
-    if ($verify -gt 0) { $parts += ('深度验证 ' + $verify + 's（' + $VerifyReadySec + 's × 2 次尝试）') } else { $parts += '深度验证 0s（本次跳过）' }
-    if ($gui -gt 0) { $parts += ('主进程冒烟 ' + $gui + 's') }
-    $parts += ('端口释放 ' + $free + 's')
-    if (-not $Stop) { $parts += ('就绪 ' + $ready + 's') }
-    if ($grace -gt 0) { $parts += ('收尾 ' + $grace + 's') }
-    $parts += '固定余量 60s'
-    return ($parts -join ' + ')
+    if ($DryRun) {
+        $ready = [Math]::Max(30, $ReadySec)
+        [void]$parts.Add('就绪 ' + $ready + 's')
+        return [pscustomobject]@{ Sec = [int]$ready; Parts = @($parts.ToArray()) }
+    }
+    if ($Stop) {
+        $free = [Math]::Max(30, $PortFreeSec)
+        [void]$parts.Add('端口释放 ' + $free + 's')
+        [void]$parts.Add('固定余量 30s')
+        return [pscustomobject]@{ Sec = [int]($free + 30); Parts = @($parts.ToArray()) }
+    }
+    if ($Preflight -or $VerifyOnly) {
+        $verify = 2 * $VerifyReadySec
+        # 主进程冒烟：桌面版在深验证之外还要真起一次 Electron 主进程（临时 userData/DSH_HOME）。
+        if ($script:HostKind -eq 'desktop' -and -not $SkipGuiProbe) { $gui = $script:GuiProbeTimeoutSec }
+        [void]$parts.Add('深度验证 ' + $verify + 's（' + $VerifyReadySec + 's × 2 次尝试）')
+        if ($gui -gt 0) { [void]$parts.Add('主进程冒烟 ' + $gui + 's') }
+        [void]$parts.Add('验证余量 60s')
+        return [pscustomobject]@{ Sec = [int]($verify + $gui + 60); Parts = @($parts.ToArray()) }
+    }
+    $verify = 0
+    $verifyPart = 0
+    # 桌面版同样要深验证（隔离宿主）—— 旧判据把 desktop 排除在外，预算里写「深度验证 0s」，
+    # 实际却跑了 60-150s，就绪等待于是被总预算提前掐断（2026-11-27 实测）。
+    if (-not $Start -and -not $Fast) {
+        $verify = 2 * $VerifyReadySec
+        $verifyPart = $verify + 60
+    }
+    if ($script:HostKind -eq 'desktop' -and -not $Start -and -not $Fast -and -not $SkipGuiProbe) { $gui = $script:GuiProbeTimeoutSec }
+    if ($verify -gt 0) { [void]$parts.Add('深度验证 ' + $verify + 's（' + $VerifyReadySec + 's × 2 次尝试）') } else { [void]$parts.Add('深度验证 0s（本次跳过）') }
+    if ($verifyPart -gt 0) { [void]$parts.Add('验证余量 60s') }
+    if ($gui -gt 0) { [void]$parts.Add('主进程冒烟 ' + $gui + 's') }
+    [void]$parts.Add('端口释放 ' + $PortFreeSec + 's')
+    [void]$parts.Add('就绪 ' + $ReadySec + 's')
+    if ($GraceSec -gt 0) { [void]$parts.Add('收尾 ' + $GraceSec + 's') }
+    [void]$parts.Add('固定余量 60s')
+    $sec = $verifyPart + $gui + $PortFreeSec + $ReadySec + $GraceSec + 60
+    return [pscustomobject]@{ Sec = [int]$sec; Parts = @($parts.ToArray()) }
+}
+
+function Format-BudgetParts {
+    $plan = Get-ActionBudgetPlan
+    return (@($plan.Parts) -join ' + ')
 }
 
 function Set-ActionBudget {
-    if ($Status -or $CheckShadowed -or $RepairSharedScope -or $Record) {
+    $plan = Get-ActionBudgetPlan
+    $script:ActionBudgetSec = [int]$plan.Sec
+    if ($script:ActionBudgetSec -le 0) {
         $script:ActionDeadline = $null
-        $script:ActionBudgetSec = 0
         return
     }
-    $budget = 0
-    if ($DryRun) { $budget = [Math]::Max(30, $ReadySec) }
-    elseif ($Stop) { $budget = [Math]::Max(30, $PortFreeSec) + 30 }
-    elseif ($Preflight -or $VerifyOnly) {
-        $guiPart = 0
-        if ($script:HostKind -eq 'desktop' -and -not $SkipGuiProbe) { $guiPart = 25 }
-        $budget = 2 * $VerifyReadySec + 60 + $guiPart
-    }
-    else {
-        $verifyPart = 0
-        # 桌面版同样要深验证（隔离宿主）—— 旧判据把 desktop 排除在外，预算里写「深度验证 0s」，
-        # 实际却跑了 60-150s，就绪等待于是被总预算提前掐断（2026-11-27 实测）。
-        if (-not $Start -and -not $Fast) { $verifyPart = 2 * $VerifyReadySec + 60 }
-        $guiPart = 0
-        if ($script:HostKind -eq 'desktop' -and -not $Start -and -not $Fast -and -not $SkipGuiProbe) { $guiPart = 25 }
-        $budget = $verifyPart + $guiPart + $PortFreeSec + $ReadySec + $GraceSec + 60
-    }
-    $script:ActionBudgetSec = [int]$budget
-    $script:ActionDeadline = (Get-Date).AddSeconds([int]$budget)
+    $script:ActionDeadline = (Get-Date).AddSeconds([int]$script:ActionBudgetSec)
 }
 
 function Get-MutexName {
@@ -3711,6 +3731,27 @@ function Save-AuxPortHint([int]$MainPid_, [int[]]$Ports) {
   } catch { }
 }
 
+function Get-AuxPortHintPlan($Order, [int]$PickPort, [int]$PickStatus) {
+  <#
+    从一轮探测结果里算出「要学进 aux-ports.json 的端口」。纯函数，便于测试。
+    - Aux：探过、给了状态码、不是 401、也不是被选中的那一面；只在选中面就绪（200/401）时才写。
+    - Json：任何 404 + application/json 的端口，**包括它正好是 pick 的情况**。JSON 404 是
+      路由兜底面，从来不是宿主面；它赢了（401 面读超时）的那一轮必须也学下来，否则同一
+      故障下一轮还会重复。2026-11-27 实测 35877/404 胜 35863/401 就是这么来的。
+  #>
+  $aux = @($Order | Where-Object {
+      $_.stage -eq 'http' -and [int]$_.status -gt 0 -and [int]$_.status -ne 401 -and [int]$_.port -ne $PickPort
+    } | ForEach-Object { [int]$_.port })
+  $json = @($Order | Where-Object {
+      $_.stage -eq 'http' -and [int]$_.status -eq 404 -and ([string]$_.ct -like 'application/json*')
+    } | ForEach-Object { [int]$_.port })
+  return [pscustomobject]@{
+    Ready = ($PickStatus -eq 200 -or $PickStatus -eq 401)
+    Aux   = @($aux | Sort-Object -Unique)
+    Json  = @($json | Sort-Object -Unique)
+  }
+}
+
 function Get-DesktopInstances {
   # 参数：-Refresh 强制重扫端口表与进程表（等待循环里用，每轮宿主集会变）。
   param([switch]$Refresh, [switch]$ProbeAll)  <#
@@ -3759,22 +3800,9 @@ function Get-DesktopInstances {
         $script:ProbedPorts[[int]$o.port] = @{ status = [int]$o.status; chosen = ([int]$o.port -eq [int]$pick.port) }
       }
     }
-    # 附件面 = 探了、给了状态码、却不是被选中的那一面，而且**不是 401**：
-    # 401 = 端口绑了、认证层在要 token（宿主自己的面在启动早期就是这个形状）——
-    # 把 401 当附件面跳过，会漏掉「主面还没挂上、认证面先起来」的那一瞬。
-    # 只在本次选中的那面确实就绪（200/401）时才写回：自己都没看清时，别断定别人是附件。
-    $aux = @($pick.order | Where-Object {
-        $_.stage -eq 'http' -and $_.status -gt 0 -and $_.status -ne 401 -and [int]$_.port -ne [int]$pick.port
-      } | ForEach-Object { [int]$_.port })
-    $pickReady = ([int]$pick.status -eq 200 -or [int]$pick.status -eq 401)
-    if ($aux.Count -gt 0 -and $pick.port -gt 0 -and $pickReady) { Save-AuxPortHint $h.mainPid $aux }
-    # JSON + 404 是路由兜底面（几毫秒就答、content-type 明确），从来不是宿主面 ——
-    # 这条结论不依赖「本轮选没选中就绪面」。学不到它，下一次 401 面一忙（读超时）
-    # 它就会赢（2026-11-27 实测 35877/404 胜 35863/401）。
-    $auxJson = @($pick.order | Where-Object {
-        $_.stage -eq 'http' -and [int]$_.status -eq 404 -and ([string]$_.ct -like 'application/json*') -and [int]$_.port -ne [int]$pick.port
-      } | ForEach-Object { [int]$_.port })
-    if ($auxJson.Count -gt 0) { Save-AuxPortHint $h.mainPid $auxJson }
+    $hints = Get-AuxPortHintPlan $pick.order ([int]$pick.port) ([int]$pick.status)
+    if ($hints.Aux.Count -gt 0 -and $pick.port -gt 0 -and $hints.Ready) { Save-AuxPortHint $h.mainPid $hints.Aux }
+    if ($hints.Json.Count -gt 0) { Save-AuxPortHint $h.mainPid $hints.Json }
     $proc = Get-Process -Id $h.pid -ErrorAction SilentlyContinue
     [void]$list.Add([pscustomobject]@{
       pid            = $h.pid
@@ -4129,6 +4157,28 @@ function Stop-DesktopApp([int]$MainPid_, [int]$HostPid_, [int]$WaitSeconds) {
   return $false
 }
 
+function Invoke-WithCleanGuiEnvironment([scriptblock]$Body) {
+  <#
+    以「干净」的进程环境执行一次 GUI 拉起：移除 ELECTRON_RUN_AS_NODE，执行后恢复。
+    为什么必须：Start-Process -Environment 与当前进程环境是**合并**语义，从 hashtable 里
+    Remove 不会把继承值删掉。调用方（DSH 的 pwsh/bash 工具）带着 ELECTRON_RUN_AS_NODE=1 时，
+    Electron 会以 Node 模式启动并立刻退出（bad option: --user-data-dir=...）。
+    真实拉起与 gui-smoke 共用这一个入口，避免两处语义再次分叉。
+  #>
+  $had = [Environment]::GetEnvironmentVariable('ELECTRON_RUN_AS_NODE', 'Process')
+  try {
+    [Environment]::SetEnvironmentVariable('ELECTRON_RUN_AS_NODE', $null, 'Process')
+    return (& $Body)
+  } finally {
+    [Environment]::SetEnvironmentVariable('ELECTRON_RUN_AS_NODE', $had, 'Process')
+  }
+}
+
+function Get-GuiSmokeErrTail([string]$Path) {
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return '' }
+  try { return ((Get-Content -LiteralPath $Path -Tail 10 -ErrorAction Stop) -join ' | ') } catch { return '' }
+}
+
 function Start-DesktopApp {
   # 拉起 GUI：绝不能 -WindowStyle Hidden（会把整个 App 藏掉）；重定向只为收 boot token。
   $envPlan = Sync-ProcessEnvironment
@@ -4175,8 +4225,10 @@ function Start-DesktopApp {
   # 表现就是「A JavaScript error occurred in the main process」弹窗 + 日志里 ECONNRESET 刷屏。
   # 所以现在：stdout/stderr 给文件（有归属、可排查），stdin 保持不重定向（GUI 不需要，
   # 也不给宿主一个指向死管道的输入句柄）。GUI 自己的窗口不受影响。
-  $p = Start-Process -FilePath $plan.file -WorkingDirectory $plan.cwd -PassThru `
-       -RedirectStandardOutput $webOut -RedirectStandardError $webErr
+  $p = Invoke-WithCleanGuiEnvironment {
+        Start-Process -FilePath $plan.file -WorkingDirectory $plan.cwd -PassThru `
+          -RedirectStandardOutput $webOut -RedirectStandardError $webErr
+      }
   $script:NewPid = $p.Id
   $script:NewMainPid = $p.Id
   Add-Step 'launch' "已拉起 DSH Desktop pid=$($p.Id)（$($plan.file)），stdout/stderr→$StateDir\host.desktop.*.log" 'ok'
@@ -4201,10 +4253,11 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec, [datetime]$MainStar
   # 引擎却继续等到预算耗尽，最后只报「未发现宿主子进程的监听端口」。
   # 显式传入的 userData 优先：看门狗探针跑在临时 userData 上，走缓存/探测会读到生产目录。
   $udDir = $UserDataDir
+  $udExe = $null
   if (-not $udDir) {
     try {
       $udExe = Resolve-DesktopAppPath
-      if ($udExe) { $udDir = Get-DesktopUserDataDir $udExe }
+      if ($udExe) { $udDir = Get-DesktopUserDataDir $udExe -MainPid_ $MainPid_ }
     } catch { }
   }
   $crashSince = if ($newMainStart) { $newMainStart.AddSeconds(-5) } else { (Get-Date).AddSeconds(-120) }
@@ -4216,11 +4269,22 @@ function Wait-DesktopHostReady([int]$MainPid_, [int]$MaxSec, [datetime]$MainStar
   $lastPorts = @()
   $round = 0
   $waitStart = Get-Date
+  $nextUserDataScan = (Get-Date)
+  $udWarned = $false
   # 端口表每轮只扫一次，交给本轮所有宿主候选复用（每次 netstat 实测 ~200ms，循环里每 900ms 一轮）
   $script:NetstatRows = @()
   $nextScan = (Get-Date).AddYears(-1)
   while ((Get-Date) -lt $deadline) {
     $round++
+    # 主进程的渲染/GPU 子进程会比它晚一点出现；userData 不能只解析一次。
+    if (-not $udDir -and $udExe -and (Get-Date) -ge $nextUserDataScan) {
+      $nextUserDataScan = (Get-Date).AddSeconds(2)
+      try { $udDir = Get-DesktopUserDataDir $udExe -MainPid_ $MainPid_ } catch { }
+    }
+    if (-not $udDir -and -not $udWarned -and ((Get-Date) - $waitStart).TotalSeconds -ge 10) {
+      Add-Step 'ready' '找不到 DSH Desktop 的 userData → 就绪阶段的崩溃日志看门狗未启用' 'warn'
+      $udWarned = $true
+    }
     if ((Get-Date) -ge $nextScan) { $script:NetstatRows = Get-NetstatListenerRows -Refresh; $nextScan = (Get-Date).AddSeconds(2) }
     $mainAlive = $false
     try {
@@ -4306,43 +4370,103 @@ function Remove-TreeSafe([string]$Dir) {
 # （只剩错误窗口）—— 旧的就绪等待只看 HasExited / 端口，白等到超时还说不出原因。
 # 两层必须分开验：deep-verify 覆盖宿主，gui-smoke 覆盖主进程。
 
-function Get-DesktopUserDataDir([string]$Exe) {
-  if ($script:DesktopUserData) { return $script:DesktopUserData }
+function Get-UserDataDirFromCommandLine([string]$CommandLine) {
+  if (-not $CommandLine) { return '' }
+  $m = [regex]::Match($CommandLine, '--user-data-dir=(?:"([^"]+)"|(\S+))', 'IgnoreCase')
+  if (-not $m.Success) { return '' }
+  if ($m.Groups[1].Success) { return $m.Groups[1].Value }
+  return $m.Groups[2].Value
+}
+
+function Get-DesktopUserDataDir([string]$Exe, [int]$MainPid_ = 0) {
+  <#
+    userData 的发现顺序（前一个失败才走下一个）：
+      ① 调用方显式传入（Wait-DesktopHostReady 的 -UserDataDir）；
+      ② 本次主进程 / 其子进程命令行里的 --user-data-dir（gui-smoke 的临时实例、生产 App 的
+         渲染/GPU 子进程都带这个参数，布局无关）；
+      ③ package.json 的 app name → %APPDATA%\<name>（unpacked 布局；appRoot\resources\app\package.json）；
+      ④ %APPDATA% 两层扫描：接受 logs 或 desktop\settings.json 的目录；多候选时不猜，
+         除非能按 expectedName 精确命中或只有一份带 crash 日志。
+    不能只依赖 crash 日志：全新机器的第一次启动失败时，crash 文件恰恰还没写出来；
+    这正是 0.6.6 想覆盖的现场。按 pid 缓存，避免 gui-smoke 的临时 userData 与生产缓存串味。
+  #>
+  if ($MainPid_ -gt 0) {
+    if ($script:DesktopUserDataByPid.ContainsKey([int]$MainPid_)) {
+      return [string]$script:DesktopUserDataByPid[[int]$MainPid_]
+    }
+  } elseif ($script:DesktopUserData) {
+    return $script:DesktopUserData
+  }
   $found = ''
-  if ($Exe) {
+  # ② 本次主进程 / 子进程的 --user-data-dir
+  if (-not $found -and $MainPid_ -gt 0) {
+    try {
+      $procs = @()
+      $procs += @(Get-CimInstance Win32_Process -Filter ("ProcessId=" + $MainPid_) -ErrorAction SilentlyContinue)
+      $procs += @(Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $MainPid_) -ErrorAction SilentlyContinue)
+      foreach ($p in @($procs)) {
+        if (-not $p) { continue }
+        $cand = Get-UserDataDirFromCommandLine ([string]$p.CommandLine)
+        if ($cand -and (Test-Path -LiteralPath $cand -PathType Container)) { $found = $cand; break }
+      }
+    } catch { }
+  }
+  # ③ package.json 的 app name
+  $expectedName = ''
+  if (-not $found -and $Exe) {
     try {
       $paths = Get-DesktopPaths $Exe
       if ($paths) {
-        $pkg = Join-Path $paths.appRoot 'package.json'
-        if (Test-Path -LiteralPath $pkg -PathType Leaf) {
-          $doc = Get-Content -LiteralPath $pkg -Raw -Encoding UTF8 | ConvertFrom-Json
-          $name = [string]$doc.name
-          if ($name -and $env:APPDATA) {
-            $cand = Join-Path $env:APPDATA $name
-            if (Test-Path -LiteralPath $cand) { $found = $cand }
+        foreach ($pkg in @((Join-Path $paths.appRoot 'resources\app\package.json'), (Join-Path $paths.appRoot 'package.json'))) {
+          if (Test-Path -LiteralPath $pkg -PathType Leaf) {
+            $doc = Get-Content -LiteralPath $pkg -Raw -Encoding UTF8 | ConvertFrom-Json
+            $expectedName = [string]$doc.name
+            break
           }
+        }
+        if ($expectedName -and $env:APPDATA) {
+          $cand = Join-Path $env:APPDATA $expectedName
+          if (Test-Path -LiteralPath $cand -PathType Container) { $found = $cand }
         }
       }
     } catch { }
   }
+  # ④ %APPDATA% 两层扫描；多候选时不猜
   if (-not $found -and $env:APPDATA) {
-    # 布局无关的兜底：Electron 的崩溃日志固定在 <userData>\logs\crash-*-main.log。
-    # 只扫两层（<vendor>\<app>），不递归整个 APPDATA。
     try {
       $hits = New-Object System.Collections.ArrayList
       foreach ($vendor in @(Get-ChildItem -LiteralPath $env:APPDATA -Directory -ErrorAction SilentlyContinue)) {
         foreach ($app in @(Get-ChildItem -LiteralPath $vendor.FullName -Directory -ErrorAction SilentlyContinue)) {
           $logs = Join-Path $app.FullName 'logs'
-          if (-not (Test-Path -LiteralPath $logs)) { continue }
-          $crash = Get-ChildItem -LiteralPath $logs -Filter 'crash-*-main.log' -File -ErrorAction SilentlyContinue |
-                   Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if ($crash) { [void]$hits.Add([pscustomobject]@{ dir = $app.FullName; stamp = $crash.LastWriteTime }) }
+          $hasLogs = Test-Path -LiteralPath $logs -PathType Container
+          $hasSettings = Test-Path -LiteralPath (Join-Path $app.FullName 'desktop\settings.json') -PathType Leaf
+          if (-not $hasLogs -and -not $hasSettings) { continue }
+          $crash = $null
+          if ($hasLogs) {
+            $crash = Get-ChildItem -LiteralPath $logs -Filter 'crash-*-main.log' -File -ErrorAction SilentlyContinue |
+                     Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          }
+          [void]$hits.Add([pscustomobject]@{ dir = $app.FullName; stamp = $(if ($crash) { $crash.LastWriteTime } else { [datetime]::MinValue }) })
         }
       }
-      if ($hits.Count -gt 0) { $found = (@($hits | Sort-Object stamp -Descending)[0]).dir }
+      if ($hits.Count -eq 1) {
+        $found = $hits[0].dir
+      } elseif ($hits.Count -gt 1) {
+        if ($expectedName) {
+          $exact = @($hits | Where-Object { $_.dir -eq (Join-Path $env:APPDATA $expectedName) })
+          if ($exact.Count -eq 1) { $found = $exact[0].dir }
+        }
+        if (-not $found) {
+          $withCrash = @($hits | Where-Object { $_.stamp -gt [datetime]::MinValue } | Sort-Object stamp -Descending)
+          if ($withCrash.Count -eq 1) { $found = $withCrash[0].dir }
+        }
+      }
     } catch { }
   }
-  $script:DesktopUserData = $found
+  if ($found) {
+    if ($MainPid_ -gt 0) { $script:DesktopUserDataByPid[[int]$MainPid_] = $found }
+    else { $script:DesktopUserData = $found }
+  }
   return $found
 }
 
@@ -4361,7 +4485,11 @@ function Get-MainCrashRecord([string]$UserDataDir, [datetime]$Since, [int]$MainP
     $shellPid = 0
     $pidLine = @($head | Where-Object { $_ -match '^shell pid:\s*(\d+)' } | Select-Object -First 1)
     if ($pidLine.Count -gt 0 -and $pidLine[0] -match '^shell pid:\s*(\d+)') { $shellPid = [int]$Matches[1] }
-    if ($MainPid_ -gt 0 -and $shellPid -gt 0 -and $shellPid -ne $MainPid_) { continue }
+    if ($MainPid_ -gt 0) {
+      # 没有 shell pid 行的记录无法归属：宁可漏掉，也不能把它算到本次主进程头上。
+      if ($shellPid -le 0) { continue }
+      if ($shellPid -ne $MainPid_) { continue }
+    }
     $errLine = @($head | Where-Object { $_ -match '^Error:' } | Select-Object -First 1)
     $msg = ''
     if ($errLine.Count -gt 0) { $msg = ([string]$errLine[0]).Trim() }
@@ -4370,7 +4498,7 @@ function Get-MainCrashRecord([string]$UserDataDir, [datetime]$Since, [int]$MainP
   return $null
 }
 
-function Invoke-WatchdogProbe([int]$MainPid, [string]$UserDataDir, [datetime]$SpawnedAt) {
+function Invoke-WatchdogProbe([int]$MainPid, [string]$UserDataDir, [datetime]$SpawnedAt, [switch]$Discover) {
   <#
     真机验证「就绪阶段崩溃看门狗」：在**临时** userData 里写一份主进程崩溃记录
     （shell pid 与本次冒烟的主进程一致），然后直接调用生产用的 Wait-DesktopHostReady，
@@ -4387,19 +4515,31 @@ function Invoke-WatchdogProbe([int]$MainPid, [string]$UserDataDir, [datetime]$Sp
   [System.IO.File]::WriteAllText($file, $text, (New-Object System.Text.UTF8Encoding($false)))
   $before = $script:Steps.Count
   $t0 = Get-Date
-  $wd = Wait-DesktopHostReady $MainPid 15 $SpawnedAt -UserDataDir $UserDataDir
+  $wd = $null
+  $probeError = ''
+  try {
+    $wd = if ($Discover) { Wait-DesktopHostReady $MainPid 15 $SpawnedAt }
+          else { Wait-DesktopHostReady $MainPid 15 $SpawnedAt -UserDataDir $UserDataDir }
+  }
+  catch { $probeError = [string]$_.Exception.Message }
   $sec = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
   # 探针借用了生产函数，它会往 steps 里写自己的 'ready' 行；那是探针的中间态，
   # 不该出现在本次动作的终态里（更不能把一次成功的重启变成 ok=false）。
   while ($script:Steps.Count -gt $before) { $script:Steps.RemoveAt($script:Steps.Count - 1) }
-  $detected = (-not $wd.ok) -and ([string]$wd.reason -eq 'main-crashed') -and ([string]$wd.error -like '*watchdog-probe*')
+  $wdOk = if ($null -ne $wd) { [string]$wd.ok } else { 'null' }
+  $wdReason = if ($null -ne $wd) { [string]$wd.reason } else { 'null' }
+  $wdError = if ($null -ne $wd) { [string]$wd.error } else { '' }
+  $detected = ([string]::IsNullOrEmpty($probeError)) -and ($null -ne $wd) -and
+    (-not $wd.ok) -and ($wdReason -eq 'main-crashed') -and ($wdError -like '*watchdog-probe*')
   Add-Step 'watchdog' $(if ($detected) {
       "就绪阶段看门狗在 ${sec}s 内识别注入的崩溃记录（reason=main-crashed，错误文本已透传）"
+    } elseif ($probeError) {
+      "看门狗探针自身异常：$probeError"
     } else {
-      "看门狗没有按预期识别注入的崩溃记录：ok=$($wd.ok) reason=$($wd.reason) error=$($wd.error)"
+      "看门狗没有按预期识别注入的崩溃记录：ok=$wdOk reason=$wdReason error=$wdError"
     }) $(if ($detected) { 'ok' } else { 'warn' })
   try { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue } catch { }
-  return [pscustomobject]@{ ok = $detected; sec = $sec }
+  return [pscustomobject]@{ ok = $detected; sec = $sec; error = $probeError }
 }
 
 function Test-DesktopGuiStartup {
@@ -4442,20 +4582,32 @@ function Test-DesktopGuiStartup {
     foreach ($n in $plan.Names) { if ($n -and $n -ine 'Path') { $env2[$n] = [string]$plan.Block[$n] } }
     $env2['PATH'] = [string]$plan.PathValue
     $env2['DSH_HOME'] = $home2
-    if ($env2.ContainsKey('ELECTRON_RUN_AS_NODE')) { $env2.Remove('ELECTRON_RUN_AS_NODE') }
+    # -Environment 的基座是调用时的进程环境快照；Remove 只删 hashtable 键，$null 才会从基座删除。
+    $env2['ELECTRON_RUN_AS_NODE'] = $null
 
-    $p = Start-Process -FilePath $exe -ArgumentList @("--user-data-dir=$ud") -WorkingDirectory (Split-Path $exe -Parent) -Environment $env2 -PassThru
-    $deadline = $start.AddSeconds(25)
+    $smokeOut = Join-Path $probe 'smoke.out.log'
+    $smokeErr = Join-Path $probe 'smoke.err.log'
+    # -Environment 是合并语义；真正的删除由 helper 在进程环境上做，子进程才拿不到该变量。
+    $p = Invoke-WithCleanGuiEnvironment {
+          Start-Process -FilePath $exe -ArgumentList @("--user-data-dir=$ud") `
+            -WorkingDirectory (Split-Path $exe -Parent) -Environment $env2 -PassThru `
+            -RedirectStandardOutput $smokeOut -RedirectStandardError $smokeErr
+        }
+    $deadline = $start.AddSeconds($script:GuiProbeTimeoutSec)
     while ((Get-Date) -lt $deadline) {
       $crash = Get-MainCrashRecord $ud $start.AddSeconds(-3) $p.Id
       if ($crash -and $crash.error) {
         $keep = Join-Path $StateDir ('gui-smoke-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
         try { Copy-Item -LiteralPath $crash.path -Destination $keep -Force } catch { }
-        Add-Step 'gui-smoke' ('主进程启动即失败：' + $crash.error + '（崩溃日志：' + $keep + '）') 'fail'
+        $tail = Get-GuiSmokeErrTail $smokeErr
+        $tailNote = if ($tail) { '；stderr: ' + $tail } else { '' }
+        Add-Step 'gui-smoke' ('主进程启动即失败：' + $crash.error + $tailNote + '（崩溃日志：' + $keep + '）') 'fail'
         return [pscustomobject]@{ ok = $false; reason = 'main-crashed'; error = $crash.error; log = $keep }
       }
       if ($p.HasExited) {
-        Add-Step 'gui-smoke' ('主进程在 ' + [int]((Get-Date) - $start).TotalSeconds + 's 内退出（exit=' + $p.ExitCode + '），没有拉起宿主') 'fail'
+        $tail = Get-GuiSmokeErrTail $smokeErr
+        $tailNote = if ($tail) { '；stderr: ' + $tail } else { '' }
+        Add-Step 'gui-smoke' ('主进程在 ' + [int]((Get-Date) - $start).TotalSeconds + 's 内退出（exit=' + $p.ExitCode + '），没有拉起宿主' + $tailNote) 'fail'
         return [pscustomobject]@{ ok = $false; reason = 'exited'; error = '' }
       }
       $kids = @(Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $p.Id) -ErrorAction SilentlyContinue)
@@ -4463,7 +4615,10 @@ function Test-DesktopGuiStartup {
         if ($k.CommandLine -and $k.CommandLine -match 'dsh-desktop-host[\\/]lib[\\/]index\.js') {
           Add-Step 'gui-smoke' ('主进程 ' + [int]((Get-Date) - $start).TotalSeconds + 's 内完成启动期校验并拉起宿主 pid=' + $k.ProcessId + '（临时 userData，未触碰生产实例）') 'ok'
           if ($WatchdogProbe) {
-            $wd = Invoke-WatchdogProbe -MainPid $p.Id -UserDataDir $ud -SpawnedAt $start
+            # -Discover：故意不传 -UserDataDir，让生产发现路径从 smoke 主进程自己的命令行
+            # （--user-data-dir=临时目录）找到它；否则探针会绕过 Get-DesktopUserDataDir，
+            # 永远测不到“新机器没有 crash 日志时能不能发现”的那条分支。
+            $wd = Invoke-WatchdogProbe -MainPid $p.Id -UserDataDir $ud -SpawnedAt $start -Discover
             # 普通重启：探针失败只留 warn（检测层坏了不该拦住一次能成功的重启）；
             # -Preflight 是验收闸门：它不过就不许停生产实例。
             if (-not $wd.ok -and $Preflight) {
@@ -4476,7 +4631,9 @@ function Test-DesktopGuiStartup {
       }
       Start-Sleep -Milliseconds 600
     }
-    Add-Step 'gui-smoke' '主进程 25s 内既没拉起宿主、也没写崩溃日志 → 无法确认它能启动（fail-closed）' 'fail'
+    $tail = Get-GuiSmokeErrTail $smokeErr
+    $tailNote = if ($tail) { '；stderr: ' + $tail } else { '' }
+    Add-Step 'gui-smoke' ('主进程 ' + $script:GuiProbeTimeoutSec + 's 内既没拉起宿主、也没写崩溃日志 → 无法确认它能启动（fail-closed）' + $tailNote) 'fail'
     return [pscustomobject]@{ ok = $false; reason = 'timeout' }
   } finally {
     if ($p -and -not $p.HasExited) { try { & (Get-SystemTool 'taskkill') /PID $p.Id /T /F *> $null } catch { } }

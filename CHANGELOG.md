@@ -1,5 +1,62 @@
 # 变更记录
 
+## 0.6.9 — smoke 不再被调用环境带偏；看门狗在无 crash 日志的机器上也能发现目录；预算与文档对齐
+
+2026-11-28。修的是 0.6.8 评审里确认的边界，不是新功能。
+
+### 1. `gui-smoke` / 真实拉起共用干净环境
+
+`Start-Process -Environment` 是**合并**语义：从 hashtable 里 `Remove` 掉
+`ELECTRON_RUN_AS_NODE` 不会删除从调用进程继承的值。DSH 的 pwsh 工具会话带着
+`ELECTRON_RUN_AS_NODE=1` 时，smoke 的 Electron 以 Node 模式启动，报
+`bad option: --user-data-dir=...` 后 exit=9，原来的 stderr 还被丢掉。
+
+现在 `Invoke-WithCleanGuiEnvironment` 在拉起前临时移除该变量、拉起后恢复；smoke 与
+`Start-DesktopApp` 都走它。smoke 的 stdout/stderr 重定向到临时目录，失败时把 stderr
+最后 10 行写进 `gui-smoke` step。带 `ELECTRON_RUN_AS_NODE=1` 的 shell 实测：
+`-Preflight` rc=0，62.1s，gui-smoke 2s，watchdog 1.3s（不再显式传 userData），deep-verify 401。
+
+### 2. userData 发现：不再要求先有一份 crash 日志
+
+`Get-DesktopUserDataDir` 旧主路径读 `<appRoot>\package.json`（unpacked 布局实际在
+`resources\app\package.json`），兜底又要求 `logs\crash-*-main.log` 已存在 —— 全新机器的
+第一次启动失败恰恰没有这份日志。新顺序：① 调用方显式传入；② 主进程/子进程命令行里的
+`--user-data-dir`（gui-smoke 的临时实例、生产 App 的渲染/GPU 子进程都带）；③
+`resources\app\package.json` 的 app name；④ `%APPDATA%` 两层扫描，接受 `logs` **或**
+`desktop\settings.json`，多候选时不猜。按 Electron 主进程 pid 缓存，smoke 的临时目录不会
+复用生产缓存；`Wait-DesktopHostReady` 在等待循环里重试发现，10s 仍找不到才写 warn。
+
+`Invoke-WatchdogProbe` 不再显式传 `-UserDataDir`（新增 `-Discover`），让探针真正走一遍
+生产发现路径。
+
+### 3. JSON 404 赢了也要学进 aux
+
+0.6.8 的 `$auxJson` 条件仍排除 `$pick.port`：401 面读超时、JSON 404 成为 pick 的那一轮，
+恰恰学不到它，同一故障下次还会复发。抽出纯函数 `Get-AuxPortHintPlan`：JSON 404 **即使
+正好是 pick** 也进 `aux-ports.json`；`Aux` 仍只在选中面就绪时写。`test/probe-hostport.ps1`
+新增四种 pick 形状的断言。
+
+### 4. 预算文本与公式同源
+
+旧的 `Format-BudgetParts` 与 `Set-ActionBudget` 各算一遍：预检文本 `385s = 300 + 25 + 30 + 90 + 3 + 60`
+分项实际 508s。现在 `Get-ActionBudgetPlan` 一次返回 `Sec` 与 `Parts`，`Format-BudgetParts`
+只渲染、`Set-ActionBudget` 只使用 `Sec`；preflight / restart / start / stop / dry-run / skip
+六种模式由 `test/probe-budget.ps1` 断言“分项之和 == Sec”。
+
+### 5. 其他
+
+- `Get-MainCrashRecord`：`-MainPid_ > 0` 时，没有 `shell pid:` 行的 crash 文件跳过，不再
+  归到本次主进程头上。
+- `$script:GuiProbeTimeoutSec = 25` 收敛四处字面量（smoke deadline、预算文本、两处预算）。
+- `-SkipGuiProbe` 暴露到 `win_restart` 工具（`skipGuiProbe`，默认 false），README 中英同步。
+- `ready-failed` 契约补第四个原因 `main-crashed`；README、排障表、parity X-22/D-19/D-20 同步。
+- `test/probe-hostport.ps1` / `probe-desktop-watchdog.ps1` / `probe-budget.ps1` 加 BOM 并纳入
+  `check-encoding.ps1`；`npm run probe` 跑三项慢探针（`npm test` 仍是三套件）。
+- install 探针的 plan 模式不再创建 `%TEMP%\dsh-restart-install-probe`。
+
+验证：三套件 selftest 99 / parity 265/265 / integration 16+1；`--with-engine` 17/0；
+`npm run probe` 三项全过；`check-encoding` 7 个文件双引擎 0 错误；线上 `-Status` 401/52185。
+
 ## 0.6.8 — 选面不再被 JSON 兜底面骗过；看门狗有了真机探针；`-DryRun` 真的不写
 
 2026-11-27。三处都来自同一天的真机观察，不是推演。

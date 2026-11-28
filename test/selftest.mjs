@@ -721,6 +721,22 @@ test('argv: restart with a fake -File target, no shell string anywhere', () => {
     assert.equal(args[args.indexOf('-Port') + 1], '3080', 'the port must be one discrete token');
 });
 
+test('argv: skipGuiProbe is opt-in and reaches the engine', () => {
+    const scriptPath = 'C:\\fake\\engine.ps1';
+    const on = resolveInvocation(normalizeConfig({}), { skipGuiProbe: true });
+    const argsOn = buildScriptArgs({ scriptPath, action: 'restart', invocation: on, platform: 'win32' });
+    assert.ok(argsOn.includes('-SkipGuiProbe'), 'an explicit skipGuiProbe must reach the engine argv');
+
+    const off = resolveInvocation(normalizeConfig({}), {});
+    const argsOff = buildScriptArgs({ scriptPath, action: 'restart', invocation: off, platform: 'win32' });
+    assert.equal(argsOff.includes('-SkipGuiProbe'), false, 'the switch must stay off by default');
+    assert.throws(
+        () => resolveInvocation(normalizeConfig({}), { skipGuiProbe: 'yes' }),
+        /skipGuiProbe/,
+        'a non-boolean value must be rejected',
+    );
+});
+
 test('argv: every action maps to exactly one legacy switch', () => {
     const invocation = resolveInvocation(normalizeConfig({}), {});
     for (const [action, expected] of Object.entries(ACTION_SWITCHES)) {
@@ -2001,6 +2017,8 @@ test('desktop gui-smoke covers the main process, not just the host', () => {
     assert.ok(body.includes('Get-MainCrashRecord'), 'the probe must read the main-process crash log');
     assert.ok(body.includes('taskkill'), 'the probe must clean up its own process tree');
     assert.ok(body.includes("Add-Step 'gui-smoke'"), 'the probe must write a step of its own');
+    assert.ok(body.includes('Invoke-WithCleanGuiEnvironment'), 'the probe must strip the caller Node-mode env');
+    assert.ok(body.includes('smoke.err.log'), 'the probe must capture stderr so a failure has a reason');
 
     const waitStart = source.indexOf('function Wait-DesktopHostReady');
     assert.ok(waitStart > 0, 'Wait-DesktopHostReady must exist');
@@ -2008,6 +2026,12 @@ test('desktop gui-smoke covers the main process, not just the host', () => {
     const waitBody = source.slice(waitStart, waitEnd === -1 ? source.length : waitEnd);
     assert.ok(waitBody.includes('Get-MainCrashRecord'), 'the ready wait must fail fast on a main-process crash log');
     assert.ok(waitBody.includes("reason = 'main-crashed'"), 'a main-process crash must be a distinct ready reason');
+
+    const appStart = source.indexOf('function Start-DesktopApp');
+    assert.ok(appStart > 0, 'Start-DesktopApp must exist');
+    const appEnd = source.indexOf('\nfunction ', appStart + 10);
+    const appBody = source.slice(appStart, appEnd === -1 ? source.length : appEnd);
+    assert.ok(appBody.includes('Invoke-WithCleanGuiEnvironment'), 'the real GUI launch must use the same env helper');
 });
 
 test('budget: a desktop restart reserves deep-verify and the gui probe', () => {
@@ -2023,10 +2047,24 @@ test('budget: a desktop restart reserves deep-verify and the gui probe', () => {
     };
     const format = slice('Format-BudgetParts');
     const budget = slice('Set-ActionBudget');
-    assert.equal(/HostKind -ne 'desktop'/.test(format), false, 'Format-BudgetParts must not exclude desktop deep-verify');
-    assert.equal(/HostKind -ne 'desktop'/.test(budget), false, 'Set-ActionBudget must not exclude desktop deep-verify');
-    assert.match(format, /主进程冒烟/, 'the budget text must name the gui probe');
-    assert.match(budget, /guiPart/, 'the budget arithmetic must include the gui probe');
+    const plan = slice('Get-ActionBudgetPlan');
+    assert.equal(/HostKind -ne 'desktop'/.test(plan), false, 'the budget plan must not exclude desktop deep-verify');
+    assert.match(plan, /主进程冒烟/, 'the budget plan must name the gui probe');
+    assert.match(plan, /验证余量 60s/, 'the budget plan must account for the verify margin');
+    assert.match(format, /Get-ActionBudgetPlan/, 'Format-BudgetParts must render the shared plan');
+    assert.match(budget, /Get-ActionBudgetPlan/, 'Set-ActionBudget must use the shared plan');
+    assert.match(plan, /GuiProbeTimeoutSec/, 'the gui probe budget must use the shared constant');
+});
+
+test('crash records without a shell pid are never attributed to a main process', () => {
+    const root = fileURLToPath(new URL('..', import.meta.url));
+    const source = readFileSync(join(root, 'scripts', 'dsh-restart.ps1'), 'utf8');
+    const start = source.indexOf('function Get-MainCrashRecord');
+    assert.ok(start > 0, 'Get-MainCrashRecord must exist');
+    const end = source.indexOf('\nfunction ', start + 10);
+    const body = source.slice(start, end === -1 ? source.length : end);
+    assert.match(body, /shellPid -le 0/, 'an un-attributable crash file must be skipped');
+    assert.match(body, /shellPid -ne \$MainPid_/, 'a crash file for another pid must be skipped');
 });
 
 // --------------------------------------------------------------------------

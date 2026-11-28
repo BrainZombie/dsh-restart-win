@@ -7,10 +7,14 @@
     [System.Management.Automation.Language.Parser]::ParseFile 做语法解析；
     不执行目标脚本，不写注册表，不改计划任务，不碰 hosts，不触发任何重启。
 
-    默认检查三个文件（不传 -Path 时）：
+    默认检查仓库里的 PowerShell 脚本（不传 -Path 时）：
       · 同目录的 dsh-restart.ps1（引擎）
       · 同目录的 audit-profile.ps1（bundle 解析审计，只读）
       · 本脚本自身（check-encoding.ps1）
+      · 仓库根 install.ps1
+      · test\probe-hostport.ps1（真实 socket 的选面探针）
+      · test\probe-desktop-watchdog.ps1（崩溃记录归属探针）
+      · test\probe-budget.ps1（预算文本与公式一致性探针）
 
     对每个文件检查三项：
       1. 前 3 字节必须是 EF BB BF（UTF-8 BOM）。缺失时 PS 5.1 会按 GBK 解析，
@@ -91,6 +95,9 @@ if ($Path -and @($Path).Count -gt 0) {
     $targets.Add((Join-Path $scriptDir 'dsh-restart.ps1'))
     $targets.Add((Join-Path $scriptDir 'audit-profile.ps1'))
     $targets.Add((Join-Path (Split-Path $scriptDir -Parent) 'install.ps1'))
+    $targets.Add((Join-Path (Split-Path $scriptDir -Parent) 'test\probe-hostport.ps1'))
+    $targets.Add((Join-Path (Split-Path $scriptDir -Parent) 'test\probe-desktop-watchdog.ps1'))
+    $targets.Add((Join-Path (Split-Path $scriptDir -Parent) 'test\probe-budget.ps1'))
     if ($PSCommandPath) { $targets.Add($PSCommandPath) }
     else { $targets.Add((Join-Path $scriptDir 'check-encoding.ps1')) }
 }
