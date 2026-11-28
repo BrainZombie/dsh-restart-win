@@ -779,7 +779,7 @@ CLI 直接跑（`dsh-restart-win -Start`）时每一行阶段输出都会实时�
 
 ```powershell
 npm test                                  # node --check + 单测/契约测试
-npm run probe                             # 慢探针：端口选面 / 崩溃记录与 userData / 预算公式
+npm run probe                             # 慢探针：端口选面 / 崩溃记录与 userData / 预算公式 / GUI 干净环境
 node test/parity.mjs                      # 把 docs/parity-matrix.md 的每一行断言成「有实现 + 有证据」
 pwsh -NoProfile -File scripts\check-encoding.ps1
 powershell.exe -NoProfile -File scripts\check-encoding.ps1
@@ -810,6 +810,7 @@ test/probe-hostport.ps1   真 socket 验证 -Status 的选面（从引擎里抽�
                           Invoke-HttpProbe 原样执行，对面是两个真实的 HTTP 面）
 test/probe-desktop-watchdog.ps1 崩溃记录归属 / userData 发现探针（fake APPDATA）
 test/probe-budget.ps1     预算文本与公式一致性探针（五种模式）
+test/probe-clean-env.ps1  GUI 拉起环境：ELECTRON_RUN_AS_NODE 必须删除、不能置空
 docs/parity-matrix.md     功能对照表（每行有旧实现位置、目标位置、验证方式）
 docs/migration.md         从旧引擎切换与回退
 ```

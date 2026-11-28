@@ -33,7 +33,7 @@ PowerShell 把 `$null` 强制成空串交给 `[string]` 形参，等于**置空*
 
 `Invoke-WithCleanGuiEnvironment` 改用 Env: 提供程序真正删除（`Remove-Item Env:ELECTRON_RUN_AS_NODE`），
 删除后用 `GetEnvironmentVariables('Process').Contains(...)` 复核，残留就打到 stderr 提示；
-`finally` 只在 `$had` 非空时恢复，避免「本来没有」被恢复成一个空值。
+`finally` 只在 `$had` 非 null 时恢复（原本没有这个变量时不会凭空造出一个空值）。
 
 ### 验证
 

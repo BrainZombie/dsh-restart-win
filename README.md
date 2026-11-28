@@ -690,7 +690,7 @@ So treat "not verified" as "not tried", not as "broken" — but do not make your
 
 ```powershell
 npm test                                  # node --check + unit / contract tests
-npm run probe                             # slow probes: port face / crash attribution + userData / budget formulas
+npm run probe                             # slow probes: port face / crash attribution + userData / budget formulas / clean GUI env
 node test/parity.mjs                      # asserts every docs/parity-matrix.md row has an implementation and evidence
 pwsh -NoProfile -File scripts\check-encoding.ps1
 powershell.exe -NoProfile -File scripts\check-encoding.ps1
@@ -721,6 +721,7 @@ test/probe-hostport.ps1   real-socket check of -Status' port selection (extracts
                           Resolve-HostPort / Invoke-HttpProbe and drives them against two live faces)
 test/probe-desktop-watchdog.ps1 crash-record attribution / userData discovery probe (fake APPDATA)
 test/probe-budget.ps1     budget text vs formula consistency (five modes)
+test/probe-clean-env.ps1  GUI launch environment: ELECTRON_RUN_AS_NODE must be deleted, not blanked
 docs/parity-matrix.md     capability matrix (source position, target, verification per row)
 docs/migration.md         switching from the old engine and rolling back
 ```
