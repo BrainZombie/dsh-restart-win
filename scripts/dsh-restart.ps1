@@ -4167,10 +4167,25 @@ function Invoke-WithCleanGuiEnvironment([scriptblock]$Body) {
   #>
   $had = [Environment]::GetEnvironmentVariable('ELECTRON_RUN_AS_NODE', 'Process')
   try {
-    [Environment]::SetEnvironmentVariable('ELECTRON_RUN_AS_NODE', $null, 'Process')
+    # 【必须是「删除」，不能只是「置空」】2026-11-28 真机定位：Electron 判的是
+    # **变量是否存在**（base::Environment::HasVar），不是值真假。留一个空值
+    # `ELECTRON_RUN_AS_NODE=` 时 Electron 一样进 Node 模式：不带脚本参数就变成
+    # 「读 stdin 的 REPL」，stdin 是 NUL/管道 → 进程 <50ms 内 exit=0、stdout/stderr
+    # 全空、不写任何 userData 文件、也不留 crash 记录 —— 就绪等待只会看到「主进程已退出」，
+    # 而同一秒用手工方式拉起却完全正常，极难归因。
+    # .NET 的 SetEnvironmentVariable(name, $null, 'Process') 在 PowerShell 里拿到的是
+    # 强制转换后的空字符串，等于「设置空值」而不是删除；Env: 提供程序的 Remove-Item 才是
+    # 真正的删除（删完 GetEnvironmentVariables('Process') 里就没有这个键了）。
+    Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+    try {
+      $stillThere = [Environment]::GetEnvironmentVariables('Process').Contains('ELECTRON_RUN_AS_NODE')
+    } catch { $stillThere = $false }
+    if ($stillThere) {
+      [Console]::Error.WriteLine('[dsh-restart] 警告：ELECTRON_RUN_AS_NODE 删除失败，GUI 拉起会变成 Node 模式（立刻 exit 0）')
+    }
     return (& $Body)
   } finally {
-    [Environment]::SetEnvironmentVariable('ELECTRON_RUN_AS_NODE', $had, 'Process')
+    if ($null -ne $had) { $env:ELECTRON_RUN_AS_NODE = $had }
   }
 }
 

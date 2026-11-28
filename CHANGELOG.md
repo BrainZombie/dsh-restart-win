@@ -1,5 +1,50 @@
 # 变更记录
 
+## 0.6.10 — 真实拉起不再被「置空」的 ELECTRON_RUN_AS_NODE 拖进 Node 模式
+
+2026-11-28。修的是 0.6.9 引入的回归：**所有真实重启都会 `ready-failed:exited`**，而 `-VerifyOnly` 全绿。
+
+### 现场
+
+`dsh-restart-win` 从 PowerShell 7 直接跑：`[ ok] launch 已拉起 DSH Desktop pid=33124` 之后
+立刻 `[FAIL] ready DSH Desktop 主进程 33124 已退出（未就绪）`，`host.desktop.out.log` /
+`host.desktop.err.log` 都是 0 字节，`userData` 一个文件都没写，`crash-*-main.log` 也没有新记录；
+`abort-cleanup` 再把「已经死掉的」pid 收一遍。带着 `-Fast`（无 deep-verify）、`-SkipGuiProbe`、
+不重定向输出、`cmd /c start` 拉起都复现；同一秒用 `Start-Process` 手工拉起同一个 exe 却完全正常。
+
+### 根因（实测三步定位）
+
+1. `Start-Process -PassThru` 立刻检查：进程**活着**（`start=…`），但 100ms 内 `exitCode=0`。
+2. 把引擎进程的环境块整份 dump 出来重放：应用能正常起来 → 环境**值**没问题；
+   但 dump 里有一行 `ELECTRON_RUN_AS_NODE=`（**空值、存在**）。
+3. 直接用三种环境拉起对照：不存在 → 正常；空值 → **<50ms exit=0、零输出**；`=1` → 同样。
+   传一个 `--user-data-dir` 给它才把真相打印出来：`bad option: --user-data-dir=…` —— 那是 **Node** 的报错。
+
+Electron 判的是变量**存在**（`base::Environment::HasVar`），不是值真假。所以「空值」= Node 模式：
+没有脚本参数就退化成「读 stdin 的 REPL」，stdin 是 NUL/管道 → 立刻 exit 0、什么都不打印。
+
+而 0.6.9 的 `Invoke-WithCleanGuiEnvironment` 正是用
+`[Environment]::SetEnvironmentVariable('ELECTRON_RUN_AS_NODE', $null, 'Process')` 来「删除」它 ——
+PowerShell 把 `$null` 强制成空串交给 `[string]` 形参，等于**置空**；`finally` 恢复时 `$had` 为 `$null`
+又置空一次。于是从我方（`dsh-restart` 自己的 pwsh，继承自宿主/工具会话）拉起 GUI 的每一次，
+都变成 Node 模式启动。
+
+### 修法
+
+`Invoke-WithCleanGuiEnvironment` 改用 Env: 提供程序真正删除（`Remove-Item Env:ELECTRON_RUN_AS_NODE`），
+删除后用 `GetEnvironmentVariables('Process').Contains(...)` 复核，残留就打到 stderr 提示；
+`finally` 只在 `$had` 非空时恢复，避免「本来没有」被恢复成一个空值。
+
+### 验证
+
+- 带 `ELECTRON_RUN_AS_NODE=1`（复刻 DSH 工具会话）的真实重启：rc=0，main `33368` / host `3008` /
+  端口 `3854` / HTTP 401，token 已轮换。
+- 新增 `test/probe-clean-env.ps1`：从引擎 AST 取 `Invoke-WithCleanGuiEnvironment` 本体点源后直调，
+  断言「带 =1 时函数体内看不见 → 调用后恢复 =1」「本来没有时调用后也不会出现」「子进程 `cmd /c set`
+  里没有这个键」；另把三种处置语义（置空仍存在 / `SetEnvironmentVariable($null)` 只置空 / `Remove-Item`
+  真删）钉成反证，语义漂移会立刻失败。
+- `npm run probe` 纳入该探针；parity 新增 D-21（静态断言 + 两处调用共用包装）；矩阵补 D-21 行。
+
 ## 0.6.9 — smoke 不再被调用环境带偏；看门狗在无 crash 日志的机器上也能发现目录；预算与文档对齐
 
 2026-11-28。修的是 0.6.8 评审里确认的边界，不是新功能。

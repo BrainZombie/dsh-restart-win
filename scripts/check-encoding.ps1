@@ -15,6 +15,7 @@
       · test\probe-hostport.ps1（真实 socket 的选面探针）
       · test\probe-desktop-watchdog.ps1（崩溃记录归属探针）
       · test\probe-budget.ps1（预算文本与公式一致性探针）
+      · test\probe-clean-env.ps1（GUI 拉起的干净环境：ELECTRON_RUN_AS_NODE 必须删除）
 
     对每个文件检查三项：
       1. 前 3 字节必须是 EF BB BF（UTF-8 BOM）。缺失时 PS 5.1 会按 GBK 解析，
@@ -98,6 +99,7 @@ if ($Path -and @($Path).Count -gt 0) {
     $targets.Add((Join-Path (Split-Path $scriptDir -Parent) 'test\probe-hostport.ps1'))
     $targets.Add((Join-Path (Split-Path $scriptDir -Parent) 'test\probe-desktop-watchdog.ps1'))
     $targets.Add((Join-Path (Split-Path $scriptDir -Parent) 'test\probe-budget.ps1'))
+$targets.Add((Join-Path (Split-Path $scriptDir -Parent) 'test\probe-clean-env.ps1'))
     if ($PSCommandPath) { $targets.Add($PSCommandPath) }
     else { $targets.Add((Join-Path $scriptDir 'check-encoding.ps1')) }
 }

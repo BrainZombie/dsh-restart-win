@@ -609,6 +609,29 @@ const PROBES = {
     'P-36': [eng(/\$MyInvocation\.InvocationName -eq '\.'/)],
 };
 
+PROBES['D-21'] = [
+    // 2026-11-28 真机定位：0.6.9 的「干净环境」包装函数把删除写成了置空，Electron 判存在不判真假，
+    // 于是每次真实拉起都进 Node 模式（无脚本 + stdin 为管道）→ <50ms exit=0、零输出、无 crash 记录，
+    // 就绪等待只能报「主进程已退出」。行为断言见 test/probe-clean-env.ps1（点源引擎函数本体）。
+    {
+        note: 'the wrapper deletes ELECTRON_RUN_AS_NODE (Env: provider) instead of blanking it',
+        fn: (ctx) => {
+            const body = ctx.functionBody(ENGINE, 'Invoke-WithCleanGuiEnvironment');
+            assert.ok(/Remove-Item Env:ELECTRON_RUN_AS_NODE/.test(body), 'an empty value still puts Electron into Node mode: it checks HasVar, not truthiness');
+            assert.ok(!/SetEnvironmentVariable\('ELECTRON_RUN_AS_NODE',\s*\$null/.test(body), 'PowerShell coerces $null to "" for [string] parameters, so the variable survives');
+            assert.ok(/\$null -ne \$had/.test(body), 'restoring $null would re-create an empty variable for the next launch');
+        },
+    },
+    {
+        note: 'both GUI launches (gui-smoke + the real one) still go through that wrapper',
+        fn: (ctx) => {
+            const text = ctx.text(ENGINE);
+            const calls = text.match(/Invoke-WithCleanGuiEnvironment \{/g) || [];
+            assert.ok(calls.length >= 2, `expected gui-smoke and the real launch to share the wrapper, found ${calls.length}`);
+        },
+    },
+];
+
 // ------------------------------------------------------------------ §2 main flow
 PROBES['F-01'] = [{
     note: 'action dispatch order is the semantics: short paths return before anything touches an instance',
